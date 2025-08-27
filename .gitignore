@@ -150,5 +150,3 @@ target/
 tests/
 vendor/
 yarn.lock
-
-.gitignore

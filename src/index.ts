@@ -3,6 +3,7 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import { connectDB } from "./services/dbService";
 import nftRoutes from "./routes/nft";
+import walletRoutes from "./routes/wallet";
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -11,6 +12,8 @@ app.use(cors());
 app.use(bodyParser.json());
 
 app.use("/api/nft", nftRoutes);
+
+app.use("/api/wallet", walletRoutes);
 
 const PORT = process.env.PORT || 3000;
 
