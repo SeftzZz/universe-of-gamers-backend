@@ -241,4 +241,25 @@ router.post("/make-tx", async (req: Request, res) => {
   }
 });
 
+// GET all NFTs
+router.get("/", async (req, res) => {
+  try {
+    const nfts = await Nft.find();
+    res.json(nfts);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch NFTs" });
+  }
+});
+
+// GET NFT by ID
+router.get("/:id", async (req, res) => {
+  try {
+    const nft = await Nft.findById(req.params.id);
+    if (!nft) return res.status(404).json({ error: "NFT not found" });
+    res.json(nft);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch NFT" });
+  }
+});
+
 export default router;
