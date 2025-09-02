@@ -1,0 +1,55 @@
+{
+  "version": "0.1.0",
+  "name": "dummy_dex",
+  "instructions": [
+    {
+      "name": "swapDummy",
+      "accounts": [
+        {
+          "name": "user",
+          "isMut": true,
+          "isSigner": true
+        },
+        {
+          "name": "userAtaIn",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "userAtaOut",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "poolAtaIn",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "poolAtaOut",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "poolSigner",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "amountIn",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "address": "9pJoUw7cmenr829UtqnNPk2WrZ7qX1GU54DRHpoGbgBW"
+  }
+}

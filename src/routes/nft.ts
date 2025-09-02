@@ -1,6 +1,9 @@
 import { Router, Request } from "express";
 import multer from "multer";
 import { Nft } from "../models/Nft";
+import { Character } from "../models/Character";
+import { Rune } from "../models/Rune";
+
 import { mintNftWithAnchor } from "../services/anchorService";
 import {
   LAMPORTS_PER_SOL,
@@ -32,7 +35,7 @@ const programIdStr = process.env.PROGRAM_ID;
 if (!programIdStr) throw new Error("❌ PROGRAM_ID is missing in .env");
 
 const programID = new PublicKey(programIdStr.trim());
-const idl = require("../../target/idl/uog_marketplace.json");
+const idl = require("../../public/idl/uog_marketplace.json");
 
 // 🔍 Tambahkan log debug
 console.log("⚙️ [nft.ts] PROGRAM_ID =", programID.toBase58());
@@ -261,5 +264,78 @@ router.get("/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch NFT" });
   }
 });
+
+// =====================
+// Character Routes
+// =====================
+
+// POST Character
+router.post("/character", async (req, res) => {
+  try {
+    const char = await Character.create(req.body);
+    res.json({ success: true, data: char });
+  } catch (err: any) {
+    console.error("❌ Error creating character:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET all Characters
+router.get("/character", async (req, res) => {
+  try {
+    const chars = await Character.find().populate("runes");
+    res.json(chars);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch characters" });
+  }
+});
+
+// GET Character by ID
+router.get("/character/:id", async (req, res) => {
+  try {
+    const char = await Character.findById(req.params.id).populate("runes");
+    if (!char) return res.status(404).json({ error: "Character not found" });
+    res.json(char);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch character" });
+  }
+});
+
+// =====================
+// Rune Routes
+// =====================
+
+// POST Rune
+router.post("/rune", async (req, res) => {
+  try {
+    const rune = await Rune.create(req.body);
+    res.json({ success: true, data: rune });
+  } catch (err: any) {
+    console.error("❌ Error creating rune:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET all Runes
+router.get("/rune", async (req, res) => {
+  try {
+    const runes = await Rune.find();
+    res.json(runes);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch runes" });
+  }
+});
+
+// GET Rune by ID
+router.get("/rune/:id", async (req, res) => {
+  try {
+    const rune = await Rune.findById(req.params.id);
+    if (!rune) return res.status(404).json({ error: "Rune not found" });
+    res.json(rune);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch rune" });
+  }
+});
+
 
 export default router;

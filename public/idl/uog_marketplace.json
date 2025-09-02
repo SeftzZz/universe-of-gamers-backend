@@ -5,7 +5,7 @@
     {
       "name": "initializeMarket",
       "docs": [
-        "Inisialisasi Market Config + simpan fee rates"
+        "Initialize Market Config + save fee rates"
       ],
       "accounts": [
         {
@@ -43,7 +43,7 @@
     {
       "name": "mintAndList",
       "docs": [
-        "Mint + Buat Metadata + Approve Escrow + Bayar Fee Minting"
+        "Mint + Create Metadata + Approve Escrow + Pay Minting Fee"
       ],
       "accounts": [
         {
@@ -211,7 +211,7 @@
     {
       "name": "withdrawTreasury",
       "docs": [
-        "Withdraw treasury"
+        "Withdraw treasury funds"
       ],
       "accounts": [
         {
@@ -326,6 +326,97 @@
           "type": "u16"
         }
       ]
+    },
+    {
+      "name": "sendToken",
+      "accounts": [
+        {
+          "name": "sender",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Sender of SOL (must be signer)"
+          ]
+        },
+        {
+          "name": "recipient",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Recipient of SOL"
+          ]
+        },
+        {
+          "name": "treasuryPda",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Treasury PDA (for fees)"
+          ]
+        },
+        {
+          "name": "marketConfig",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Market config (stores trade_fee_bps)"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Native Solana System Program"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "swapToken",
+      "accounts": [
+        {
+          "name": "user",
+          "isMut": true,
+          "isSigner": true
+        },
+        {
+          "name": "dexProgram",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "marketConfig",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "treasuryPda",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "data",
+          "type": "bytes"
+        },
+        {
+          "name": "inAmount",
+          "type": "u64"
+        }
+      ]
     }
   ],
   "accounts": [
@@ -402,6 +493,108 @@
       }
     }
   ],
+  "events": [
+    {
+      "name": "Minted",
+      "fields": [
+        {
+          "name": "seller",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "nftMint",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "price",
+          "type": "u64",
+          "index": false
+        }
+      ]
+    },
+    {
+      "name": "Listed",
+      "fields": [
+        {
+          "name": "seller",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "nftMint",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "price",
+          "type": "u64",
+          "index": false
+        }
+      ]
+    },
+    {
+      "name": "Bought",
+      "fields": [
+        {
+          "name": "buyer",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "seller",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "nftMint",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "price",
+          "type": "u64",
+          "index": false
+        },
+        {
+          "name": "tradeFee",
+          "type": "u64",
+          "index": false
+        }
+      ]
+    },
+    {
+      "name": "Swapped",
+      "fields": [
+        {
+          "name": "user",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "dexProgram",
+          "type": "publicKey",
+          "index": false
+        },
+        {
+          "name": "inAmount",
+          "type": "u64",
+          "index": false
+        },
+        {
+          "name": "tradeFee",
+          "type": "u64",
+          "index": false
+        },
+        {
+          "name": "tradeFeeBps",
+          "type": "u16",
+          "index": false
+        }
+      ]
+    }
+  ],
   "errors": [
     {
       "code": 6000,
@@ -412,6 +605,11 @@
       "code": 6001,
       "name": "FeeTooHigh",
       "msg": "Fee too high"
+    },
+    {
+      "code": 6002,
+      "name": "UnsupportedProgram",
+      "msg": "Unsupported program id"
     }
   ]
 }
