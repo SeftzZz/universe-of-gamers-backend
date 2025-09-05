@@ -36,7 +36,8 @@ const SkillSchema = new Schema<ISkill>({
 });
 
 // 🔹 Character Schema
-const CharacterSchema = new Schema<ICharacter>({
+const CharacterSchema = new Schema<ICharacter>(
+{
   displayName: { type: String, required: true },
   element: { type: String, enum: ["Fire", "Water", "Earth", "Wind"], required: true },
   level: { type: Number, min: 1, default: 1 },
@@ -50,6 +51,8 @@ const CharacterSchema = new Schema<ICharacter>({
   skillAttack: { type: SkillSchema, required: true },
   ultimateAttack: { type: SkillSchema, required: true },
   createdAt: { type: Date, default: Date.now }
-});
+},
+{ collection: "characters" } // add by fpp 05/09/25
+);
 
 export const Character = mongoose.model<ICharacter>("Character", CharacterSchema);
