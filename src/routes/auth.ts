@@ -55,7 +55,7 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const auth = await Auth.findOne({ email, authProvider: 'local' });
+    const auth = await Auth.findOne({ email });
     if (!auth) return res.status(404).json({ error: 'User not found' });
 
     const isMatch = await auth.comparePassword(password);
@@ -69,7 +69,7 @@ router.post('/login', async (req, res) => {
 });
 
 // === Login with Google ===
-router.post('/auth/google', async (req, res) => {
+router.post('/google', async (req, res) => {
   try {
     const { googleId, email, name } = req.body;
     let auth = await Auth.findOne({ googleId });
@@ -87,7 +87,7 @@ router.post('/auth/google', async (req, res) => {
 });
 
 // === Login / Import External Wallet ===
-router.post('/auth/wallet', async (req, res) => {
+router.post('/wallet', async (req, res) => {
   try {
     const { provider, address, name } = req.body;
 

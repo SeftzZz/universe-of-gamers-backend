@@ -26,16 +26,19 @@ import * as anchor from "@project-serum/anchor";
 import { BN } from "bn.js";
 import axios from "axios";
 import dotenv from "dotenv";
-import { getPriceInfo } from "../services/priceService";
+import { getTokenInfo } from "../services/priceService";
 import { getMint } from "@solana/spl-token";
 
 import WalletBalance from "../models/WalletBalance";
 import WalletToken from "../models/WalletToken";
 import { Nft } from "../models/Nft";
 const fs = require("fs");
+import { Client } from "@solana-tracker/data-api";
 
 dotenv.config();
 const router = Router();
+
+const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY });
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -236,29 +239,40 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
     const { address } = req.params;
     if (!address) return res.status(400).json({ error: "Missing wallet address" });
 
-    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
-    const pubkey = new PublicKey(address);
-    const lamports = await connection.getBalance(pubkey);
-    const sol = lamports / LAMPORTS_PER_SOL;
+    // ✅ langsung ambil data wallet dari SolanaTracker
+    const wallet = await solanaTracker.getWallet(address);
 
-    // ambil harga SOL dari CoinGecko
-    const solInfo = await getPriceInfo("solana");
+    if (!wallet) {
+      return res.status(404).json({ error: "Wallet not found" });
+    }
 
-    const usdValue =
-      solInfo.priceUsd !== null ? sol * solInfo.priceUsd : null;
+    // cari token SOL di daftar tokens
+    const solToken = wallet.tokens.find(
+      (t: any) =>
+        t.token.symbol === "SOL" ||
+        t.token.mint === "So11111111111111111111111111111111111111112"
+    );
 
-    const percentChange = solInfo.percentChange ?? 0;
-    const trend =
-      percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
+    // jumlah SOL asli (native balance, bukan totalSol)
+    const solBalance = solToken?.balance ?? 0;
 
-    // Simpan ke MongoDB (upsert biar update kalau sudah ada)
+    // totalSol (akumulasi versi SolanaTracker, bisa beda perhitungan)
+    const solTotal = wallet.totalSol ?? 0;
+
+    const solPriceUsd = solToken?.pools?.[0]?.price?.usd ?? 0;
+    const usdValue = solPriceUsd ? solBalance * solPriceUsd : null;
+
+    const percentChange = solToken?.events?.["24h"]?.priceChangePercentage ?? 0;
+    const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
+
+    // 🔹 Simpan ke MongoDB (opsional)
     await WalletBalance.findOneAndUpdate(
       { address },
       {
         address,
-        lamports,
-        sol,
-        solPriceUsd: solInfo.priceUsd,
+        solBalance,   // asli
+        solTotal,     // versi tracker
+        solPriceUsd,
         usdValue,
         percentChange,
         trend,
@@ -269,9 +283,9 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
 
     res.json({
       address,
-      lamports,
-      sol,
-      solPriceUsd: solInfo.priceUsd,
+      solBalance,   // asli dari token.balance
+      solTotal,     // total versi tracker
+      solPriceUsd,
       usdValue,
       percentChange,
       trend,
@@ -289,120 +303,48 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
 router.get("/tokens/:address", async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
-    if (!address)
+    if (!address) {
       return res.status(400).json({ error: "Missing wallet address" });
+    }
 
-    const connection = new Connection(
-      process.env.SOLANA_CLUSTER as string,
-      "confirmed"
-    );
-    const pubkey = new PublicKey(address);
+    // ✅ langsung ambil data wallet dari SolanaTracker
+    const wallet = await solanaTracker.getWallet(address);
 
-    // ambil SPL token accounts dari wallet
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-      pubkey,
-      {
-        programId: new PublicKey(
-          "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-        ),
-      }
-    );
+    if (!wallet?.tokens?.length) {
+      return res.json({ address, tokens: [], total: 0, totalSol: 0 });
+    }
 
-    const tokens = tokenAccounts.value.map((acc) => {
-      const info: any = acc.account.data.parsed.info;
-      return {
-        mint: info.mint,
-        owner: info.owner,
-        amount: parseFloat(info.tokenAmount.uiAmountString),
-        decimals: info.tokenAmount.decimals,
-      };
-    });
-
-    // ambil native SOL balance
-    const lamports = await connection.getBalance(pubkey);
-    const solBalance = lamports / LAMPORTS_PER_SOL;
-
-    // ambil metadata token list resmi
-    const tokenListProvider = new TokenListProvider();
-    const tokenList = await tokenListProvider.resolve();
-    const list = tokenList.filterByChainId(ChainId.MainnetBeta).getList();
-
-    // enrich SPL tokens
-    const enriched = tokens.map((t) => {
-      const meta = list.find((tk) => tk.address === t.mint);
-      return {
-        ...t,
-        name: meta?.name || null,
-        symbol: meta?.symbol || "Unknown",
-        logoURI: meta?.logoURI || null,
-      };
-    });
-
-    // 🔥 Registry fallback (phantom-like) → selalu include
-    const registryTokens = Object.keys(REGISTRY).map((mint) => {
-      const meta = REGISTRY[mint];
-      const exist = enriched.find((e) => e.mint === mint);
-
-      return {
-        mint,
-        owner: address,
-        amount:
-          mint === SOL_MINT
-            ? solBalance // pakai native balance untuk SOL
-            : exist?.amount || 0, // fallback 0 kalau ATA belum ada
-        decimals: meta.decimals,
-        name: meta.name,
-        symbol: meta.symbol,
-        logoURI: meta.logoURI,
-      };
-    });
-
-    // gabungkan → registry defaults + semua token lain
-    const allTokens = [
-      ...registryTokens,
-      ...enriched.filter((e) => !REGISTRY[e.mint]), // hanya token lain di wallet
-    ];
-
-    // ambil harga dari CoinGecko
-    const [solInfo, usdcInfo, uogInfo] = await Promise.all([
-      getPriceInfo("solana"),
-      getPriceInfo("usd-coin"),
-      getPriceInfo("universe-of-gamers"),
-    ]);
-
-    const final = allTokens.map((t) => {
-      let priceUsd = 0;
-      let percentChange = 0;
-
-      if (t.mint === SOL_MINT) {
-        priceUsd = solInfo.priceUsd ?? 0;
-        percentChange = solInfo.percentChange ?? 0;
-      } else if (t.mint === USDC_MINT) {
-        priceUsd = usdcInfo.priceUsd ?? 1;
-        percentChange = usdcInfo.percentChange ?? 0;
-      } else if (t.mint === UOG_MINT) {
-        priceUsd = uogInfo.priceUsd ?? 0;
-        percentChange = uogInfo.percentChange ?? 0;
-      }
-
+    // mapping hasil biar konsisten dengan schema lama
+    const tokens = wallet.tokens.map((t: any) => {
+      const priceUsd = t.pools?.[0]?.price?.usd ?? 0;
+      const liquidity = t.pools?.[0]?.liquidity?.usd ?? 0;
+      const marketCap = t.pools?.[0]?.marketCap?.usd ?? 0;
+      const percentChange = t.events?.["24h"]?.priceChangePercentage ?? 0;
       const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
 
-      const usdValue = priceUsd
-        ? parseFloat((t.amount * priceUsd).toFixed(2))
-        : 0;
-
       return {
-        ...t,
-        priceUsd: parseFloat(priceUsd.toFixed(2)),
-        usdValue,
+        mint:
+          t.token.symbol === "SOL"
+            ? "So11111111111111111111111111111111111111112"
+            : t.token.mint,
+        name: t.token.name,
+        symbol: t.token.symbol,
+        logoURI: t.token.image,
+        decimals: t.token.decimals,
+        amount: t.balance,
+        priceUsd: parseFloat(priceUsd.toFixed(6)),
+        usdValue: parseFloat(t.value?.toFixed(2) ?? "0"),
+        liquidity: parseFloat(liquidity.toFixed(2)),
+        marketCap: parseFloat(marketCap.toFixed(2)),
         percentChange: parseFloat(percentChange.toFixed(2)),
         trend,
+        holders: t.holders ?? 0,
       };
     });
 
-    // Simpan ke DB (opsional)
+    // opsional: simpan ke DB
     await Promise.all(
-      final.map(async (t) => {
+      tokens.map(async (t) => {
         await WalletToken.findOneAndUpdate(
           { address, mint: t.mint },
           { ...t, address, lastUpdated: new Date() },
@@ -411,9 +353,14 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       })
     );
 
-    res.json({ address, tokens: final });
+    res.json({
+      address,
+      tokens,
+      total: wallet.total ?? 0,
+      totalSol: wallet.totalSol ?? 0,
+    });
   } catch (err: any) {
-    console.error("❌ Error fetching tokens:", err);
+    console.error("❌ Error fetching wallet:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -665,5 +612,37 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
   }
 });
 
+// GET /wallet/:address?mint=<mintAddress>
+router.get('/trades/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    const { mint } = req.query;
+
+    if (!address) return res.status(400).json({ error: "Missing wallet address" });
+    if (!mint) return res.status(400).json({ error: "Missing token mint" });
+
+    // ✅ ambil semua trades wallet
+    const walletTrades = await solanaTracker.getWalletTrades(address, undefined, true, true, false);
+
+    if (!walletTrades || !walletTrades.trades) {
+      return res.json({ trades: [] });
+    }
+
+    // ✅ filter trades yang ada mint sesuai request
+    const filtered = walletTrades.trades.filter((t: any) =>
+      t.from.address === mint || t.to.address === mint
+    );
+
+    res.json({
+      trades: filtered,
+      total: filtered.length,
+      mint,
+      wallet: address
+    });
+  } catch (err: any) {
+    console.error('❌ Error fetching wallet trades:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 export default router;
