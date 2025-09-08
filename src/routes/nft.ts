@@ -337,5 +337,70 @@ router.get("/rune/:id", async (req, res) => {
   }
 });
 
+/////////////////////////////
+// // POST NFT (simpan langsung ke MongoDB)
+// router.post("/", async (req, res) => {
+//   try {
+//     // parsing metadata jika dikirim dalam string
+//     let metadata = req.body.metadata;
+//     if (typeof metadata === "string") {
+//       try {
+//         metadata = JSON.parse(metadata);
+//       } catch {
+//         metadata = { raw: req.body.metadata }; // fallback kalau bukan JSON valid
+//       }
+//     }
+
+//     const nft = await Nft.create({
+//       name: req.body.name,
+//       description: req.body.description,
+//       image: req.body.image,
+//       price: req.body.price,
+//       metadata: metadata,
+//       blockchain: req.body.blockchain,
+//       collection: req.body.collection,
+//       royalty: req.body.royalty,
+//       character: req.body.character, // reference ObjectId ke Character
+//     });
+
+//     res.json({ success: true, data: nft });
+//   } catch (err: any) {
+//     console.error("❌ Error creating NFT:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+// Simpan NFT ke MongoDB setelah mint sukses
+router.post("/", async (req, res) => {
+  try {
+    let metadata = req.body.metadata;
+    if (typeof metadata === "string") {
+      try {
+        metadata = JSON.parse(metadata);
+      } catch {
+        metadata = { raw: req.body.metadata };
+      }
+    }
+
+    const nft = await Nft.create({
+      name: req.body.name,
+      description: req.body.description,
+      image: req.body.image,
+      price: req.body.price,
+      metadata,
+      blockchain: req.body.blockchain,
+      collection: req.body.collection,
+      royalty: req.body.royalty,
+      character: req.body.character,
+      owner: req.body.owner,   // tambahkan owner (wallet address)
+      txSignature: req.body.txSignature // simpan tx hash biar bisa trace di explorer
+    });
+
+    res.json({ success: true, data: nft });
+  } catch (err: any) {
+    console.error("❌ Error saving NFT:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 export default router;
