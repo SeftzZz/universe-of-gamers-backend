@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import path from 'path';
 import bodyParser from "body-parser";
 import { connectDB } from "./services/dbService";
 import nftRoutes from "./routes/nft";
@@ -24,7 +25,13 @@ app.use("/api/auth", authRoutes);
 
 app.use('/api', solRoutes);
 
-app.use("/api/characters", characterRoutes); // add by fpp 05/09/25 untuk route character
+app.get("/api/ping", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+
+app.use("/api/characters", characterRoutes);
 
 const PORT = process.env.PORT || 3000;
 

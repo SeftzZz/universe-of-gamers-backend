@@ -30,7 +30,7 @@ const CustodialWalletSchema = new mongoose.Schema(
       required: true,
     },
     privateKey: {
-      type: String, // ⚠️ sebaiknya dienkripsi sebelum disimpan
+      type: String,
       required: true,
     },
   },
@@ -48,7 +48,7 @@ const AuthSchema = new mongoose.Schema(
     email: {
       type: String,
       unique: true,
-      sparse: true, // biar null bisa (untuk login via wallet)
+      sparse: true,
       lowercase: true,
       match: [/^\S+@\S+\.\S+$/, 'Invalid email format'],
     },
@@ -61,14 +61,26 @@ const AuthSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
-    wallets: [WalletSchema],             // ✅ multi external wallet
-    custodialWallets: [CustodialWalletSchema], // ✅ multi custodial wallet
+    wallets: [WalletSchema],
+    custodialWallets: [CustodialWalletSchema],
     authProvider: {
       type: String,
-      enum: ['local', 'google', 'wallet', 'custodial'],
+      enum: ['local', 'google', 'wallet'],
       default: 'local',
     },
     acceptedTerms: {
+      type: Boolean,
+      default: false,
+    },
+    avatar: {
+      type: String,
+      default: '',
+    },
+    notifyNewItems: {
+      type: Boolean,
+      default: false,
+    },
+    notifyEmail: {
       type: Boolean,
       default: false,
     },
