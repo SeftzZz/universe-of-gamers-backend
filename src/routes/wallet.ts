@@ -31,6 +31,7 @@ import { getMint } from "@solana/spl-token";
 
 import WalletBalance from "../models/WalletBalance";
 import WalletToken from "../models/WalletToken";
+import TrendingToken from "../models/TrendingToken";
 import { Nft } from "../models/Nft";
 const fs = require("fs");
 import { Client } from "@solana-tracker/data-api";
@@ -231,6 +232,42 @@ async function toRawAmount(mintAddress: string, uiAmount: number): Promise<bigin
   return raw;
 }
 
+async function getDefaultTokens() {
+  const defaultMints = [SOL_MINT, USDC_MINT, UOG_MINT];
+  const result: any[] = [];
+
+  for (const mint of defaultMints) {
+    try {
+      const info: any = await solanaTracker.getTokenInfo(String(mint));
+      const priceUsd = info?.priceUsd ?? 0;
+      const liquidity = info?.liquidityUsd ?? 0;
+      const marketCap = info?.marketCapUsd ?? 0;
+      const percentChange = info?.percentChange24h ?? 0;
+      const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
+
+      result.push({
+        mint,
+        name: REGISTRY[mint]?.name ?? info?.name ?? "",
+        symbol: REGISTRY[mint]?.symbol ?? info?.symbol ?? "",
+        logoURI: REGISTRY[mint]?.logoURI ?? info?.logoURI ?? "",
+        decimals: REGISTRY[mint]?.decimals ?? info?.decimals ?? 0,
+        amount: 0, // wallet kosong
+        priceUsd: parseFloat(priceUsd.toFixed(6)),
+        usdValue: 0,
+        liquidity: parseFloat(liquidity.toFixed(2)),
+        marketCap: parseFloat(marketCap.toFixed(2)),
+        percentChange: parseFloat(percentChange.toFixed(2)),
+        trend,
+        holders: info?.holders ?? 0,
+      });
+    } catch (err: any) {
+      console.warn(`⚠️ gagal ambil info token ${mint}:`, err.message);
+    }
+  }
+
+  return result;
+}
+
 //
 // GET /wallet/balance/:address
 //
@@ -239,39 +276,48 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
     const { address } = req.params;
     if (!address) return res.status(400).json({ error: "Missing wallet address" });
 
-    // ✅ langsung ambil data wallet dari SolanaTracker
-    const wallet = await solanaTracker.getWallet(address);
+    let wallet: any = null;
+    let attempt = 0;
+    const maxRetries = 3;
+    let lastError: any = null;
 
-    if (!wallet) {
-      return res.status(404).json({ error: "Wallet not found" });
+    while (attempt < maxRetries && !wallet) {
+      try {
+        wallet = await solanaTracker.getWallet(address);
+      } catch (err) {
+        lastError = err;
+        attempt++;
+        console.warn(`⚠️ getWallet attempt ${attempt} failed:`, err.message);
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 1000 * attempt)); // backoff 1s, 2s, ...
+        }
+      }
     }
 
-    // cari token SOL di daftar tokens
+    if (!wallet) {
+      return res.status(500).json({ error: "Failed to fetch wallet", details: lastError?.message });
+    }
+
     const solToken = wallet.tokens.find(
       (t: any) =>
         t.token.symbol === "SOL" ||
         t.token.mint === "So11111111111111111111111111111111111111112"
     );
 
-    // jumlah SOL asli (native balance, bukan totalSol)
     const solBalance = solToken?.balance ?? 0;
-
-    // totalSol (akumulasi versi SolanaTracker, bisa beda perhitungan)
     const solTotal = wallet.totalSol ?? 0;
-
     const solPriceUsd = solToken?.pools?.[0]?.price?.usd ?? 0;
     const usdValue = solPriceUsd ? solBalance * solPriceUsd : null;
 
     const percentChange = solToken?.events?.["24h"]?.priceChangePercentage ?? 0;
     const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
 
-    // 🔹 Simpan ke MongoDB (opsional)
     await WalletBalance.findOneAndUpdate(
       { address },
       {
         address,
-        solBalance,   // asli
-        solTotal,     // versi tracker
+        solBalance,
+        solTotal,
         solPriceUsd,
         usdValue,
         percentChange,
@@ -283,8 +329,8 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
 
     res.json({
       address,
-      solBalance,   // asli dari token.balance
-      solTotal,     // total versi tracker
+      solBalance,
+      solTotal,
       solPriceUsd,
       usdValue,
       percentChange,
@@ -307,14 +353,48 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Missing wallet address" });
     }
 
-    // ✅ langsung ambil data wallet dari SolanaTracker
-    const wallet = await solanaTracker.getWallet(address);
+    let wallet: any = null;
+    let attempt = 0;
+    const maxRetries = 3;
+    let lastError: any = null;
 
-    if (!wallet?.tokens?.length) {
-      return res.json({ address, tokens: [], total: 0, totalSol: 0 });
+    while (attempt < maxRetries && !wallet) {
+      try {
+        wallet = await solanaTracker.getWallet(address);
+      } catch (err) {
+        lastError = err;
+        attempt++;
+        console.warn(`⚠️ getWallet attempt ${attempt} failed:`, err.message);
+        if (attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, 1000 * attempt)); // backoff
+        }
+      }
     }
 
-    // mapping hasil biar konsisten dengan schema lama
+    if (!wallet?.tokens?.length) {
+      const defaultTokens = await getDefaultTokens();
+
+      if (defaultTokens.length) {
+        await Promise.all(
+          defaultTokens.map((t) =>
+            WalletToken.findOneAndUpdate(
+              { address, mint: t.mint },
+              { ...t, address, lastUpdated: new Date() },
+              { upsert: true, new: true }
+            )
+          )
+        );
+      }
+
+      return res.json({
+        address,
+        tokens: defaultTokens,
+        total: defaultTokens.reduce((sum, t) => sum + t.usdValue, 0),
+        totalSol:
+          defaultTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+      });
+    }
+
     const tokens = wallet.tokens.map((t: any) => {
       const priceUsd = t.pools?.[0]?.price?.usd ?? 0;
       const liquidity = t.pools?.[0]?.liquidity?.usd ?? 0;
@@ -342,7 +422,6 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       };
     });
 
-    // opsional: simpan ke DB
     await Promise.all(
       tokens.map(async (t) => {
         await WalletToken.findOneAndUpdate(
@@ -361,6 +440,62 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error("❌ Error fetching wallet:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+//
+// GET /wallet/trending
+//
+router.get("/trending", async (req: Request, res: Response) => {
+  try {
+    // ✅ langsung ambil trending tokens (interval 1h)
+    const trendingTokens = await solanaTracker.getTrendingTokens("1h");
+
+    // mapping hasil biar konsisten dengan schema lama
+    const tokens = trendingTokens.map((t: any) => {
+      const pool = t.pools?.[0] || {};
+      const priceUsd = pool.price?.usd ?? 0;
+      const liquidity = pool.liquidity?.usd ?? 0;
+      const marketCap = pool.marketCap?.usd ?? 0;
+      const percentChange = t.events?.["1h"]?.priceChangePercentage ?? 0;
+      const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
+
+      return {
+        mint: t.token.mint,
+        name: t.token.name,
+        symbol: t.token.symbol,
+        logoURI: t.token.image,
+        decimals: t.token.decimals,
+        amount: 0, // trending token tidak punya balance wallet
+        priceUsd: parseFloat(priceUsd.toFixed(6)),
+        usdValue: 0,
+        liquidity: parseFloat(liquidity.toFixed(2)),
+        marketCap: parseFloat(marketCap.toFixed(2)),
+        percentChange: parseFloat(percentChange.toFixed(2)),
+        trend,
+        holders: t.holders ?? 0,
+      };
+    });
+
+    // opsional: simpan ke DB
+    await Promise.all(
+      tokens.map(async (t) => {
+        await TrendingToken.findOneAndUpdate(
+          { mint: t.mint },
+          { ...t, lastUpdated: new Date() },
+          { upsert: true, new: true }
+        );
+      })
+    );
+
+    res.json({
+      tokens,
+      total: tokens.length,
+      totalSol: 0,
+    });
+  } catch (err: any) {
+    console.error("❌ Error fetching trending tokens:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -492,19 +627,22 @@ router.post("/send/submit", async (req: Request, res: Response) => {
 //
 router.post("/swap/quote", async (req: Request, res: Response) => {
   try {
-    const { from, fromMint, toMint, amount } = req.body;
+    const { from, fromMint, toMint, amount, decimals } = req.body;
     if (!from || !fromMint || !toMint || !amount) {
       return res.status(400).json({ error: "from, fromMint, toMint, amount required" });
     }
 
     console.log("🔍 [DFLOW QUOTE] payload", { from, fromMint, toMint, amount });
 
+    // konversi ke lamports
+    const rawAmount = BigInt(Math.floor(amount * 10 ** decimals));
+
     const { data: quote } = await axios.get("https://quote-api.dflow.net/intent", {
       params: {
         userPublicKey: from,
         inputMint: fromMint,
         outputMint: toMint,
-        amount,
+        amount: rawAmount.toString(),   // kirim string integer, bukan float
         slippageBps: 50,
         wrapAndUnwrapSol: true,
       },

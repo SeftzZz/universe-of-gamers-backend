@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import path from 'path';
 import bodyParser from "body-parser";
 import { connectDB } from "./services/dbService";
 import nftRoutes from "./routes/nft";
@@ -20,6 +21,12 @@ app.use("/api/wallet", walletRoutes);
 app.use("/api/auth", authRoutes);
 
 app.use('/api', solRoutes);
+
+app.get("/api/ping", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
 const PORT = process.env.PORT || 3000;
 
