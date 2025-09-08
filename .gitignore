@@ -302,3 +302,9 @@ target/
 tests/
 vendor/
 yarn.lock
+
+test-ledger/
+buffer-keypair.json
+dump_check.so
+idl_uog_marketplace.json
+jupiter_payload.json
