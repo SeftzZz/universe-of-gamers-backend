@@ -8,11 +8,14 @@ import walletRoutes from "./routes/wallet";
 import authRoutes from "./routes/auth";
 import solRoutes from './routes/sol';
 import dotenv from "dotenv";
+import characterRoutes from "./routes/character"; // add by fpp 05/09/25
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+
+app.use(express.json()); // add by fpp 05/09/25 untuk route character
 
 app.use("/api/nft", nftRoutes);
 
@@ -27,6 +30,8 @@ app.get("/api/ping", (req, res) => {
 });
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+
+app.use("/api/characters", characterRoutes);
 
 const PORT = process.env.PORT || 3000;
 
