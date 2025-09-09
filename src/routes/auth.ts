@@ -1,12 +1,17 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import Auth from '../models/Auth.js';
-import { encrypt, decrypt } from '../utils/cryptoHelper.js';
+import Auth from '../models/Auth';
+import { ICustodialWallet } from '../models/Auth';
+import { encrypt, decrypt } from '../utils/cryptoHelper';
 import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import bcrypt from 'bcrypt';
 import multer from 'multer';
 import path from 'path';
+
+import { mnemonicToSeedSync } from 'bip39';
+import nacl from 'tweetnacl';
+import * as ed25519 from 'ed25519-hd-key';
 
 // Multer config
 const storage = multer.diskStorage({
@@ -23,11 +28,15 @@ const upload = multer({ storage });
 const router = express.Router();
 
 // Fungsi buat generate JWT
-const generateToken = (user) => {
+const generateToken = (user: any): string => {
+  if (!process.env.JWT_SECRET) {
+    throw new Error("JWT_SECRET not set in environment variables");
+  }
+
   return jwt.sign(
     { id: user._id, email: user.email, provider: user.authProvider },
-    process.env.JWT_SECRET,
-    { expiresIn: '1d' }
+    process.env.JWT_SECRET as string, // pastikan string
+    { expiresIn: "1d" }
   );
 };
 
@@ -41,8 +50,8 @@ router.post('/register', async (req, res) => {
     const privateKeyBase58 = bs58.encode(kp.secretKey);
     const address = kp.publicKey.toBase58();
 
-    const custodialWallet = {
-      provider: 'solana',
+    const custodialWallet: ICustodialWallet = {
+      provider: 'solana', // ⬅️ type-safe
       address,
       privateKey: encrypt(privateKeyBase58),
     };
@@ -55,8 +64,8 @@ router.post('/register', async (req, res) => {
       authProvider: 'custodial',
       wallets: [
         {
-          provider: 'other', // default external type
-          address: address,    // sama dengan custodial
+          provider: 'other',
+          address, // sama dengan custodial
         },
       ],
       custodialWallets: [custodialWallet],
@@ -64,7 +73,6 @@ router.post('/register', async (req, res) => {
     });
 
     await auth.save();
-
     const token = generateToken(auth);
 
     res.status(201).json({
@@ -78,7 +86,7 @@ router.post('/register', async (req, res) => {
       })), // ❌ privateKey tetap hidden
     });
   } catch (err: any) {
-    console.error('❌ Register error:', err);
+    console.error("❌ Register error:", err.message);
     res.status(400).json({ error: err.message });
   }
 });
@@ -111,7 +119,7 @@ router.post('/login', async (req, res) => {
       custodialWallets, // privateKey tidak dikirim
     });
   } catch (err: any) {
-    console.error('❌ Login error:', err);
+    console.error("❌ Login error:", err.message);
     res.status(400).json({ error: err.message });
   }
 });
@@ -129,7 +137,7 @@ router.post('/google', async (req, res) => {
 
     const token = generateToken(auth);
     res.json({ message: 'Login successful', authId: auth._id, token });
-  } catch (err) {
+  } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
@@ -173,12 +181,12 @@ router.post('/wallet', async (req, res) => {
       token,
     });
   } catch (err: any) {
-    console.error('❌ Wallet login error:', err);
+    console.error("❌ Wallet login error:", err.message);
     res.status(400).json({ error: err.message });
   }
 });
 
-// === Generate Custodial Wallet ===
+// === Generate Custodial Wallet === 
 router.post('/create/custodial', async (req, res) => {
   try {
     const { userId, provider } = req.body;
@@ -187,37 +195,36 @@ router.post('/create/custodial', async (req, res) => {
     const auth = await Auth.findById(userId);
     if (!auth) return res.status(404).json({ error: 'User not found' });
 
-    const selectedProvider = provider || 'solana';
+    const selectedProvider = (provider || 'solana') as 'solana' | 'ethereum';
 
     if (selectedProvider === 'solana') {
-      // ✅ Generate custodial wallet (Solana)
       const kp = Keypair.generate();
       const privateKeyBase58 = bs58.encode(kp.secretKey);
 
-      const wallet = {
-        provider: 'solana',
+      const wallet: ICustodialWallet = {
+        provider: selectedProvider,
         address: kp.publicKey.toBase58(),
-        privateKey: encrypt(privateKeyBase58), // 🔒 simpan terenkripsi
+        privateKey: encrypt(privateKeyBase58),
       };
 
       auth.custodialWallets.push(wallet);
       auth.authProvider = 'custodial';
       await auth.save();
 
-      const token = generateToken(auth); // 🔑 kalau mau langsung login token JWT
+      const token = generateToken(auth);
 
       return res.status(201).json({
         success: true,
         message: 'Custodial wallet created',
         authId: auth._id,
         token,
-        wallet: { provider: wallet.provider, address: wallet.address }, // ❌ jangan kirim privateKey!
+        wallet: { provider: wallet.provider, address: wallet.address },
       });
     }
 
     return res.status(400).json({ error: 'Unsupported provider' });
   } catch (err: any) {
-    console.error('❌ Error create custodial wallet:', err);
+    console.error("❌ Error create custodial wallet:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -231,7 +238,7 @@ router.get('/user/:id', async (req, res) => {
       user.avatar = '';
     }
     res.json(user);
-  } catch (err) {
+  } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
@@ -269,7 +276,7 @@ router.put('/user/:id/profile', async (req, res) => {
     const { name, email } = req.body;
     const user = await Auth.findByIdAndUpdate(req.params.id, { name, email }, { new: true });
     res.json({ success: true, user });
-  } catch (err) {
+  } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
@@ -314,8 +321,81 @@ router.put('/user/:id/notifications', async (req, res) => {
       { new: true }
     );
     res.json({ success: true, user });
-  } catch (err) {
+  } catch (err: any) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// === Import Recovery Phrase ===
+router.post('/import/phrase', async (req, res) => {
+  try {
+    const { userId, phrase } = req.body;
+    if (!userId || !phrase) {
+      return res.status(400).json({ error: 'Missing userId or phrase' });
+    }
+
+    const auth = await Auth.findById(userId);
+    if (!auth) return res.status(404).json({ error: 'User not found' });
+
+    // ✅ generate keypair dari seed phrase
+    const seed = mnemonicToSeedSync(phrase);
+    const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
+    const kp = nacl.sign.keyPair.fromSeed(derived);
+
+    const privateKeyBase58 = bs58.encode(Buffer.from(kp.secretKey));
+    const address = bs58.encode(Buffer.from(kp.publicKey));
+
+    const wallet: ICustodialWallet = {
+      provider: 'solana',
+      address,
+      privateKey: encrypt(privateKeyBase58),
+    };
+
+    auth.custodialWallets.push(wallet);
+    await auth.save();
+
+    res.json({
+      success: true,
+      message: 'Recovery phrase imported',
+      wallet: { provider: wallet.provider, address: wallet.address },
+    });
+  } catch (err: any) {
+    console.error('❌ Import phrase error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Import Private Key ===
+router.post('/import/private', async (req, res) => {
+  try {
+    const { userId, privateKey } = req.body;
+    if (!userId || !privateKey) {
+      return res.status(400).json({ error: 'Missing userId or privateKey' });
+    }
+
+    const auth = await Auth.findById(userId);
+    if (!auth) return res.status(404).json({ error: 'User not found' });
+
+    const secret = bs58.decode(privateKey);
+    const kp = Keypair.fromSecretKey(secret);
+
+    const wallet: ICustodialWallet = {
+      provider: 'solana',
+      address: kp.publicKey.toBase58(),
+      privateKey: encrypt(privateKey),
+    };
+
+    auth.custodialWallets.push(wallet);
+    await auth.save();
+
+    res.json({
+      success: true,
+      message: 'Private key imported',
+      wallet: { provider: wallet.provider, address: wallet.address },
+    });
+  } catch (err: any) {
+    console.error('❌ Import private key error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 

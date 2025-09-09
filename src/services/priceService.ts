@@ -5,7 +5,7 @@ export interface PriceInfo {
   percentChange: number | null;
 }
 
-const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY });
+const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
 
 // ✅ cache in-memory dengan TTL 1 menit
 const priceCache: Map<string, { data: PriceInfo; ts: number }> = new Map();
@@ -54,7 +54,7 @@ export async function getTokenInfo(mint: string): Promise<PriceInfo> {
     console.log(`✅ ${token.name} (${token.symbol}) $${currentPrice?.toFixed(2)} | Δ ${percentChange ?? "N/A"}%`);
 
     return data;
-  } catch (err) {
+  } catch (err: any) {
     console.error("❌ Error getTokenInfo:", err);
     const data = { priceUsd: null, percentChange: null };
     priceCache.set(mint, { data, ts: now });
