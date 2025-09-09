@@ -39,7 +39,7 @@ import { Client } from "@solana-tracker/data-api";
 dotenv.config();
 const router = Router();
 
-const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY });
+const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -202,7 +202,7 @@ function formatError(err: any) {
       try {
         logs = JSON.parse(match[0]);
       } catch {
-        logs = match[0].split("\n").map(l => l.trim()).filter(Boolean);
+        logs = match[0].split("\n").map((l: string) => l.trim()).filter(Boolean);
       }
     }
   }
@@ -287,7 +287,7 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
       } catch (err) {
         lastError = err;
         attempt++;
-        console.warn(`⚠️ getWallet attempt ${attempt} failed:`, err.message);
+        console.warn(`⚠️ getWallet attempt ${attempt} failed:`, (err as any).message);
         if (attempt < maxRetries) {
           await new Promise(r => setTimeout(r, 1000 * attempt)); // backoff 1s, 2s, ...
         }
@@ -364,7 +364,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       } catch (err) {
         lastError = err;
         attempt++;
-        console.warn(`⚠️ getWallet attempt ${attempt} failed:`, err.message);
+        console.warn(`⚠️ getWallet attempt ${attempt} failed:`, (err as any).message);
         if (attempt < maxRetries) {
           await new Promise((r) => setTimeout(r, 1000 * attempt)); // backoff
         }
@@ -423,7 +423,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
     });
 
     await Promise.all(
-      tokens.map(async (t) => {
+      tokens.map(async (t: any) => {
         await WalletToken.findOneAndUpdate(
           { address, mint: t.mint },
           { ...t, address, lastUpdated: new Date() },
@@ -541,57 +541,103 @@ router.get("/nfts/id/:id", async (req, res) => {
 });
 
 //
-// POST /wallet/send/build (pakai program sendToken)
+// POST /wallet/send/build
 //
 router.post("/send/build", async (req: Request, res: Response) => {
   try {
-    const { from, to, amount } = req.body;
-    if (!from || !to || !amount) {
-      return res.status(400).json({ error: "from, to, and amount are required" });
+    const { from, to, amount, mint } = req.body;
+    if (!from || !to || !amount || !mint) {
+      return res.status(400).json({ error: "from, to, amount, and mint are required" });
     }
+
+    console.log("📩 [BUILD TX] Request received");
+    console.log("   🔑 From :", from);
+    console.log("   🎯 To   :", to);
+    console.log("   💰 Amount (UI):", amount);
+    console.log("   🪙 Mint :", mint);
 
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const fromPubkey = new PublicKey(from);
     const toPubkey = new PublicKey(to);
 
-    // --- setup Anchor provider & program ---
-    const provider = new anchor.AnchorProvider(
-      connection,
-      {} as any, // signer kosong, biar tx tetap unsigned
-      { preflightCommitment: "confirmed" }
-    );
-    const idl = require("../../public/idl/uog_marketplace.json");
-    const programId = new PublicKey(process.env.PROGRAM_ID as string);
-    const program = new anchor.Program(idl, programId, provider);
+    let ix;
+    if (mint === "So11111111111111111111111111111111111111112") {
+      // === Native SOL transfer ===
+      console.log("⚡ Native SOL transfer detected");
+      const lamports = Math.floor(amount * 1e9);
+      console.log("   💰 Amount raw (lamports):", lamports);
 
-    // --- derive PDA ---
-    const [marketConfigPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market_config")],
-      program.programId
-    );
-    const [treasuryPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("treasury")],
-      program.programId
-    );
+      ix = SystemProgram.transfer({
+        fromPubkey,
+        toPubkey,
+        lamports,
+      });
+    } else {
+      // === SPL Token transfer ===
+      console.log("🔄 SPL Token transfer detected");
 
-    // --- build ix ---
-    const lamports = Math.floor(amount * 1e9);
-    const ix = await program.methods
-      .sendToken(new anchor.BN(lamports))
-      .accounts({
-        sender: fromPubkey,
-        recipient: toPubkey,
-        treasuryPda,
-        marketConfig: marketConfigPda,
-        systemProgram: SystemProgram.programId,
-      })
-      .instruction();
+      const mintPubkey = new PublicKey(mint);
 
-    const tx = new Transaction().add(ix);
+      // Ambil info mint → decimals
+      const mintInfo = await getMint(connection, mintPubkey);
+      console.log("   🔢 Decimals for mint:", mintInfo.decimals);
+
+      // Hitung raw amount
+      const rawAmount = BigInt(Math.floor(amount * 10 ** mintInfo.decimals));
+      console.log("   💰 Amount raw (with decimals):", rawAmount.toString());
+
+      // Resolve ATA
+      const fromTokenAccount = await getAssociatedTokenAddress(mintPubkey, fromPubkey);
+      const toTokenAccount   = await getAssociatedTokenAddress(mintPubkey, toPubkey);
+
+      console.log("   📦 FromTokenAccount:", fromTokenAccount.toBase58());
+      console.log("   📦 ToTokenAccount  :", toTokenAccount.toBase58());
+
+      // Cek ATA penerima
+      const toAccountInfo = await connection.getAccountInfo(toTokenAccount);
+      console.log("   🗂️ To ATA exists? :", !!toAccountInfo);
+
+      // Cek balance sender & receiver
+      const fromBalance = await connection.getTokenAccountBalance(fromTokenAccount).catch(() => null);
+      const toBalance = await connection.getTokenAccountBalance(toTokenAccount).catch(() => null);
+      console.log("   📊 Sender balance before:", fromBalance?.value.uiAmountString ?? "N/A");
+      console.log("   📊 Recipient balance before:", toBalance?.value.uiAmountString ?? "0");
+
+      const instructions = [];
+
+      if (!toAccountInfo) {
+        console.log("   ➕ Creating ATA for recipient");
+        instructions.push(
+          createAssociatedTokenAccountInstruction(
+            fromPubkey,
+            toTokenAccount,
+            toPubkey,
+            mintPubkey
+          )
+        );
+      }
+
+      instructions.push(
+        createTransferInstruction(
+          fromTokenAccount,
+          toTokenAccount,
+          fromPubkey,
+          rawAmount
+        )
+      );
+
+      ix = instructions;
+    }
+
+    const tx = new Transaction().add(...(Array.isArray(ix) ? ix : [ix]));
     tx.feePayer = fromPubkey;
     tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
 
-    // balikin unsigned tx ke frontend
+    console.log("✅ Transaction built successfully");
+    console.log("   FeePayer:", tx.feePayer.toBase58());
+    console.log("   Instructions count:", tx.instructions.length);
+
+    // Balikin unsigned tx
     const serialized = tx.serialize({ requireAllSignatures: false });
     res.json({ tx: serialized.toString("base64") });
   } catch (err: any) {
@@ -601,21 +647,24 @@ router.post("/send/build", async (req: Request, res: Response) => {
 });
 
 //
-// POST /wallet/send/submit (tetap sama)
+// POST /wallet/send/submit
 //
 router.post("/send/submit", async (req: Request, res: Response) => {
   try {
     const { signedTx } = req.body;
-    if (!signedTx) return res.status(400).json({ error: "signedTx required" });
+    if (!signedTx) {
+      return res.status(400).json({ error: "signedTx is required" });
+    }
 
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const txBuffer = Buffer.from(signedTx, "base64");
-    const sig = await connection.sendRawTransaction(txBuffer, { skipPreflight: false });
-
-    res.json({
-      signature: sig,
-      explorer: `https://solscan.io/tx/${sig}?cluster=mainnet`
+    const signature = await connection.sendRawTransaction(txBuffer, {
+      skipPreflight: false,
+      maxRetries: 3,
     });
+
+    await connection.confirmTransaction(signature, "confirmed");
+    res.json({ signature });
   } catch (err: any) {
     console.error("❌ submit sendToken error:", err);
     res.status(500).json({ error: err.message });
@@ -627,28 +676,49 @@ router.post("/send/submit", async (req: Request, res: Response) => {
 //
 router.post("/swap/quote", async (req: Request, res: Response) => {
   try {
-    const { from, fromMint, toMint, amount, decimals } = req.body;
+    const { from, fromMint, toMint, amount } = req.body;
     if (!from || !fromMint || !toMint || !amount) {
       return res.status(400).json({ error: "from, fromMint, toMint, amount required" });
     }
 
-    console.log("🔍 [DFLOW QUOTE] payload", { from, fromMint, toMint, amount });
+    console.log("📩 [SWAP QUOTE] Request received");
+    console.log("   🔑 From    :", from);
+    console.log("   🪙 FromMint:", fromMint);
+    console.log("   🪙 ToMint  :", toMint);
+    console.log("   💰 Amount (UI):", amount);
 
-    // konversi ke lamports
+    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+
+    // === cek decimals dari mint ===
+    let decimals = 9; // default SOL
+    if (fromMint !== SOL_MINT) {
+      const mintInfo = await getMint(connection, new PublicKey(fromMint));
+      decimals = mintInfo.decimals;
+    }
+    console.log("   🔢 Decimals for input mint:", decimals);
+
+    // konversi ke raw integer (lamports/token units)
     const rawAmount = BigInt(Math.floor(amount * 10 ** decimals));
+    console.log("   💰 Amount raw:", rawAmount.toString());
 
+    // request quote ke DFLOW
     const { data: quote } = await axios.get("https://quote-api.dflow.net/intent", {
       params: {
         userPublicKey: from,
         inputMint: fromMint,
         outputMint: toMint,
-        amount: rawAmount.toString(),   // kirim string integer, bukan float
+        amount: rawAmount.toString(),
         slippageBps: 50,
         wrapAndUnwrapSol: true,
       },
     });
 
-    if (!quote?.openTransaction) throw new Error("❌ Missing openTransaction");
+    if (!quote?.openTransaction) throw new Error("❌ Missing openTransaction from DFLOW");
+
+    console.log("✅ Quote received");
+    console.log("   InAmount   :", quote.inAmount);
+    console.log("   OutAmount  :", quote.outAmount);
+    console.log("   MinOutAmt  :", quote.minOutAmount);
 
     res.json({
       inAmount: quote.inAmount,
@@ -657,7 +727,7 @@ router.post("/swap/quote", async (req: Request, res: Response) => {
       openTransaction: quote.openTransaction,
     });
   } catch (err: any) {
-    console.error("❌ dflow/quote error:", err.response?.data || err.message);
+    console.error("❌ swap/quote error:", err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -672,9 +742,14 @@ router.post("/swap/build", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "from, openTransaction required" });
     }
 
+    console.log("📩 [SWAP BUILD] Request received");
+    console.log("   🔑 From:", from);
+
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const fromPubkey = new PublicKey(from);
-    const provider = new anchor.AnchorProvider(connection, {} as any, { preflightCommitment: "confirmed" });
+    const provider = new anchor.AnchorProvider(connection, {} as any, {
+      preflightCommitment: "confirmed",
+    });
 
     // load UOG marketplace IDL
     const idlUog = require("../../public/idl/uog_marketplace.json");
@@ -684,44 +759,68 @@ router.post("/swap/build", async (req: Request, res: Response) => {
       provider
     );
 
-    // parse DFLOW transaction
+    // parse DFLOW tx
     const tx = Transaction.from(Buffer.from(openTransaction, "base64"));
-    const ixIndex = tx.instructions.findIndex(ix => ix.programId.toBase58() === "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH");
-    if (ixIndex < 0) throw new Error("❌ DFLOW instruction not found");
+
+    // cari instruksi DFLOW
+    const ixIndex = tx.instructions.findIndex(
+      (ix) => ix.programId.toBase58().startsWith("DF1o") // fleksibel
+    );
+    if (ixIndex < 0) throw new Error("❌ DFLOW instruction not found in tx");
 
     const aggIx = tx.instructions[ixIndex];
-    const metas = aggIx.keys.map(k => ({
+    const metas = aggIx.keys.map((k) => ({
       pubkey: k.pubkey,
       isSigner: k.isSigner,
       isWritable: k.isWritable,
     }));
     const ixData = aggIx.data;
 
-    // build instruction for UOG program
+    console.log("   🔗 Aggregator program:", aggIx.programId.toBase58());
+    console.log("   📦 Remaining accounts:", metas.length);
+
+    // derive PDA untuk UOG
+    const [marketConfigPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("market_config")],
+      programUog.programId
+    );
+    const [treasuryPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("treasury")],
+      programUog.programId
+    );
+
+    // build ix untuk UOG program
     const ix = await programUog.methods
-      .swapToken(ixData, new anchor.BN(0)) // amount opsional, bisa pakai inAmount dari quote
+      .swapToken(ixData, new anchor.BN(0)) // amount opsional
       .accounts({
         user: fromPubkey,
         dexProgram: aggIx.programId,
-        marketConfig: (await PublicKey.findProgramAddressSync([Buffer.from("market_config")], programUog.programId))[0],
-        treasuryPda: (await PublicKey.findProgramAddressSync([Buffer.from("treasury")], programUog.programId))[0],
+        marketConfig: marketConfigPda,
+        treasuryPda,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .remainingAccounts(metas)
       .instruction();
 
-    const { ComputeBudgetProgram } = require("@solana/web3.js");
+    // compute budget + priority fee
     const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
     const addPriorityFee = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5_000 });
 
     const txOut = new Transaction().add(modifyComputeUnits, addPriorityFee, ix);
     txOut.feePayer = fromPubkey;
-    txOut.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    txOut.recentBlockhash = blockhash;
+
+    console.log("✅ Swap TX built");
+    console.log("   FeePayer:", txOut.feePayer.toBase58());
+    console.log("   Blockhash:", blockhash, " valid until height:", lastValidBlockHeight);
+    console.log("   Instructions count:", txOut.instructions.length);
 
     const serialized = txOut.serialize({ requireAllSignatures: false });
     res.json({ tx: serialized.toString("base64") });
   } catch (err: any) {
-    console.error("❌ swap build error:", err.message);
+    console.error("❌ swap/build error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -734,18 +833,28 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     const { signedTx } = req.body;
     if (!signedTx) return res.status(400).json({ error: "signedTx required" });
 
+    console.log("📩 [SWAP SUBMIT] Request received");
+
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const txBuffer = Buffer.from(signedTx, "base64");
-    const sig = await connection.sendRawTransaction(txBuffer, { skipPreflight: false });
 
-    await connection.confirmTransaction(sig, "confirmed");
+    const sig = await connection.sendRawTransaction(txBuffer, {
+      skipPreflight: false,
+      maxRetries: 5,
+    });
+
+    console.log("⏳ Waiting for confirmation...");
+    const confirmation = await connection.confirmTransaction(sig, "confirmed");
+
+    console.log("✅ Swap TX confirmed:", sig);
 
     res.json({
       signature: sig,
+      confirmation,
       explorer: `https://solscan.io/tx/${sig}?cluster=mainnet`,
     });
   } catch (err: any) {
-    console.error("❌ swap submit error:", err.message);
+    console.error("❌ swap/submit error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
