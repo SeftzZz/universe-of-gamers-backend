@@ -579,7 +579,7 @@ router.post("/send/build", async (req: Request, res: Response) => {
       {} as any,
       { preflightCommitment: "confirmed" }
     );
-    const idl = require("../../public/idl/uog_marketplace.json");
+    const idl = require("../../public/idl/universe_of_gamers.json");
     const programId = new PublicKey(process.env.PROGRAM_ID as string);
     const program = new anchor.Program(idl, programId, provider);
 
@@ -837,7 +837,7 @@ router.post("/swap/build", async (req: Request, res: Response) => {
     });
 
     // load UOG marketplace IDL
-    const idlUog = require("../../public/idl/uog_marketplace.json");
+    const idlUog = require("../../public/idl/universe_of_gamers.json");
     const programUog = new anchor.Program(
       idlUog,
       new PublicKey(process.env.PROGRAM_ID as string),
