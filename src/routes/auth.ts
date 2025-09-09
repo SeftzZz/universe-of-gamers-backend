@@ -399,4 +399,44 @@ router.post('/import/private', async (req, res) => {
   }
 });
 
+// === Forget Password ===
+router.post('/forget-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+    console.log("📩 [FORGET PASSWORD] Request received");
+    console.log("   📧 Email:", email);
+
+    // 🔎 Debug: tampilkan semua email user
+    const allUsers = await Auth.find({}, 'email').lean();
+    console.log("📜 All registered emails:", allUsers.map(u => u.email));
+
+    if (!email || !newPassword) {
+      console.warn("⚠️ Missing email or newPassword in request body");
+      return res.status(400).json({ error: 'Missing email or newPassword' });
+    }
+
+    const user = await Auth.findOne({ email });
+    if (!user) {
+      console.warn("❌ User not found for email:", email);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (newPassword.length < 8) {
+      console.warn("⚠️ Password too short for email:", email);
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    // ganti password → auto hash di pre('save')
+    user.password = newPassword;
+    await user.save();
+
+    console.log("✅ Password reset successfully for email:", email);
+
+    return res.json({ success: true, message: 'Password reset successfully' });
+  } catch (err: unknown) {
+    console.error('❌ Forget password error:', (err as Error).message);
+    return res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 export default router;
