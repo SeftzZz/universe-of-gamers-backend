@@ -8,7 +8,7 @@ import walletRoutes from "./routes/wallet";
 import authRoutes from "./routes/auth";
 import solRoutes from './routes/sol';
 import dotenv from "dotenv";
-import characterRoutes from "./routes/character"; // add by fpp 05/09/25
+// import characterRoutes from "./routes/character"; // add by fpp 05/09/25
 dotenv.config();
 
 const app = express();
@@ -31,7 +31,8 @@ app.get("/api/ping", (req, res) => {
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
-app.use("/api/characters", characterRoutes);
+// app.use("/api/characters", characterRoutes);
+// app.use("/api/nft/character", characterRoutes);
 
 const PORT = process.env.PORT || 3000;
 

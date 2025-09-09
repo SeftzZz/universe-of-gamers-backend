@@ -282,10 +282,18 @@ router.post("/character", async (req, res) => {
 
 // GET all Characters
 router.get("/character", async (req, res) => {
+  // try {
+  //   const chars = await Character.find().populate("runes");
+  //   res.json(chars);
+  // } catch (err: any) {
+  //   res.status(500).json({ error: "Failed to fetch characters" });
+  // }
+
   try {
-    const chars = await Character.find().populate("runes");
-    res.json(chars);
-  } catch (err: any) {
+    const characters = await Character.find().lean();
+    res.json(characters);
+  } catch (err) {
+    console.error("❌ Error fetching characters:", err);
     res.status(500).json({ error: "Failed to fetch characters" });
   }
 });
