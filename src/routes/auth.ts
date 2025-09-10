@@ -329,35 +329,73 @@ router.put('/user/:id/notifications', async (req, res) => {
 // === Import Recovery Phrase ===
 router.post('/import/phrase', async (req, res) => {
   try {
-    const { userId, phrase } = req.body;
-    if (!userId || !phrase) {
-      return res.status(400).json({ error: 'Missing userId or phrase' });
+    const { userId, phrase, name } = req.body;
+    if (!phrase) {
+      return res.status(400).json({ error: 'Missing recovery phrase' });
     }
 
-    const auth = await Auth.findById(userId);
-    if (!auth) return res.status(404).json({ error: 'User not found' });
-
-    // ✅ generate keypair dari seed phrase
+    // 🔑 generate keypair dari seed phrase
     const seed = mnemonicToSeedSync(phrase);
     const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
     const kp = nacl.sign.keyPair.fromSeed(derived);
 
     const privateKeyBase58 = bs58.encode(Buffer.from(kp.secretKey));
     const address = bs58.encode(Buffer.from(kp.publicKey));
+    const displayName = name || address;
 
-    const wallet: ICustodialWallet = {
-      provider: 'solana',
-      address,
-      privateKey: encrypt(privateKeyBase58),
-    };
+    let auth;
 
-    auth.custodialWallets.push(wallet);
-    await auth.save();
+    if (userId) {
+      auth = await Auth.findById(userId);
+      if (!auth) return res.status(404).json({ error: 'User not found' });
+    } else {
+      // cek apakah user dengan address ini sudah ada
+      auth = await Auth.findOne({
+        $or: [
+          { name: displayName },
+          { 'wallets.address': address },
+          { 'custodialWallets.address': address },
+        ],
+      });
+
+      if (!auth) {
+        auth = new Auth({
+          name: displayName,
+          authProvider: 'custodial',
+          custodialWallets: [],
+          wallets: [],
+          avatar: '',
+        });
+      }
+    }
+
+    // cek apakah wallet sudah ada
+    const alreadyExists =
+      auth.wallets.some((w) => w.address === address) ||
+      auth.custodialWallets.some((w) => w.address === address);
+
+    if (!alreadyExists) {
+      const wallet: ICustodialWallet = {
+        provider: 'solana',
+        address,
+        privateKey: encrypt(privateKeyBase58),
+      };
+      auth.custodialWallets.push(wallet);
+      await auth.save();
+    }
+
+    // refresh dari DB
+    const freshAuth = await Auth.findById(auth._id);
+    if (!freshAuth) return res.status(404).json({ error: 'User not found after save' });
+
+    const token = generateToken(freshAuth);
 
     res.json({
       success: true,
-      message: 'Recovery phrase imported',
-      wallet: { provider: wallet.provider, address: wallet.address },
+      message: alreadyExists ? 'Wallet already exists' : 'Recovery phrase imported',
+      authId: freshAuth._id,
+      wallet: { provider: 'solana', address },
+      token,
     });
   } catch (err: any) {
     console.error('❌ Import phrase error:', err);
@@ -368,30 +406,69 @@ router.post('/import/phrase', async (req, res) => {
 // === Import Private Key ===
 router.post('/import/private', async (req, res) => {
   try {
-    const { userId, privateKey } = req.body;
-    if (!userId || !privateKey) {
-      return res.status(400).json({ error: 'Missing userId or privateKey' });
+    const { userId, privateKey, name } = req.body;
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Missing privateKey' });
     }
-
-    const auth = await Auth.findById(userId);
-    if (!auth) return res.status(404).json({ error: 'User not found' });
 
     const secret = bs58.decode(privateKey);
     const kp = Keypair.fromSecretKey(secret);
 
-    const wallet: ICustodialWallet = {
-      provider: 'solana',
-      address: kp.publicKey.toBase58(),
-      privateKey: encrypt(privateKey),
-    };
+    const address = kp.publicKey.toBase58();
+    const displayName = name || address;
 
-    auth.custodialWallets.push(wallet);
-    await auth.save();
+    let auth;
+
+    if (userId) {
+      auth = await Auth.findById(userId);
+      if (!auth) return res.status(404).json({ error: 'User not found' });
+    } else {
+      // cek apakah user dengan address ini sudah ada
+      auth = await Auth.findOne({
+        $or: [
+          { name: displayName },
+          { 'wallets.address': address },
+          { 'custodialWallets.address': address },
+        ],
+      });
+
+      if (!auth) {
+        auth = new Auth({
+          name: displayName,
+          authProvider: 'custodial',
+          custodialWallets: [],
+          wallets: [],
+          avatar: '',
+        });
+      }
+    }
+
+    const alreadyExists =
+      auth.wallets.some((w) => w.address === address) ||
+      auth.custodialWallets.some((w) => w.address === address);
+
+    if (!alreadyExists) {
+      const wallet: ICustodialWallet = {
+        provider: 'solana',
+        address,
+        privateKey: encrypt(privateKey),
+      };
+      auth.custodialWallets.push(wallet);
+      await auth.save();
+    }
+
+    // refresh dari DB
+    const freshAuth = await Auth.findById(auth._id);
+    if (!freshAuth) return res.status(404).json({ error: 'User not found after save' });
+
+    const token = generateToken(freshAuth);
 
     res.json({
       success: true,
-      message: 'Private key imported',
-      wallet: { provider: wallet.provider, address: wallet.address },
+      message: alreadyExists ? 'Wallet already exists' : 'Private key imported',
+      authId: freshAuth._id,
+      wallet: { provider: 'solana', address },
+      token,
     });
   } catch (err: any) {
     console.error('❌ Import private key error:', err);

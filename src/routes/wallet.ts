@@ -16,6 +16,7 @@ import { ComputeBudgetProgram, sendAndConfirmRawTransaction } from "@solana/web3
 import {
   getAssociatedTokenAddress,
   createTransferInstruction,
+  getOrCreateAssociatedTokenAccount,
   createAssociatedTokenAccountInstruction,
   TOKEN_PROGRAM_ID,
   ACCOUNT_SIZE,
@@ -429,7 +430,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         console.log(`🔗 Alias detected: ${t.token.mint} -> ${TOKEN_ALIASES[t.token.mint]}`);
       }
 
-      // console.log("📌 Token mapped:", mapped);
+      console.log("📌 Token mapped:", mapped);
       return mapped;
     });
 
@@ -559,7 +560,9 @@ router.post("/send/build", async (req: Request, res: Response) => {
   try {
     const { from, to, amount, mint } = req.body;
     if (!from || !to || !amount || !mint) {
-      return res.status(400).json({ error: "from, to, amount, mint are required" });
+      return res
+        .status(400)
+        .json({ error: "from, to, amount, mint are required" });
     }
 
     console.log("📩 [BUILD TX] Request received (via program)");
@@ -568,7 +571,10 @@ router.post("/send/build", async (req: Request, res: Response) => {
     console.log("   🎯 To   :", to);
     console.log("   💰 Amount (UI):", amount);
 
-    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+    const connection = new Connection(
+      process.env.SOLANA_CLUSTER as string,
+      "confirmed"
+    );
     const fromPubkey = new PublicKey(from);
     const toPubkey = new PublicKey(to);
     const mintPubkey = new PublicKey(mint);
@@ -583,7 +589,7 @@ router.post("/send/build", async (req: Request, res: Response) => {
     const programId = new PublicKey(process.env.PROGRAM_ID as string);
     const program = new anchor.Program(idl, programId, provider);
 
-    // ✅ derive PDA secara konsisten
+    // ✅ derive PDA
     const [marketConfigPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("market_config")],
       program.programId
@@ -593,13 +599,6 @@ router.post("/send/build", async (req: Request, res: Response) => {
       program.programId
     );
 
-    // ✅ optional: verify owner MarketConfig
-    const marketAccInfo = await connection.getAccountInfo(marketConfigPda);
-    if (!marketAccInfo || !marketAccInfo.owner.equals(program.programId)) {
-      throw new Error(
-        `MarketConfig PDA invalid. Got ${marketConfigPda.toBase58()}, owner=${marketAccInfo?.owner.toBase58()}`
-      );
-    }
     console.log("   📂 MarketConfig PDA:", marketConfigPda.toBase58());
 
     // ==== decimals ====
@@ -612,13 +611,8 @@ router.post("/send/build", async (req: Request, res: Response) => {
 
       if (mint === "So11111111111111111111111111111111111111112") {
         decimals = 9; // SOL
-      } else if (mint === UOG_MINT) {
-        decimals = 6; // Hardcode UOG
-      } else if (REGISTRY[mint]?.decimals) {
-        decimals = REGISTRY[mint].decimals;
       } else {
         decimals = 6; // fallback
-        console.warn(`⚠️ Using fallback decimals=6 for ${mint}`);
       }
     }
 
@@ -630,8 +624,41 @@ router.post("/send/build", async (req: Request, res: Response) => {
     let senderTokenAccount, recipientTokenAccount, treasuryTokenAccount;
 
     if (mint !== "So11111111111111111111111111111111111111112") {
-      senderTokenAccount = await getAssociatedTokenAddress(mintPubkey, fromPubkey);
-      recipientTokenAccount = await getAssociatedTokenAddress(mintPubkey, toPubkey);
+      senderTokenAccount = await getAssociatedTokenAddress(
+        mintPubkey,
+        fromPubkey
+      );
+
+      // 📌 1. default ATA
+      let expectedATA = await getAssociatedTokenAddress(mintPubkey, toPubkey);
+
+      // 📌 2. cek apakah ATA ini ada & punya balance
+      let ataInfo = await connection.getAccountInfo(expectedATA);
+      if (ataInfo) {
+        recipientTokenAccount = expectedATA;
+      } else {
+        // 📌 3. fallback cari token account lain untuk mint yg sama
+        const resp = await connection.getParsedTokenAccountsByOwner(toPubkey, {
+          mint: mintPubkey,
+        });
+
+        if (resp.value.length > 0) {
+          const found = resp.value.find(
+            (acc) =>
+              acc.account.data.parsed.info.tokenAmount.uiAmount &&
+              acc.account.data.parsed.info.tokenAmount.uiAmount > 0
+          );
+          if (found) {
+            recipientTokenAccount = found.pubkey;
+          }
+        }
+
+        // 📌 4. fallback terakhir: pakai expected ATA
+        if (!recipientTokenAccount) {
+          recipientTokenAccount = expectedATA;
+        }
+      }
+
       treasuryTokenAccount = await getAssociatedTokenAddress(
         mintPubkey,
         treasuryPda,
@@ -663,7 +690,8 @@ router.post("/send/build", async (req: Request, res: Response) => {
     const tx = new Transaction().add(ix);
     tx.feePayer = fromPubkey;
 
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
 
     console.log("✅ Transaction built via program");
