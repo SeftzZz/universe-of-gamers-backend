@@ -415,7 +415,25 @@
           "isSigner": false
         },
         {
+          "name": "treasuryTokenAccount",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "userOutTokenAccount",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Provided by client; program does not verify mint here."
+          ]
+        },
+        {
           "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "tokenProgram",
           "isMut": false,
           "isSigner": false
         }
@@ -571,7 +589,17 @@
           "index": false
         },
         {
+          "name": "outputMint",
+          "type": "publicKey",
+          "index": false
+        },
+        {
           "name": "inAmount",
+          "type": "u64",
+          "index": false
+        },
+        {
+          "name": "outAmount",
           "type": "u64",
           "index": false
         },
@@ -608,6 +636,11 @@
       "code": 6003,
       "name": "AccountDeserializeFailed",
       "msg": "Account deserialization failed"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidOwner",
+      "msg": "Invalid Owner"
     }
   ]
 }

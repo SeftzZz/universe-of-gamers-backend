@@ -91,6 +91,18 @@ router.post('/register', async (req, res) => {
   }
 });
 
+router.get('/decrypt', async (req, res) => {
+  const encryptedFromDB =
+    "02PSMY6sehQvuJNLbMHfdr32rw9PpnrZ1aOwi0gxmL9+jVw+zBeBn1RQaoLLnmmJrGRAehNiWcgeMOX8VkE1k1cFnVkem+jutKLyYPbPo2c7+4Ca30bZnhjr6TGwRExRdT/R8qGysYZOSZyF4GoNuIoshFggjPc="; // ganti dengan string terenkripsi kamu
+
+  try {
+    const privateKey = decrypt(encryptedFromDB);
+    console.log("🔑 Private Key asli:", privateKey);
+  } catch (err) {
+    console.error("❌ Gagal decrypt:", err);
+  }
+});
+
 // === Login Local ===
 router.post('/login', async (req, res) => {
   try {

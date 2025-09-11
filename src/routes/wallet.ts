@@ -21,6 +21,7 @@ import {
   TOKEN_PROGRAM_ID,
   ACCOUNT_SIZE,
   AccountLayout,
+  ASSOCIATED_TOKEN_PROGRAM_ID
 } from "@solana/spl-token";
 import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
@@ -379,9 +380,16 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       }
     }
 
-    if (!wallet?.tokens?.length) {
-      const defaultTokens = await getDefaultTokens();
+    if (!wallet) {
+      console.warn(`⚠️ Wallet ${address} not found after ${maxRetries} attempts`);
+      return res.status(404).json({ error: "Wallet not found" });
+    }
 
+    // === CASE: Wallet ada tapi token kosong ===
+    if (!wallet?.tokens?.length) {
+      console.warn(`⚠️ Wallet ${address} has no tokens, inserting defaults...`);
+
+      const defaultTokens = await getDefaultTokens();
       if (defaultTokens.length) {
         await Promise.all(
           defaultTokens.map((t) =>
@@ -394,12 +402,11 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         );
       }
 
-      return res.json({
+      return res.status(200).json({
         address,
         tokens: defaultTokens,
-        total: defaultTokens.reduce((sum, t) => sum + t.usdValue, 0),
-        totalSol:
-          defaultTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+        total: defaultTokens.reduce((sum, t) => sum + (t.usdValue ?? 0), 0),
+        totalSol: defaultTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
       });
     }
 
@@ -558,11 +565,17 @@ router.get("/nfts/id/:id", async (req, res) => {
 //
 router.post("/send/build", async (req: Request, res: Response) => {
   try {
-    const { from, to, amount, mint } = req.body;
+    let { from, to, amount, mint } = req.body;
     if (!from || !to || !amount || !mint) {
       return res
         .status(400)
         .json({ error: "from, to, amount, mint are required" });
+    }
+
+    // ✅ Normalisasi mint: paksa SOL dummy ke WSoL mint resmi
+    if (mint === "So11111111111111111111111111111111111111111") {
+      console.warn("⚠️ Mint dummy SOL terdeteksi, pakai WSoL mint resmi instead");
+      mint = "So11111111111111111111111111111111111111112";
     }
 
     console.log("📩 [BUILD TX] Request received (via program)");
@@ -902,18 +915,44 @@ router.post("/swap/build", async (req: Request, res: Response) => {
       programUog.programId
     );
 
+    // === derive ATA untuk treasury dan user ===
+    const outputMint = aggIx.keys.find(k => k.isWritable)?.pubkey; // ambil mint dari aggregator keys (atau parse dari quote)
+    if (!outputMint) throw new Error("❌ Cannot determine outputMint from aggregator tx");
+
+    // ATA user (output token hasil swap)
+    const userOutTokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(outputMint),
+      fromPubkey,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    // ATA treasury
+    const treasuryTokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(outputMint),
+      treasuryPda,
+      true, // pda = true
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
     // build ix untuk UOG program
     const ix = await programUog.methods
-      .swapToken(ixData, new anchor.BN(0)) // amount opsional
+      .swapToken(ixData, new anchor.BN(0))
       .accounts({
         user: fromPubkey,
         dexProgram: aggIx.programId,
         marketConfig: marketConfigPda,
         treasuryPda,
+        treasuryTokenAccount,     // ✅ new
+        userOutTokenAccount,      // ✅ new
         systemProgram: anchor.web3.SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,             // ✅ wajib untuk SPL CPI
       })
       .remainingAccounts(metas)
       .instruction();
+
 
     // compute budget + priority fee
     const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
