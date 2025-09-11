@@ -310,3 +310,4 @@ dump_check.so
 idl_uog_marketplace.json
 jupiter_payload.json
 yarn.lock
+address-generated/

@@ -12,14 +12,16 @@ import {
   LoadedAddresses,
   AddressLookupTableAccount,
 } from "@solana/web3.js";
-import { ComputeBudgetProgram } from "@solana/web3.js";
+import { ComputeBudgetProgram, sendAndConfirmRawTransaction } from "@solana/web3.js";
 import {
   getAssociatedTokenAddress,
   createTransferInstruction,
+  getOrCreateAssociatedTokenAccount,
   createAssociatedTokenAccountInstruction,
   TOKEN_PROGRAM_ID,
   ACCOUNT_SIZE,
   AccountLayout,
+  ASSOCIATED_TOKEN_PROGRAM_ID
 } from "@solana/spl-token";
 import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
@@ -52,6 +54,10 @@ const CUSTOM_TOKENS: Record<string, { id: string, symbol: string, name: string, 
     logoURI: "https://assets.coingecko.com/coins/images/68112/standard/IMG_0011.jpeg" // link resmi coingecko
   }
 };
+const TOKEN_ALIASES: Record<string, string> = {
+  "Gr8Kcyt8UVRF1Pux7YHiK32Spm7cmnFVL6hd7LSLHqoB": UOG_MINT,
+};
+
 // 🔑 Registry default (phantom-like)
 const REGISTRY: Record<
   string,
@@ -76,7 +82,7 @@ const REGISTRY: Record<
     symbol: "UOG",
     logoURI:
       "https://assets.coingecko.com/coins/images/68112/standard/IMG_0011.jpeg",
-    decimals: 9,
+    decimals: 6,
   },
 };
 
@@ -232,7 +238,7 @@ async function toRawAmount(mintAddress: string, uiAmount: number): Promise<bigin
   return raw;
 }
 
-async function getDefaultTokens() {
+async function getDefaultTokens() { 
   const defaultMints = [SOL_MINT, USDC_MINT, UOG_MINT];
   const result: any[] = [];
 
@@ -245,13 +251,13 @@ async function getDefaultTokens() {
       const percentChange = info?.percentChange24h ?? 0;
       const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
 
-      result.push({
+      const tokenData = {
         mint,
         name: REGISTRY[mint]?.name ?? info?.name ?? "",
         symbol: REGISTRY[mint]?.symbol ?? info?.symbol ?? "",
         logoURI: REGISTRY[mint]?.logoURI ?? info?.logoURI ?? "",
         decimals: REGISTRY[mint]?.decimals ?? info?.decimals ?? 0,
-        amount: 0, // wallet kosong
+        amount: 0,
         priceUsd: parseFloat(priceUsd.toFixed(6)),
         usdValue: 0,
         liquidity: parseFloat(liquidity.toFixed(2)),
@@ -259,7 +265,10 @@ async function getDefaultTokens() {
         percentChange: parseFloat(percentChange.toFixed(2)),
         trend,
         holders: info?.holders ?? 0,
-      });
+      };
+
+      console.log("✅ Default token generated:", tokenData);
+      result.push(tokenData);
     } catch (err: any) {
       console.warn(`⚠️ gagal ambil info token ${mint}:`, err.message);
     }
@@ -371,9 +380,16 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       }
     }
 
-    if (!wallet?.tokens?.length) {
-      const defaultTokens = await getDefaultTokens();
+    if (!wallet) {
+      console.warn(`⚠️ Wallet ${address} not found after ${maxRetries} attempts`);
+      return res.status(404).json({ error: "Wallet not found" });
+    }
 
+    // === CASE: Wallet ada tapi token kosong ===
+    if (!wallet?.tokens?.length) {
+      console.warn(`⚠️ Wallet ${address} has no tokens, inserting defaults...`);
+
+      const defaultTokens = await getDefaultTokens();
       if (defaultTokens.length) {
         await Promise.all(
           defaultTokens.map((t) =>
@@ -386,12 +402,11 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         );
       }
 
-      return res.json({
+      return res.status(200).json({
         address,
         tokens: defaultTokens,
-        total: defaultTokens.reduce((sum, t) => sum + t.usdValue, 0),
-        totalSol:
-          defaultTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+        total: defaultTokens.reduce((sum, t) => sum + (t.usdValue ?? 0), 0),
+        totalSol: defaultTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
       });
     }
 
@@ -402,11 +417,8 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       const percentChange = t.events?.["24h"]?.priceChangePercentage ?? 0;
       const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
 
-      return {
-        mint:
-          t.token.symbol === "SOL"
-            ? "So11111111111111111111111111111111111111112"
-            : t.token.mint,
+      const mapped = {
+        mint: t.token.mint,
         name: t.token.name,
         symbol: t.token.symbol,
         logoURI: t.token.image,
@@ -420,10 +432,18 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         trend,
         holders: t.holders ?? 0,
       };
+
+      if (TOKEN_ALIASES[t.token.mint]) {
+        console.log(`🔗 Alias detected: ${t.token.mint} -> ${TOKEN_ALIASES[t.token.mint]}`);
+      }
+
+      // console.log("📌 Token mapped:", mapped);
+      return mapped;
     });
 
     await Promise.all(
       tokens.map(async (t: any) => {
+        // console.log("💾 Upsert to DB:", { address, mint: t.mint });
         await WalletToken.findOneAndUpdate(
           { address, mint: t.mint },
           { ...t, address, lastUpdated: new Date() },
@@ -545,101 +565,159 @@ router.get("/nfts/id/:id", async (req, res) => {
 //
 router.post("/send/build", async (req: Request, res: Response) => {
   try {
-    const { from, to, amount, mint } = req.body;
+    let { from, to, amount, mint } = req.body;
     if (!from || !to || !amount || !mint) {
-      return res.status(400).json({ error: "from, to, amount, and mint are required" });
+      return res
+        .status(400)
+        .json({ error: "from, to, amount, mint are required" });
     }
 
-    console.log("📩 [BUILD TX] Request received");
+    // ✅ Normalisasi mint: paksa SOL dummy ke WSoL mint resmi
+    if (mint === "So11111111111111111111111111111111111111111") {
+      console.warn("⚠️ Mint dummy SOL terdeteksi, pakai WSoL mint resmi instead");
+      mint = "So11111111111111111111111111111111111111112";
+    }
+
+    console.log("📩 [BUILD TX] Request received (via program)");
+    console.log("   Mint :", mint);
     console.log("   🔑 From :", from);
     console.log("   🎯 To   :", to);
     console.log("   💰 Amount (UI):", amount);
-    console.log("   🪙 Mint :", mint);
 
-    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+    const connection = new Connection(
+      process.env.SOLANA_CLUSTER as string,
+      "confirmed"
+    );
     const fromPubkey = new PublicKey(from);
     const toPubkey = new PublicKey(to);
+    const mintPubkey = new PublicKey(mint);
 
-    let ix;
-    if (mint === "So11111111111111111111111111111111111111112") {
-      // === Native SOL transfer ===
-      console.log("⚡ Native SOL transfer detected");
-      const lamports = Math.floor(amount * 1e9);
-      console.log("   💰 Amount raw (lamports):", lamports);
+    // setup Anchor provider & program
+    const provider = new anchor.AnchorProvider(
+      connection,
+      {} as any,
+      { preflightCommitment: "confirmed" }
+    );
+    const idl = require("../../public/idl/universe_of_gamers.json");
+    const programId = new PublicKey(process.env.PROGRAM_ID as string);
+    const program = new anchor.Program(idl, programId, provider);
 
-      ix = SystemProgram.transfer({
-        fromPubkey,
-        toPubkey,
-        lamports,
-      });
-    } else {
-      // === SPL Token transfer ===
-      console.log("🔄 SPL Token transfer detected");
+    // ✅ derive PDA
+    const [marketConfigPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("market_config")],
+      program.programId
+    );
+    const [treasuryPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("treasury")],
+      program.programId
+    );
 
-      const mintPubkey = new PublicKey(mint);
+    console.log("   📂 MarketConfig PDA:", marketConfigPda.toBase58());
 
-      // Ambil info mint → decimals
+    // ==== decimals ====
+    let decimals: number;
+    try {
       const mintInfo = await getMint(connection, mintPubkey);
-      console.log("   🔢 Decimals for mint:", mintInfo.decimals);
+      decimals = mintInfo.decimals;
+    } catch (e: any) {
+      console.warn(`⚠️ getMint failed for ${mint}:`, e.message);
 
-      // Hitung raw amount
-      const rawAmount = BigInt(Math.floor(amount * 10 ** mintInfo.decimals));
-      console.log("   💰 Amount raw (with decimals):", rawAmount.toString());
-
-      // Resolve ATA
-      const fromTokenAccount = await getAssociatedTokenAddress(mintPubkey, fromPubkey);
-      const toTokenAccount   = await getAssociatedTokenAddress(mintPubkey, toPubkey);
-
-      console.log("   📦 FromTokenAccount:", fromTokenAccount.toBase58());
-      console.log("   📦 ToTokenAccount  :", toTokenAccount.toBase58());
-
-      // Cek ATA penerima
-      const toAccountInfo = await connection.getAccountInfo(toTokenAccount);
-      console.log("   🗂️ To ATA exists? :", !!toAccountInfo);
-
-      // Cek balance sender & receiver
-      const fromBalance = await connection.getTokenAccountBalance(fromTokenAccount).catch(() => null);
-      const toBalance = await connection.getTokenAccountBalance(toTokenAccount).catch(() => null);
-      console.log("   📊 Sender balance before:", fromBalance?.value.uiAmountString ?? "N/A");
-      console.log("   📊 Recipient balance before:", toBalance?.value.uiAmountString ?? "0");
-
-      const instructions = [];
-
-      if (!toAccountInfo) {
-        console.log("   ➕ Creating ATA for recipient");
-        instructions.push(
-          createAssociatedTokenAccountInstruction(
-            fromPubkey,
-            toTokenAccount,
-            toPubkey,
-            mintPubkey
-          )
-        );
+      if (mint === "So11111111111111111111111111111111111111112") {
+        decimals = 9; // SOL
+      } else {
+        decimals = 6; // fallback
       }
-
-      instructions.push(
-        createTransferInstruction(
-          fromTokenAccount,
-          toTokenAccount,
-          fromPubkey,
-          rawAmount
-        )
-      );
-
-      ix = instructions;
     }
 
-    const tx = new Transaction().add(...(Array.isArray(ix) ? ix : [ix]));
+    const lamports = BigInt(Math.floor(amount * 10 ** decimals));
+    console.log("   🔢 Token decimals:", decimals);
+    console.log("   💰 Raw amount (lamports):", lamports.toString());
+
+    // ==== SPL ATA resolution ====
+    let senderTokenAccount, recipientTokenAccount, treasuryTokenAccount;
+
+    if (mint !== "So11111111111111111111111111111111111111112") {
+      senderTokenAccount = await getAssociatedTokenAddress(
+        mintPubkey,
+        fromPubkey
+      );
+
+      // 📌 1. default ATA
+      let expectedATA = await getAssociatedTokenAddress(mintPubkey, toPubkey);
+
+      // 📌 2. cek apakah ATA ini ada & punya balance
+      let ataInfo = await connection.getAccountInfo(expectedATA);
+      if (ataInfo) {
+        recipientTokenAccount = expectedATA;
+      } else {
+        // 📌 3. fallback cari token account lain untuk mint yg sama
+        const resp = await connection.getParsedTokenAccountsByOwner(toPubkey, {
+          mint: mintPubkey,
+        });
+
+        if (resp.value.length > 0) {
+          const found = resp.value.find(
+            (acc) =>
+              acc.account.data.parsed.info.tokenAmount.uiAmount &&
+              acc.account.data.parsed.info.tokenAmount.uiAmount > 0
+          );
+          if (found) {
+            recipientTokenAccount = found.pubkey;
+          }
+        }
+
+        // 📌 4. fallback terakhir: pakai expected ATA
+        if (!recipientTokenAccount) {
+          recipientTokenAccount = expectedATA;
+        }
+      }
+
+      treasuryTokenAccount = await getAssociatedTokenAddress(
+        mintPubkey,
+        treasuryPda,
+        true // allowOwnerOffCurve untuk PDA
+      );
+
+      console.log("   📦 Sender ATA:", senderTokenAccount.toBase58());
+      console.log("   📦 Recipient ATA:", recipientTokenAccount.toBase58());
+      console.log("   📦 Treasury ATA:", treasuryTokenAccount.toBase58());
+    }
+
+    // ==== build ix ====
+    const ix = await program.methods
+      .sendToken(new anchor.BN(lamports.toString()))
+      .accounts({
+        sender: fromPubkey,
+        recipient: toPubkey,
+        treasuryPda,
+        mint: mintPubkey,
+        senderTokenAccount: senderTokenAccount ?? fromPubkey,
+        recipientTokenAccount: recipientTokenAccount ?? toPubkey,
+        treasuryTokenAccount: treasuryTokenAccount ?? treasuryPda,
+        marketConfig: marketConfigPda,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+
+    const tx = new Transaction().add(ix);
     tx.feePayer = fromPubkey;
-    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
 
-    console.log("✅ Transaction built successfully");
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash("confirmed");
+    tx.recentBlockhash = blockhash;
+
+    console.log("✅ Transaction built via program");
     console.log("   FeePayer:", tx.feePayer.toBase58());
-    console.log("   Instructions count:", tx.instructions.length);
+    console.log("   Blockhash:", blockhash);
+    console.log("   LastValidBlockHeight:", lastValidBlockHeight);
 
-    // Balikin unsigned tx
     const serialized = tx.serialize({ requireAllSignatures: false });
-    res.json({ tx: serialized.toString("base64") });
+    res.json({
+      tx: serialized.toString("base64"),
+      blockhash,
+      lastValidBlockHeight,
+    });
   } catch (err: any) {
     console.error("❌ build sendToken error:", err);
     res.status(500).json({ error: err.message });
@@ -650,22 +728,70 @@ router.post("/send/build", async (req: Request, res: Response) => {
 // POST /wallet/send/submit
 //
 router.post("/send/submit", async (req: Request, res: Response) => {
+  // bikin connection global di scope function
+  const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+
   try {
-    const { signedTx } = req.body;
+    const { signedTx, blockhash, lastValidBlockHeight } = req.body;
     if (!signedTx) {
       return res.status(400).json({ error: "signedTx is required" });
     }
 
-    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
-    const txBuffer = Buffer.from(signedTx, "base64");
-    const signature = await connection.sendRawTransaction(txBuffer, {
-      skipPreflight: false,
-      maxRetries: 3,
-    });
+    // ✅ Cek apakah blockhash masih valid
+    if (blockhash && lastValidBlockHeight) {
+      const stillValid = await connection.isBlockhashValid(blockhash, lastValidBlockHeight);
+      if (!stillValid) {
+        console.warn("⚠️ Blockhash expired before submit");
+        const { blockhash: newHash, lastValidBlockHeight: newHeight } =
+          await connection.getLatestBlockhash("confirmed");
+        return res.status(409).json({
+          error: "Blockhash expired, please rebuild transaction",
+          blockhash: newHash,
+          lastValidBlockHeight: newHeight,
+        });
+      }
+    }
 
-    await connection.confirmTransaction(signature, "confirmed");
+    const txBuffer = Buffer.from(signedTx, "base64");
+
+    // ✅ Kirim + auto confirm TX
+    const signature = await sendAndConfirmRawTransaction(
+      connection,
+      txBuffer,
+      {
+        skipPreflight: false,
+        commitment: "confirmed",
+        maxRetries: 3,
+      }
+    );
+    console.log("✅ Sent + Confirmed:", signature);
+
+    // ✅ Extra confirm pakai getSignatureStatuses
+    let status = null;
+    for (let i = 0; i < 15; i++) {
+      const st = await connection.getSignatureStatuses([signature]);
+      status = st.value[0];
+      if (status && status.confirmationStatus === "confirmed") break;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    if (!status) {
+      throw new Error("Transaction not confirmed within retries");
+    }
+
+    console.log("✅ Confirmed transaction:", signature);
     res.json({ signature });
   } catch (err: any) {
+    if (err.message?.includes("Blockhash not found")) {
+      const { blockhash: newHash, lastValidBlockHeight: newHeight } =
+        await connection.getLatestBlockhash("finalized");
+      return res.status(409).json({
+        error: "Blockhash expired, please rebuild transaction",
+        blockhash: newHash,
+        lastValidBlockHeight: newHeight,
+      });
+    }
+
     console.error("❌ submit sendToken error:", err);
     res.status(500).json({ error: err.message });
   }
@@ -752,7 +878,7 @@ router.post("/swap/build", async (req: Request, res: Response) => {
     });
 
     // load UOG marketplace IDL
-    const idlUog = require("../../public/idl/uog_marketplace.json");
+    const idlUog = require("../../public/idl/universe_of_gamers.json");
     const programUog = new anchor.Program(
       idlUog,
       new PublicKey(process.env.PROGRAM_ID as string),
@@ -789,18 +915,44 @@ router.post("/swap/build", async (req: Request, res: Response) => {
       programUog.programId
     );
 
+    // === derive ATA untuk treasury dan user ===
+    const outputMint = aggIx.keys.find(k => k.isWritable)?.pubkey; // ambil mint dari aggregator keys (atau parse dari quote)
+    if (!outputMint) throw new Error("❌ Cannot determine outputMint from aggregator tx");
+
+    // ATA user (output token hasil swap)
+    const userOutTokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(outputMint),
+      fromPubkey,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    // ATA treasury
+    const treasuryTokenAccount = await getAssociatedTokenAddress(
+      new PublicKey(outputMint),
+      treasuryPda,
+      true, // pda = true
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
     // build ix untuk UOG program
     const ix = await programUog.methods
-      .swapToken(ixData, new anchor.BN(0)) // amount opsional
+      .swapToken(ixData, new anchor.BN(0))
       .accounts({
         user: fromPubkey,
         dexProgram: aggIx.programId,
         marketConfig: marketConfigPda,
         treasuryPda,
+        treasuryTokenAccount,     // ✅ new
+        userOutTokenAccount,      // ✅ new
         systemProgram: anchor.web3.SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,             // ✅ wajib untuk SPL CPI
       })
       .remainingAccounts(metas)
       .instruction();
+
 
     // compute budget + priority fee
     const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });

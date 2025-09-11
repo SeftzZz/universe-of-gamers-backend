@@ -35,7 +35,7 @@ const programIdStr = process.env.PROGRAM_ID;
 if (!programIdStr) throw new Error("❌ PROGRAM_ID is missing in .env");
 
 const programID = new PublicKey(programIdStr.trim());
-const idl = require("../../public/idl/uog_marketplace.json");
+const idl = require("../../public/idl/universe_of_gamers.json");
 
 // 🔍 Tambahkan log debug
 console.log("⚙️ [nft.ts] PROGRAM_ID =", programID.toBase58());
