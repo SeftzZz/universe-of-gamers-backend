@@ -28,6 +28,7 @@ export interface ICustodialWallet {
   provider: 'solana' | 'ethereum';
   address: string;
   privateKey: string; // encrypted
+  mnemonic?: string;
 }
 
 const CustodialWalletSchema = new Schema<ICustodialWallet>(
@@ -39,6 +40,7 @@ const CustodialWalletSchema = new Schema<ICustodialWallet>(
     },
     address: { type: String, required: true },
     privateKey: { type: String, required: true },
+    mnemonic: { type: String, required: true },
   },
   { _id: false }
 );
