@@ -47,9 +47,12 @@ const CharacterSchema = new Schema<ICharacter>(
     spd: { type: Number, min: 0, required: true },
     critRate: { type: Number, min: 0, max: 100, default: 0 },
     critDmg: { type: Number, min: 0, max: 500, default: 0 },
-    basicAttack: { type: SkillSchema, required: true },
-    skillAttack: { type: SkillSchema, required: true },
-    ultimateAttack: { type: SkillSchema, required: true },
+    // basicAttack: { type: SkillSchema, required: true },
+    // skillAttack: { type: SkillSchema, required: true },
+    // ultimateAttack: { type: SkillSchema, required: true },
+    basicAttack: { type: SkillSchema, default: {} },
+    skillAttack: { type: SkillSchema, default: {} },
+    ultimateAttack: { type: SkillSchema, default: {} },
     createdAt: { type: Date, default: Date.now }
   },
   { collection: "characters" } // add by fpp 05/09/25

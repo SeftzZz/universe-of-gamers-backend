@@ -36,6 +36,22 @@ export function encrypt(text: string): string {
  * @param encryptedData data terenkripsi base64
  * @returns private key asli
  */
+// export function decrypt(encryptedData: string): string {
+//   const data = Buffer.from(encryptedData, "base64");
+
+//   const iv = data.slice(0, IV_LENGTH);
+//   const authTag = data.slice(IV_LENGTH, IV_LENGTH + 16);
+//   const encrypted = data.slice(IV_LENGTH + 16);
+
+//   const decipher = crypto.createDecipheriv(ALGORITHM, KEY, iv);
+//   decipher.setAuthTag(authTag);
+
+//   let decrypted = decipher.update(encrypted, undefined, "utf8");
+//   decrypted += decipher.final("utf8");
+
+//   return decrypted;
+// }
+
 export function decrypt(encryptedData: string): string {
   const data = Buffer.from(encryptedData, "base64");
 

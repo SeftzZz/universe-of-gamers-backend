@@ -124,6 +124,18 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.get('/decrypt', async (req, res) => {
+  const encryptedFromDB =
+    "VGeGRFaaNrSGcNnyi3UvfHn37uQLtNvi/IPgeEWl8ZpinYbkccMFTUv+ygf16DPJDGNMoOOS3NQN7aZFLbBN1w0/7Wdej2BFY+jgXBUEdBfa+zGXc7FAogr6L83WSighUYKaRFqbnKTZOv//lYh3ezMz2cJ5YuM="; // ganti dengan string terenkripsi kamu
+
+  try {
+    const privateKey = decrypt(encryptedFromDB);
+    console.log("🔑 Private Key asli:", privateKey);
+  } catch (err) {
+    console.error("❌ Gagal decrypt:", err);
+  }
+});
+
 // === Login with Google ===
 router.post('/google', async (req, res) => {
   try {
