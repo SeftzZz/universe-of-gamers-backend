@@ -437,7 +437,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         console.log(`🔗 Alias detected: ${t.token.mint} -> ${TOKEN_ALIASES[t.token.mint]}`);
       }
 
-      console.log("📌 Token mapped:", mapped);
+      // console.log("📌 Token mapped:", mapped);
       return mapped;
     });
 
