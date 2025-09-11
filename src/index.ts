@@ -9,6 +9,7 @@ import authRoutes from "./routes/auth";
 import solRoutes from './routes/sol';
 import dotenv from "dotenv";
 import characterRoutes from "./routes/character"; // add by fpp 05/09/25
+import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
 dotenv.config();
 
 const app = express();

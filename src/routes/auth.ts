@@ -2,6 +2,7 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import Auth from '../models/Auth';
 import { ICustodialWallet } from '../models/Auth';
+import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
 import { encrypt, decrypt } from '../utils/cryptoHelper';
 import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
@@ -88,18 +89,6 @@ router.post('/register', async (req, res) => {
   } catch (err: any) {
     console.error("❌ Register error:", err.message);
     res.status(400).json({ error: err.message });
-  }
-});
-
-router.get('/decrypt', async (req, res) => {
-  const encryptedFromDB =
-    "02PSMY6sehQvuJNLbMHfdr32rw9PpnrZ1aOwi0gxmL9+jVw+zBeBn1RQaoLLnmmJrGRAehNiWcgeMOX8VkE1k1cFnVkem+jutKLyYPbPo2c7+4Ca30bZnhjr6TGwRExRdT/R8qGysYZOSZyF4GoNuIoshFggjPc="; // ganti dengan string terenkripsi kamu
-
-  try {
-    const privateKey = decrypt(encryptedFromDB);
-    console.log("🔑 Private Key asli:", privateKey);
-  } catch (err) {
-    console.error("❌ Gagal decrypt:", err);
   }
 });
 
@@ -338,6 +327,59 @@ router.put('/user/:id/notifications', async (req, res) => {
   }
 });
 
+// === Export Custodial Private Key (Protected) ===
+router.get("/user/:id/export/private", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { address } = req.query;
+    if (!address || typeof address !== "string") {
+      return res.status(400).json({ error: "Missing or invalid wallet address" });
+    }
+
+    // ⚠️ Pastikan user hanya bisa akses dirinya sendiri (kecuali admin)
+    if (req.user.id !== req.params.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Forbidden: not your account" });
+    }
+
+    // 🔍 Cari user + ambil field privateKey
+    const user = await Auth.findById(req.params.id).select(
+      "+custodialWallets.privateKey +custodialWallets.address +custodialWallets.provider"
+    );
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // 🔍 Cari wallet sesuai address
+    const wallet = user.custodialWallets.find(
+      (w: any) => w.address === address
+    );
+    if (!wallet) {
+      return res.status(404).json({ error: "Wallet not found" });
+    }
+
+    // 🔓 Decrypt private key
+    let privateKey: string;
+    try {
+      privateKey = decrypt(wallet.privateKey);
+    } catch (err: any) {
+      console.error("❌ Failed to decrypt private key:", err);
+      return res.status(500).json({ error: "Failed to decrypt private key" });
+    }
+
+    return res.json({
+      success: true,
+      userId: user._id,
+      wallet: {
+        provider: wallet.provider,
+        address: wallet.address,
+      },
+      privateKey, // ⚠️ hanya keluar kalau JWT valid
+    });
+  } catch (err: any) {
+    console.error("❌ Error export private key:", err);
+    return res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
 // === Import Recovery Phrase ===
 router.post('/import/phrase', async (req, res) => {
   try {
@@ -411,79 +453,6 @@ router.post('/import/phrase', async (req, res) => {
     });
   } catch (err: any) {
     console.error('❌ Import phrase error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === Import Private Key ===
-router.post('/import/private', async (req, res) => {
-  try {
-    const { userId, privateKey, name } = req.body;
-    if (!privateKey) {
-      return res.status(400).json({ error: 'Missing privateKey' });
-    }
-
-    const secret = bs58.decode(privateKey);
-    const kp = Keypair.fromSecretKey(secret);
-
-    const address = kp.publicKey.toBase58();
-    const displayName = name || address;
-
-    let auth;
-
-    if (userId) {
-      auth = await Auth.findById(userId);
-      if (!auth) return res.status(404).json({ error: 'User not found' });
-    } else {
-      // cek apakah user dengan address ini sudah ada
-      auth = await Auth.findOne({
-        $or: [
-          { name: displayName },
-          { 'wallets.address': address },
-          { 'custodialWallets.address': address },
-        ],
-      });
-
-      if (!auth) {
-        auth = new Auth({
-          name: displayName,
-          authProvider: 'custodial',
-          custodialWallets: [],
-          wallets: [],
-          avatar: '',
-        });
-      }
-    }
-
-    const alreadyExists =
-      auth.wallets.some((w) => w.address === address) ||
-      auth.custodialWallets.some((w) => w.address === address);
-
-    if (!alreadyExists) {
-      const wallet: ICustodialWallet = {
-        provider: 'solana',
-        address,
-        privateKey: encrypt(privateKey),
-      };
-      auth.custodialWallets.push(wallet);
-      await auth.save();
-    }
-
-    // refresh dari DB
-    const freshAuth = await Auth.findById(auth._id);
-    if (!freshAuth) return res.status(404).json({ error: 'User not found after save' });
-
-    const token = generateToken(freshAuth);
-
-    res.json({
-      success: true,
-      message: alreadyExists ? 'Wallet already exists' : 'Private key imported',
-      authId: freshAuth._id,
-      wallet: { provider: 'solana', address },
-      token,
-    });
-  } catch (err: any) {
-    console.error('❌ Import private key error:', err);
     res.status(500).json({ error: err.message });
   }
 });
