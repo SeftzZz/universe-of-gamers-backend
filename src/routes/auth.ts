@@ -4,13 +4,13 @@ import Auth from '../models/Auth';
 import { ICustodialWallet } from '../models/Auth';
 import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
 import { encrypt, decrypt } from '../utils/cryptoHelper';
-import { Keypair } from '@solana/web3.js';
+import { Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import bcrypt from 'bcrypt';
 import multer from 'multer';
 import path from 'path';
 
-import { mnemonicToSeedSync } from 'bip39';
+import { generateMnemonic, mnemonicToSeedSync } from 'bip39';
 import nacl from 'tweetnacl';
 import * as ed25519 from 'ed25519-hd-key';
 
@@ -25,6 +25,9 @@ const storage = multer.diskStorage({
   }
 });
 const upload = multer({ storage });
+
+// simpan di luar router
+const walletChallenges: Map<string, string> = new Map();
 
 const router = express.Router();
 
@@ -47,14 +50,20 @@ router.post('/register', async (req, res) => {
     const { name, email, password, acceptedTerms } = req.body;
 
     // ✅ Generate custodial wallet (Solana)
-    const kp = Keypair.generate();
-    const privateKeyBase58 = bs58.encode(kp.secretKey);
+    const mnemonic = generateMnemonic(128); // 12 kata
+    const seed = mnemonicToSeedSync(mnemonic);
+    const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
+    const naclKP = nacl.sign.keyPair.fromSeed(derived);
+    const kp = Keypair.fromSecretKey(naclKP.secretKey);
+
     const address = kp.publicKey.toBase58();
+    const privateKeyBase58 = bs58.encode(kp.secretKey);
 
     const custodialWallet: ICustodialWallet = {
-      provider: 'solana', // ⬅️ type-safe
+      provider: 'solana',
       address,
       privateKey: encrypt(privateKeyBase58),
+      mnemonic: encrypt(mnemonic),
     };
 
     const auth = new Auth({
@@ -84,7 +93,7 @@ router.post('/register', async (req, res) => {
       custodialWallets: auth.custodialWallets.map(w => ({
         provider: w.provider,
         address: w.address,
-      })), // ❌ privateKey tetap hidden
+      })), // ❌ privateKey & mnemonic tetap hidden
     });
   } catch (err: any) {
     console.error("❌ Register error:", err.message);
@@ -155,11 +164,47 @@ router.post('/google', async (req, res) => {
   }
 });
 
+// === Challenge endpoint ===
+router.get('/wallet/challenge', async (req, res) => {
+  const { address } = req.query;
+  if (!address) return res.status(400).json({ error: 'Missing address' });
+
+  const nonce = Math.floor(Math.random() * 1e9).toString();
+  walletChallenges.set(address as string, nonce);
+
+  res.json({
+    message: `Login to UniverseOfGamers with wallet ${address}, nonce=${nonce}`,
+    nonce,
+  });
+});
+
 // === Login / Import External Wallet ===
 router.post('/wallet', async (req, res) => {
   try {
-    const { provider, address, name } = req.body;
+    const { provider, address, name, signature, nonce } = req.body;
+    if (!address || !signature || !nonce) {
+      return res.status(400).json({ error: 'Missing address, signature or nonce' });
+    }
 
+    // ✅ Ambil nonce yg tersimpan
+    const expectedNonce = walletChallenges.get(address);
+    if (!expectedNonce || expectedNonce !== nonce) {
+      return res.status(400).json({ error: 'Invalid or expired nonce' });
+    }
+    walletChallenges.delete(address); // sekali pakai
+
+    // ✅ Verifikasi signature
+    const message = `Login to UniverseOfGamers with wallet ${address}, nonce=${nonce}`;
+    const isValid = nacl.sign.detached.verify(
+      new TextEncoder().encode(message),
+      bs58.decode(signature),
+      new PublicKey(address).toBytes()
+    );
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    // === Lanjut login ===
     let auth = await Auth.findOne({ 'wallets.address': address });
 
     if (!auth) {
@@ -180,7 +225,6 @@ router.post('/wallet', async (req, res) => {
 
     const token = generateToken(auth);
 
-    // ✅ hide privateKey
     const custodialWallets = (auth.custodialWallets || []).map((w) => ({
       provider: w.provider,
       address: w.address,
@@ -239,6 +283,124 @@ router.post('/create/custodial', async (req, res) => {
   } catch (err: any) {
     console.error("❌ Error create custodial wallet:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// === Import Recovery Phrase ===
+router.post('/import/phrase', async (req, res) => {
+  try {
+    const { userId, phrase, name } = req.body;
+    if (!phrase) {
+      return res.status(400).json({ error: 'Missing recovery phrase' });
+    }
+
+    // 🔑 generate keypair dari seed phrase
+    const seed = mnemonicToSeedSync(phrase);
+    const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
+    const kp = nacl.sign.keyPair.fromSeed(derived);
+
+    const privateKeyBase58 = bs58.encode(Buffer.from(kp.secretKey));
+    const address = bs58.encode(Buffer.from(kp.publicKey));
+    const displayName = name || address;
+
+    let auth;
+
+    if (userId) {
+      auth = await Auth.findById(userId);
+      if (!auth) return res.status(404).json({ error: 'User not found' });
+    } else {
+      // cek apakah user dengan address ini sudah ada
+      auth = await Auth.findOne({
+        $or: [
+          { name: displayName },
+          { 'wallets.address': address },
+          { 'custodialWallets.address': address },
+        ],
+      });
+
+      if (!auth) {
+        auth = new Auth({
+          name: displayName,
+          authProvider: 'custodial',
+          custodialWallets: [],
+          wallets: [],
+          avatar: '',
+        });
+      }
+    }
+
+    // cek apakah wallet sudah ada
+    const alreadyExists =
+      auth.wallets.some((w) => w.address === address) ||
+      auth.custodialWallets.some((w) => w.address === address);
+
+    if (!alreadyExists) {
+      const wallet: ICustodialWallet = {
+        provider: 'solana',
+        address,
+        privateKey: encrypt(privateKeyBase58),
+        mnemonic: encrypt(phrase)
+      };
+      auth.custodialWallets.push(wallet);
+      await auth.save();
+    }
+
+    // refresh dari DB
+    const freshAuth = await Auth.findById(auth._id);
+    if (!freshAuth) return res.status(404).json({ error: 'User not found after save' });
+
+    const token = generateToken(freshAuth);
+
+    res.json({
+      success: true,
+      message: alreadyExists ? 'Wallet already exists' : 'Recovery phrase imported',
+      authId: freshAuth._id,
+      wallet: { provider: 'solana', address },
+      token,
+    });
+  } catch (err: any) {
+    console.error('❌ Import phrase error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Forget Password ===
+router.post('/forget-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+    console.log("📩 [FORGET PASSWORD] Request received");
+    console.log("   📧 Email:", email);
+
+    // 🔎 Debug: tampilkan semua email user
+    const allUsers = await Auth.find({}, 'email').lean();
+    console.log("📜 All registered emails:", allUsers.map(u => u.email));
+
+    if (!email || !newPassword) {
+      console.warn("⚠️ Missing email or newPassword in request body");
+      return res.status(400).json({ error: 'Missing email or newPassword' });
+    }
+
+    const user = await Auth.findOne({ email });
+    if (!user) {
+      console.warn("❌ User not found for email:", email);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (newPassword.length < 8) {
+      console.warn("⚠️ Password too short for email:", email);
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    // ganti password → auto hash di pre('save')
+    user.password = newPassword;
+    await user.save();
+
+    console.log("✅ Password reset successfully for email:", email);
+
+    return res.json({ success: true, message: 'Password reset successfully' });
+  } catch (err: unknown) {
+    console.error('❌ Forget password error:', (err as Error).message);
+    return res.status(500).json({ error: (err as Error).message });
   }
 });
 
@@ -392,120 +554,57 @@ router.get("/user/:id/export/private", authenticateJWT, async (req: AuthRequest,
   }
 });
 
-// === Import Recovery Phrase ===
-router.post('/import/phrase', async (req, res) => {
+// === Export Custodial Recovery Phrase (Protected) ===
+router.get("/user/:id/export/phrase", authenticateJWT, async (req: AuthRequest, res) => {
   try {
-    const { userId, phrase, name } = req.body;
-    if (!phrase) {
-      return res.status(400).json({ error: 'Missing recovery phrase' });
+    const { address } = req.query;
+    if (!address || typeof address !== "string") {
+      return res.status(400).json({ error: "Missing or invalid wallet address" });
     }
 
-    // 🔑 generate keypair dari seed phrase
-    const seed = mnemonicToSeedSync(phrase);
-    const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
-    const kp = nacl.sign.keyPair.fromSeed(derived);
-
-    const privateKeyBase58 = bs58.encode(Buffer.from(kp.secretKey));
-    const address = bs58.encode(Buffer.from(kp.publicKey));
-    const displayName = name || address;
-
-    let auth;
-
-    if (userId) {
-      auth = await Auth.findById(userId);
-      if (!auth) return res.status(404).json({ error: 'User not found' });
-    } else {
-      // cek apakah user dengan address ini sudah ada
-      auth = await Auth.findOne({
-        $or: [
-          { name: displayName },
-          { 'wallets.address': address },
-          { 'custodialWallets.address': address },
-        ],
-      });
-
-      if (!auth) {
-        auth = new Auth({
-          name: displayName,
-          authProvider: 'custodial',
-          custodialWallets: [],
-          wallets: [],
-          avatar: '',
-        });
-      }
+    // hanya owner atau admin
+    if (req.user.id !== req.params.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Forbidden: not your account" });
     }
 
-    // cek apakah wallet sudah ada
-    const alreadyExists =
-      auth.wallets.some((w) => w.address === address) ||
-      auth.custodialWallets.some((w) => w.address === address);
-
-    if (!alreadyExists) {
-      const wallet: ICustodialWallet = {
-        provider: 'solana',
-        address,
-        privateKey: encrypt(privateKeyBase58),
-      };
-      auth.custodialWallets.push(wallet);
-      await auth.save();
+    // cari user
+    const user = await Auth.findById(req.params.id).select(
+      "+custodialWallets.mnemonic +custodialWallets.address +custodialWallets.provider"
+    );
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
     }
 
-    // refresh dari DB
-    const freshAuth = await Auth.findById(auth._id);
-    if (!freshAuth) return res.status(404).json({ error: 'User not found after save' });
+    // cari wallet
+    const wallet = user.custodialWallets.find((w: any) => w.address === address);
+    if (!wallet) {
+      return res.status(404).json({ error: "Wallet not found" });
+    }
+    if (!wallet.mnemonic) {
+      return res.status(404).json({ error: "Recovery phrase not available" });
+    }
 
-    const token = generateToken(freshAuth);
+    // decrypt phrase
+    let phrase: string;
+    try {
+      phrase = decrypt(wallet.mnemonic);
+    } catch (err: any) {
+      console.error("❌ Failed to decrypt phrase:", err);
+      return res.status(500).json({ error: "Failed to decrypt recovery phrase" });
+    }
 
-    res.json({
+    return res.json({
       success: true,
-      message: alreadyExists ? 'Wallet already exists' : 'Recovery phrase imported',
-      authId: freshAuth._id,
-      wallet: { provider: 'solana', address },
-      token,
+      userId: user._id,
+      wallet: {
+        provider: wallet.provider,
+        address: wallet.address,
+      },
+      recoveryPhrase: phrase, // ⚠️ hati-hati expose ke frontend
     });
   } catch (err: any) {
-    console.error('❌ Import phrase error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// === Forget Password ===
-router.post('/forget-password', async (req, res) => {
-  try {
-    const { email, newPassword } = req.body;
-    console.log("📩 [FORGET PASSWORD] Request received");
-    console.log("   📧 Email:", email);
-
-    // 🔎 Debug: tampilkan semua email user
-    const allUsers = await Auth.find({}, 'email').lean();
-    console.log("📜 All registered emails:", allUsers.map(u => u.email));
-
-    if (!email || !newPassword) {
-      console.warn("⚠️ Missing email or newPassword in request body");
-      return res.status(400).json({ error: 'Missing email or newPassword' });
-    }
-
-    const user = await Auth.findOne({ email });
-    if (!user) {
-      console.warn("❌ User not found for email:", email);
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    if (newPassword.length < 8) {
-      console.warn("⚠️ Password too short for email:", email);
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    }
-
-    // ganti password → auto hash di pre('save')
-    user.password = newPassword;
-    await user.save();
-
-    console.log("✅ Password reset successfully for email:", email);
-
-    return res.json({ success: true, message: 'Password reset successfully' });
-  } catch (err: unknown) {
-    console.error('❌ Forget password error:', (err as Error).message);
-    return res.status(500).json({ error: (err as Error).message });
+    console.error("❌ Error export phrase:", err);
+    return res.status(500).json({ error: err.message || "Internal server error" });
   }
 });
 

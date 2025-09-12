@@ -267,7 +267,7 @@ async function getDefaultTokens() {
         holders: info?.holders ?? 0,
       };
 
-      console.log("✅ Default token generated:", tokenData);
+      // console.log("✅ Default token generated:", tokenData);
       result.push(tokenData);
     } catch (err: any) {
       console.warn(`⚠️ gagal ambil info token ${mint}:`, err.message);
@@ -362,6 +362,30 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Missing wallet address" });
     }
 
+    const MAX_CACHE_AGE = 5 * 60 * 1000; // 5 menit
+    const now = Date.now();
+
+    // 1️⃣ Cek database dulu
+    let dbTokens = await WalletToken.find({ address }).lean();
+
+    if (dbTokens.length) {
+      const allFresh = dbTokens.every(
+        (t) => now - new Date(t.lastUpdated).getTime() < MAX_CACHE_AGE
+      );
+
+      if (allFresh) {
+        console.log(`✅ Returning cached tokens for ${address}`);
+        return res.json({
+          address,
+          tokens: dbTokens,
+          total: dbTokens.reduce((sum, t) => sum + (t.usdValue ?? 0), 0),
+          totalSol: dbTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+          source: "db-cache",
+        });
+      }
+    }
+
+    // 2️⃣ Kalau tidak fresh → fetch dari API
     let wallet: any = null;
     let attempt = 0;
     const maxRetries = 3;
@@ -375,20 +399,30 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         attempt++;
         console.warn(`⚠️ getWallet attempt ${attempt} failed:`, (err as any).message);
         if (attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, 1000 * attempt)); // backoff
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
         }
       }
     }
 
     if (!wallet) {
       console.warn(`⚠️ Wallet ${address} not found after ${maxRetries} attempts`);
+      // fallback terakhir → return data lama dari DB meskipun expired
+      if (dbTokens.length) {
+        console.log(`⚡ Returning expired cache for ${address}`);
+        return res.json({
+          address,
+          tokens: dbTokens,
+          total: dbTokens.reduce((sum, t) => sum + (t.usdValue ?? 0), 0),
+          totalSol: dbTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+          source: "db-expired",
+        });
+      }
       return res.status(404).json({ error: "Wallet not found" });
     }
 
-    // === CASE: Wallet ada tapi token kosong ===
+    // 3️⃣ Kalau wallet ada tapi token kosong
     if (!wallet?.tokens?.length) {
       console.warn(`⚠️ Wallet ${address} has no tokens, inserting defaults...`);
-
       const defaultTokens = await getDefaultTokens();
       if (defaultTokens.length) {
         await Promise.all(
@@ -402,14 +436,16 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         );
       }
 
-      return res.status(200).json({
+      return res.json({
         address,
         tokens: defaultTokens,
         total: defaultTokens.reduce((sum, t) => sum + (t.usdValue ?? 0), 0),
         totalSol: defaultTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+        source: "defaults",
       });
     }
 
+    // 4️⃣ Map token hasil API
     const tokens = wallet.tokens.map((t: any) => {
       const priceUsd = t.pools?.[0]?.price?.usd ?? 0;
       const liquidity = t.pools?.[0]?.liquidity?.usd ?? 0;
@@ -417,7 +453,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       const percentChange = t.events?.["24h"]?.priceChangePercentage ?? 0;
       const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
 
-      const mapped = {
+      return {
         mint: t.token.mint,
         name: t.token.name,
         symbol: t.token.symbol,
@@ -432,24 +468,17 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
         trend,
         holders: t.holders ?? 0,
       };
-
-      if (TOKEN_ALIASES[t.token.mint]) {
-        console.log(`🔗 Alias detected: ${t.token.mint} -> ${TOKEN_ALIASES[t.token.mint]}`);
-      }
-
-      // console.log("📌 Token mapped:", mapped);
-      return mapped;
     });
 
+    // 5️⃣ Update DB dengan data baru
     await Promise.all(
-      tokens.map(async (t: any) => {
-        // console.log("💾 Upsert to DB:", { address, mint: t.mint });
-        await WalletToken.findOneAndUpdate(
+      tokens.map((t: any) =>
+        WalletToken.findOneAndUpdate(
           { address, mint: t.mint },
           { ...t, address, lastUpdated: new Date() },
           { upsert: true, new: true }
-        );
-      })
+        )
+      )
     );
 
     res.json({
@@ -457,6 +486,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       tokens,
       total: wallet.total ?? 0,
       totalSol: wallet.totalSol ?? 0,
+      source: "api",
     });
   } catch (err: any) {
     console.error("❌ Error fetching wallet:", err);

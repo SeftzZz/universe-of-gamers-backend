@@ -60,6 +60,71 @@ router.post("/make-tx", async (req: Request, res) => {
     const balSeller = await provider.connection.getBalance(sellerPk);
     console.log("💳 Seller balance (lamports):", balSeller);
 
+    // TODO
+    // Step 1
+    // Buat struktur untuk metadata-nft
+    // Upload file json ke server
+    // "displayName": "Monster test 01",
+    // "element": "Fire",
+    // "image": "https://api.universeofgamers.io/uploads/nfts/monster.png"
+    // "level": 1,
+    // "hp": 1,
+    // "atk": 1,
+    // "def": 1,
+    // "spd": 1,
+    // "critRate": 1,
+    // "critDmg": 1,
+    // "basicAttack": {
+    //   "skillName": "Basic test 01",
+    //   "atkMultiplier": 1,
+    //   "defMultiplier": 1,
+    //   "hpMultiplier": 1,
+    //   "description": "Basic test 01",
+    //   "_id": {
+    //     "$oid": "68bef8b8ad6a1ddfd02478f4"
+    //   }
+    // },
+    // "skillAttack": {
+    //   "skillName": "Skill test 01",
+    //   "atkMultiplier": 1,
+    //   "defMultiplier": 1,
+    //   "hpMultiplier": 1,
+    //   "description": "Skill test 01",
+    //   "_id": {
+    //     "$oid": "68bef8b8ad6a1ddfd02478f5"
+    //   }
+    // },
+    // "ultimateAttack": {
+    //   "skillName": "Ultimate test 01",
+    //   "atkMultiplier": 1,
+    //   "defMultiplier": 1,
+    //   "hpMultiplier": 1,
+    //   "description": "Ultimate test 01",
+    //   "_id": {
+    //     "$oid": "68bef8b8ad6a1ddfd02478f6"
+    //   }
+    // },
+    // "createdAt": {
+    //   "$date": "2025-09-08T15:39:36.570Z"
+    // }
+
+    // Step 2
+    // Ambil url file json nft nya
+    // Buat struktur untuk metadata
+    // metadata: any = {
+    //   name: 'Monster UOG',
+    //   symbol: 'MUOG',
+    //   uri: 'isi url file json nft',
+    //   description: 'Monster with Trident',
+    //   price: '0.001',
+    //   properties: 'No Properties',
+    //   size: '10',
+    //   blockchain: 'Solana',
+    //   collection: 'UOG Collections',
+    //   royalty: '8',
+    //   owner: this.userAddress,
+    // };
+
     // --- Konversi price & royalty ke lamports ---
     const priceLamports = Math.floor(Number(metadata.price) * LAMPORTS_PER_SOL);
     const royaltyPercent = Number(metadata.royalty || "0"); // frontend: 8 → 8%
