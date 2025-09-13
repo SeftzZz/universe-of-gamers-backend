@@ -11,6 +11,8 @@ import {
   TransactionMessage,
   LoadedAddresses,
   AddressLookupTableAccount,
+  TransactionInstruction,
+  ParsedAccountData,
 } from "@solana/web3.js";
 import { ComputeBudgetProgram, sendAndConfirmRawTransaction } from "@solana/web3.js";
 import {
@@ -21,7 +23,12 @@ import {
   TOKEN_PROGRAM_ID,
   ACCOUNT_SIZE,
   AccountLayout,
-  ASSOCIATED_TOKEN_PROGRAM_ID
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  createSyncNativeInstruction, 
+  NATIVE_MINT,
+  createCloseAccountInstruction,
+  getAccount,
+  createApproveInstruction
 } from "@solana/spl-token";
 import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
@@ -44,6 +51,10 @@ const router = Router();
 const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const DUMMY_SOL_MINT = "So11111111111111111111111111111111111111111";
+export const WSOL_MINT = new PublicKey(
+  "So11111111111111111111111111111111111111112"
+);
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const UOG_MINT = "B6VWNAqRu2tZcYeBJ1i1raw4eaVP4GrkL2YcZLshbonk";
 const CUSTOM_TOKENS: Record<string, { id: string, symbol: string, name: string, logoURI: string }> = {
@@ -275,6 +286,30 @@ async function getDefaultTokens() {
   }
 
   return result;
+}
+
+async function logAccountOwner(connection: Connection, label: string, pubkey: PublicKey) {
+  try {
+    const info = await connection.getParsedAccountInfo(pubkey);
+    if (!info.value) {
+      console.log(`❌ ${label}: ${pubkey.toBase58()} (account not found)`);
+      return;
+    }
+
+    const acc = info.value;
+    console.log(`🔎 ${label}: ${pubkey.toBase58()}`);
+    console.log("   Lamports:", acc.lamports);
+    console.log("   Program Owner:", acc.owner.toBase58());
+
+    if ("parsed" in acc.data) {
+      const parsed = acc.data as ParsedAccountData;
+      console.log("   Parsed type:", parsed.program);
+      console.log("   Token owner:", parsed.parsed?.info?.owner);
+      console.log("   Mint:", parsed.parsed?.info?.mint);
+    }
+  } catch (err) {
+    console.error(`⚠️ Gagal cek owner untuk ${label}: ${pubkey.toBase58()}`, err);
+  }
 }
 
 //
@@ -663,76 +698,142 @@ router.post("/send/build", async (req: Request, res: Response) => {
     console.log("   🔢 Token decimals:", decimals);
     console.log("   💰 Raw amount (lamports):", lamports.toString());
 
-    // ==== SPL ATA resolution ====
     let senderTokenAccount, recipientTokenAccount, treasuryTokenAccount;
+    const preInstructions: TransactionInstruction[] = [];
+    const tx = new Transaction();
 
-    if (mint !== "So11111111111111111111111111111111111111112") {
-      senderTokenAccount = await getAssociatedTokenAddress(
-        mintPubkey,
-        fromPubkey
-      );
+    if (mint === "So11111111111111111111111111111111111111112") {
+      // === Kirim SOL native ===
+      console.log("⚡ Native SOL transfer detected");
 
-      // 📌 1. default ATA
-      let expectedATA = await getAssociatedTokenAddress(mintPubkey, toPubkey);
+      const transferToRecipient = SystemProgram.transfer({
+        fromPubkey,
+        toPubkey,
+        lamports: Number(lamports),
+      });
 
-      // 📌 2. cek apakah ATA ini ada & punya balance
-      let ataInfo = await connection.getAccountInfo(expectedATA);
-      if (ataInfo) {
-        recipientTokenAccount = expectedATA;
+      const transferToTreasury = SystemProgram.transfer({
+        fromPubkey,
+        toPubkey: treasuryPda,
+        lamports: 0, // 👉 ganti sesuai fee
+      });
+
+      tx.add(transferToRecipient, transferToTreasury);
+
+    } else {
+      // === Kirim SPL Token ===
+
+      // 🔍 Cari sender token account (cek semua token accounts, fallback ke ATA)
+      // Cari semua token accounts milik sender
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(fromPubkey, {
+        mint: mintPubkey,
+      });
+
+      if (tokenAccounts.value.length > 0) {
+        // pilih account dengan saldo terbesar
+        const sorted = tokenAccounts.value.sort(
+          (a, b) =>
+            Number(b.account.data.parsed.info.tokenAmount.amount) -
+            Number(a.account.data.parsed.info.tokenAmount.amount)
+        );
+        senderTokenAccount = sorted[0].pubkey;
+        const balanceLamports = sorted[0].account.data.parsed.info.tokenAmount.amount;
+        console.log(
+          `⚡ Sender pakai token account dengan saldo: ${balanceLamports}`
+        );
+
+        if (BigInt(balanceLamports) < lamports) {
+          throw new Error(`Insufficient funds: hanya punya ${balanceLamports}, butuh ${lamports}`);
+        }
       } else {
-        // 📌 3. fallback cari token account lain untuk mint yg sama
-        const resp = await connection.getParsedTokenAccountsByOwner(toPubkey, {
-          mint: mintPubkey,
-        });
-
-        if (resp.value.length > 0) {
-          const found = resp.value.find(
-            (acc) =>
-              acc.account.data.parsed.info.tokenAmount.uiAmount &&
-              acc.account.data.parsed.info.tokenAmount.uiAmount > 0
-          );
-          if (found) {
-            recipientTokenAccount = found.pubkey;
-          }
-        }
-
-        // 📌 4. fallback terakhir: pakai expected ATA
-        if (!recipientTokenAccount) {
-          recipientTokenAccount = expectedATA;
-        }
+        throw new Error("Sender tidak punya token account untuk mint ini");
       }
 
+      if (tokenAccounts.value.length > 0) {
+        const found = tokenAccounts.value.find(
+          (acc) =>
+            acc.account.data.parsed.info.tokenAmount.uiAmount > 0
+        );
+        if (found) {
+          senderTokenAccount = found.pubkey;
+          console.log("⚡ Sender pakai token account existing dengan saldo > 0:", senderTokenAccount.toBase58());
+        } else {
+          senderTokenAccount = await getAssociatedTokenAddress(mintPubkey, fromPubkey);
+          console.log("⚠️ Tidak ada saldo di token accounts, fallback ke ATA:", senderTokenAccount.toBase58());
+        }
+      } else {
+        senderTokenAccount = await getAssociatedTokenAddress(mintPubkey, fromPubkey);
+        console.log("⚠️ Token account sender belum ada, pakai ATA:", senderTokenAccount.toBase58());
+      }
+
+      // 🔍 Recipient ATA (buat kalau belum ada)
+      const expectedATA = await getAssociatedTokenAddress(mintPubkey, toPubkey);
+      const ataInfo = await connection.getAccountInfo(expectedATA);
+      if (!ataInfo) {
+        console.log("⚠️ Recipient ATA belum ada, tambahkan create ATA ix");
+        preInstructions.push(
+          createAssociatedTokenAccountInstruction(
+            fromPubkey,
+            expectedATA,
+            toPubkey,
+            mintPubkey
+          )
+        );
+      }
+      recipientTokenAccount = expectedATA;
+
+      // 🔍 Treasury ATA (buat kalau belum ada)
       treasuryTokenAccount = await getAssociatedTokenAddress(
         mintPubkey,
         treasuryPda,
-        true // allowOwnerOffCurve untuk PDA
+        true
       );
+      const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
+      if (!treasuryInfo) {
+        console.log("⚠️ Treasury ATA belum ada, tambahkan create ATA ix");
+        preInstructions.push(
+          createAssociatedTokenAccountInstruction(
+            fromPubkey,
+            treasuryTokenAccount,
+            treasuryPda,
+            mintPubkey
+          )
+        );
+      }
 
       console.log("   📦 Sender ATA:", senderTokenAccount.toBase58());
       console.log("   📦 Recipient ATA:", recipientTokenAccount.toBase58());
       console.log("   📦 Treasury ATA:", treasuryTokenAccount.toBase58());
+
+      const senderBalance = await connection.getTokenAccountBalance(senderTokenAccount);
+      if (BigInt(senderBalance.value.amount) < lamports) {
+        throw new Error(
+          `Insufficient funds: sender hanya punya ${senderBalance.value.uiAmount} < ${amount}`
+        );
+      }
+
+      // ==== build ix ====
+      const sendIx = await program.methods
+        .sendToken(new anchor.BN(lamports.toString()))
+        .accounts({
+          sender: fromPubkey,
+          recipient: toPubkey,
+          treasuryPda,
+          mint: mintPubkey,
+          senderTokenAccount,
+          recipientTokenAccount,
+          treasuryTokenAccount,
+          marketConfig: marketConfigPda,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .instruction();
+
+      tx.add(...preInstructions, sendIx);
     }
 
-    // ==== build ix ====
-    const ix = await program.methods
-      .sendToken(new anchor.BN(lamports.toString()))
-      .accounts({
-        sender: fromPubkey,
-        recipient: toPubkey,
-        treasuryPda,
-        mint: mintPubkey,
-        senderTokenAccount: senderTokenAccount ?? fromPubkey,
-        recipientTokenAccount: recipientTokenAccount ?? toPubkey,
-        treasuryTokenAccount: treasuryTokenAccount ?? treasuryPda,
-        marketConfig: marketConfigPda,
-        systemProgram: SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .instruction();
-
-    const tx = new Transaction().add(ix);
+    // === Finalize TX ===
     tx.feePayer = fromPubkey;
-
     const { blockhash, lastValidBlockHeight } =
       await connection.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
@@ -748,6 +849,7 @@ router.post("/send/build", async (req: Request, res: Response) => {
       blockhash,
       lastValidBlockHeight,
     });
+
   } catch (err: any) {
     console.error("❌ build sendToken error:", err);
     res.status(500).json({ error: err.message });
@@ -832,10 +934,16 @@ router.post("/send/submit", async (req: Request, res: Response) => {
 //
 router.post("/swap/quote", async (req: Request, res: Response) => {
   try {
-    const { from, fromMint, toMint, amount } = req.body;
+    let { from, fromMint, toMint, amount } = req.body;
     if (!from || !fromMint || !toMint || !amount) {
       return res.status(400).json({ error: "from, fromMint, toMint, amount required" });
     }
+
+    // ✅ Normalize dummy SOL → WSOL
+    const normalizeMint = (mint: string) => mint === DUMMY_SOL_MINT ? SOL_MINT : mint;
+
+    fromMint = normalizeMint(fromMint);
+    toMint = normalizeMint(toMint);
 
     console.log("📩 [SWAP QUOTE] Request received");
     console.log("   🔑 From    :", from);
@@ -845,19 +953,25 @@ router.post("/swap/quote", async (req: Request, res: Response) => {
 
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
 
-    // === cek decimals dari mint ===
-    let decimals = 9; // default SOL
+    // === cek decimals untuk input
+    let inputDecimals = 9;
     if (fromMint !== SOL_MINT) {
       const mintInfo = await getMint(connection, new PublicKey(fromMint));
-      decimals = mintInfo.decimals;
+      inputDecimals = mintInfo.decimals;
     }
-    console.log("   🔢 Decimals for input mint:", decimals);
+
+    // === cek decimals untuk output (opsional)
+    let outputDecimals = 9;
+    if (toMint !== SOL_MINT) {
+      const mintInfo = await getMint(connection, new PublicKey(toMint));
+      outputDecimals = mintInfo.decimals;
+    }
 
     // konversi ke raw integer (lamports/token units)
-    const rawAmount = BigInt(Math.floor(amount * 10 ** decimals));
+    const rawAmount = BigInt(Math.floor(amount * 10 ** inputDecimals));
     console.log("   💰 Amount raw:", rawAmount.toString());
 
-    // request quote ke DFLOW
+    // request quote ke DFLOW (pakai normalized mint!)
     const { data: quote } = await axios.get("https://quote-api.dflow.net/intent", {
       params: {
         userPublicKey: from,
@@ -893,119 +1007,620 @@ router.post("/swap/quote", async (req: Request, res: Response) => {
 //
 router.post("/swap/build", async (req: Request, res: Response) => {
   try {
-    const { from, openTransaction } = req.body;
-    if (!from || !openTransaction) {
-      return res.status(400).json({ error: "from, openTransaction required" });
+    const { from, openTransaction, toMint, outAmount, fromMint, inAmount } = req.body;
+    if (!from || !openTransaction || !fromMint || !inAmount) {
+      return res.status(400).json({ error: "from, openTransaction, fromMint, inAmount required" });
     }
 
     console.log("📩 [SWAP BUILD] Request received");
-    console.log("   🔑 From:", from);
 
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const fromPubkey = new PublicKey(from);
-    const provider = new anchor.AnchorProvider(connection, {} as any, {
-      preflightCommitment: "confirmed",
-    });
+    const fromMintPublicKey = new PublicKey(fromMint);
+    const outputMint = new PublicKey(toMint);
 
-    // load UOG marketplace IDL
-    const idlUog = require("../../public/idl/universe_of_gamers.json");
-    const programUog = new anchor.Program(
-      idlUog,
-      new PublicKey(process.env.PROGRAM_ID as string),
-      provider
+    // Validate user balances
+    await validateUserBalances(connection, fromPubkey, fromMintPublicKey, inAmount, outputMint);
+
+    // Load program and parse transaction
+    const { programUog, aggIx, metas: baseMetas, ixData } = await loadProgramAndParseTransaction(
+      connection,
+      openTransaction,
+      fromPubkey
     );
 
-    // parse DFLOW tx
-    const tx = Transaction.from(Buffer.from(openTransaction, "base64"));
+    // Get PDAs
+    const [marketConfigPda, treasuryPda] = await getProgramDerivedAddresses(programUog);
 
-    // cari instruksi DFLOW
-    const ixIndex = tx.instructions.findIndex(
-      (ix) => ix.programId.toBase58().startsWith("DF1o") // fleksibel
-    );
-    if (ixIndex < 0) throw new Error("❌ DFLOW instruction not found in tx");
-
-    const aggIx = tx.instructions[ixIndex];
-    const metas = aggIx.keys.map((k) => ({
-      pubkey: k.pubkey,
-      isSigner: k.isSigner,
-      isWritable: k.isWritable,
-    }));
-    const ixData = aggIx.data;
-
-    console.log("   🔗 Aggregator program:", aggIx.programId.toBase58());
-    console.log("   📦 Remaining accounts:", metas.length);
-
-    // derive PDA untuk UOG
-    const [marketConfigPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market_config")],
-      programUog.programId
-    );
-    const [treasuryPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("treasury")],
-      programUog.programId
-    );
-
-    // === derive ATA untuk treasury dan user ===
-    const outputMint = aggIx.keys.find(k => k.isWritable)?.pubkey; // ambil mint dari aggregator keys (atau parse dari quote)
-    if (!outputMint) throw new Error("❌ Cannot determine outputMint from aggregator tx");
-
-    // ATA user (output token hasil swap)
-    const userOutTokenAccount = await getAssociatedTokenAddress(
-      new PublicKey(outputMint),
+    // Prepare token accounts and instructions
+    const {
+      userInTokenAccount,
+      userOutTokenAccount,
+      treasuryTokenAccount,
+      preInstructions,
+      extraPostInstructions
+    } = await prepareTokenAccountsAndInstructions(
+      connection,
       fromPubkey,
-      false,
-      TOKEN_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID
-    );
-
-    // ATA treasury
-    const treasuryTokenAccount = await getAssociatedTokenAddress(
-      new PublicKey(outputMint),
+      fromMintPublicKey,   // ✅ input mint
+      inAmount,            // ✅ amount input
+      outputMint,          // ✅ output mint
       treasuryPda,
-      true, // pda = true
-      TOKEN_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID
+      programUog,
+      marketConfigPda,
+      outAmount
     );
 
-    // build ix untuk UOG program
-    const ix = await programUog.methods
-      .swapToken(ixData, new anchor.BN(0))
-      .accounts({
-        user: fromPubkey,
-        dexProgram: aggIx.programId,
-        marketConfig: marketConfigPda,
-        treasuryPda,
-        treasuryTokenAccount,     // ✅ new
-        userOutTokenAccount,      // ✅ new
-        systemProgram: anchor.web3.SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,             // ✅ wajib untuk SPL CPI
-      })
-      .remainingAccounts(metas)
-      .instruction();
+    // 🔎 Final metas (gabung aggregator + akun wajib UOG)
+    const metas = [
+      ...baseMetas,
+      { pubkey: fromPubkey, isSigner: true, isWritable: false },           // user wallet
+      { pubkey: treasuryPda, isSigner: false, isWritable: false },         // treasury PDA
+      { pubkey: treasuryTokenAccount, isSigner: false, isWritable: true }, // treasury ATA
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ];
 
+    console.log("🔎 Remaining metas:", metas.map(m => m.pubkey.toBase58()));
 
-    // compute budget + priority fee
-    const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
-    const addPriorityFee = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5_000 });
+    // Build the main swap instruction
+    const ix = await buildSwapInstruction(
+      programUog,
+      ixData,
+      fromPubkey,
+      aggIx.programId,
+      marketConfigPda,
+      treasuryPda,
+      outputMint,
+      treasuryTokenAccount,
+      userOutTokenAccount,
+      metas,
+      inAmount
+    );
 
-    const txOut = new Transaction().add(modifyComputeUnits, addPriorityFee, ix);
-    txOut.feePayer = fromPubkey;
-
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    txOut.recentBlockhash = blockhash;
-
-    console.log("✅ Swap TX built");
-    console.log("   FeePayer:", txOut.feePayer.toBase58());
-    console.log("   Blockhash:", blockhash, " valid until height:", lastValidBlockHeight);
-    console.log("   Instructions count:", txOut.instructions.length);
+    // Build and finalize transaction
+    const txOut = await buildFinalTransaction(
+      connection,
+      fromPubkey,
+      preInstructions,
+      ix,
+      extraPostInstructions,
+      userInTokenAccount,
+      userOutTokenAccount,
+      treasuryTokenAccount,
+      treasuryPda
+    );
 
     const serialized = txOut.serialize({ requireAllSignatures: false });
     res.json({ tx: serialized.toString("base64") });
   } catch (err: any) {
-    console.error("❌ swap/build error:", err.message);
+    console.error("❌ swap/build error:", err.message, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
+
+// ==================== SEPARATE FUNCTIONS ====================
+
+/**
+ * Validate user has sufficient balances for the swap
+ */
+async function validateUserBalances(
+  connection: Connection,
+  fromPubkey: PublicKey,
+  fromMintPublicKey: PublicKey,
+  inAmount: string,
+  outputMint: PublicKey
+): Promise<void> {
+  console.log("💰 Validating user balances...");
+
+  // === 1. Input check ===
+  if (fromMintPublicKey.equals(NATIVE_MINT)) {
+    // Input = SOL → check lamports
+    const solBalance = await connection.getBalance(fromPubkey);
+    console.log(`   SOL balance: ${solBalance}, Required: ${inAmount}`);
+    if (solBalance < Number(inAmount)) {
+      throw new Error(
+        `Insufficient SOL balance. Required: ${inAmount}, Available: ${solBalance}`
+      );
+    }
+  } else {
+    // Input = SPL token
+    const userInputATA = await getAssociatedTokenAddress(fromMintPublicKey, fromPubkey);
+    try {
+      const tokenAccountInfo = await getAccount(connection, userInputATA);
+      const userTokenBalance = Number(tokenAccountInfo.amount);
+      console.log(`   Input token balance: ${userTokenBalance}, Required: ${inAmount}`);
+
+      if (userTokenBalance < Number(inAmount)) {
+        throw new Error(
+          `Insufficient token balance. Required: ${inAmount}, Available: ${userTokenBalance}`
+        );
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("Account does not exist")) {
+        throw new Error(
+          `User does not have token account for input mint: ${fromMintPublicKey.toBase58()}`
+        );
+      }
+      throw error;
+    }
+  }
+
+  // === 2. Check SOL for fees ===
+  const solBalance = await connection.getBalance(fromPubkey);
+  const estimatedFee = 100000; // ~0.0001 SOL
+  console.log(
+    `   SOL balance for fees: ${solBalance / LAMPORTS_PER_SOL} SOL, Required ~${estimatedFee / LAMPORTS_PER_SOL} SOL`
+  );
+
+  if (solBalance < estimatedFee) {
+    throw new Error(
+      `Insufficient SOL for fees. Required: ~${estimatedFee} lamports, Available: ${solBalance}`
+    );
+  }
+}
+
+/**
+ * Load UOG program and parse DFLOW transaction
+ */
+async function loadProgramAndParseTransaction(
+  connection: Connection,
+  openTransaction: string,
+  fromPubkey: PublicKey
+): Promise<{ programUog: anchor.Program; aggIx: TransactionInstruction; metas: any[]; ixData: Buffer }> {
+  const provider = new anchor.AnchorProvider(connection, {} as any, {
+    preflightCommitment: "confirmed",
+  });
+
+  // Load UOG marketplace IDL
+  const idlUog = require("../../public/idl/universe_of_gamers.json");
+  const programUog = new anchor.Program(
+    idlUog,
+    new PublicKey(process.env.PROGRAM_ID as string),
+    provider
+  );
+
+  // Parse DFLOW transaction
+  const tx = Transaction.from(Buffer.from(openTransaction, "base64"));
+
+  // Find DFLOW instruction
+  const ixIndex = tx.instructions.findIndex(
+    (ix) => ix.programId.toBase58().startsWith("DF1o")
+  );
+  if (ixIndex < 0) throw new Error("❌ DFLOW instruction not found in tx");
+
+  const aggIx = tx.instructions[ixIndex];
+  const metas = [
+    ...aggIx.keys,   // aggregator accounts
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
+  const ixData = aggIx.data;
+
+  return { programUog, aggIx, metas, ixData };
+}
+
+/**
+ * Get program derived addresses
+ */
+async function getProgramDerivedAddresses(
+  programUog: anchor.Program
+): Promise<[PublicKey, PublicKey]> {
+  const [marketConfigPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("market_config")],
+    programUog.programId
+  );
+  const [treasuryPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("treasury")],
+    programUog.programId
+  );
+
+  return [marketConfigPda, treasuryPda];
+}
+
+/**
+ * Prepare token accounts and instructions for the swap
+ */
+async function prepareTokenAccountsAndInstructions(
+  connection: Connection,
+  fromPubkey: PublicKey,
+  fromMint: PublicKey,
+  inAmount: string,
+  outputMint: PublicKey,
+  treasuryPda: PublicKey,
+  programUog: anchor.Program,
+  marketConfigPda: PublicKey,
+  outAmount: string
+): Promise<{
+  userInTokenAccount: PublicKey;
+  userOutTokenAccount: PublicKey;
+  treasuryTokenAccount: PublicKey;
+  preInstructions: TransactionInstruction[];
+  extraPostInstructions: TransactionInstruction[];
+}> {
+  let userInTokenAccount: PublicKey;
+  let userOutTokenAccount: PublicKey;
+  let treasuryTokenAccount: PublicKey;
+  const preInstructions: TransactionInstruction[] = [];
+  const extraPostInstructions: TransactionInstruction[] = [];
+
+  // === Input handling ===
+  if (fromMint.equals(NATIVE_MINT)) {
+    // Input = SOL → wrap ke WSOL ATA
+    userInTokenAccount = await prepareWSOLInputAccount(
+      connection,
+      fromPubkey,
+      inAmount,
+      preInstructions
+    );
+  } else {
+    // Input = SPL token
+    userInTokenAccount = await getAssociatedTokenAddress(fromMint, fromPubkey);
+  }
+
+  // === Output handling ===
+  if (outputMint.equals(NATIVE_MINT)) {
+    // ✅ Output = native SOL → userOut pakai WSOL ATA
+    userOutTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
+    treasuryTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, treasuryPda, true);
+
+    console.log("⚡ Output is native SOL (handled via WSOL ATA)");
+    console.log("   User WSOL ATA     :", userOutTokenAccount.toBase58());
+    console.log("   Treasury WSOL ATA :", treasuryTokenAccount.toBase58());
+
+    // === Create ATA kalau belum ada ===
+    const userOutInfo = await connection.getAccountInfo(userOutTokenAccount);
+    if (!userOutInfo) {
+      preInstructions.push(
+        createAssociatedTokenAccountInstruction(
+          fromPubkey,
+          userOutTokenAccount,
+          fromPubkey,
+          WSOL_MINT
+        )
+      );
+      preInstructions.push(createSyncNativeInstruction(userOutTokenAccount));
+    }
+
+    const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
+    if (!treasuryInfo) {
+      preInstructions.push(
+        createAssociatedTokenAccountInstruction(
+          fromPubkey,
+          treasuryTokenAccount,
+          treasuryPda,
+          WSOL_MINT
+        )
+      );
+      preInstructions.push(createSyncNativeInstruction(treasuryTokenAccount));
+    }
+
+    // === Hitung fee + approve untuk SOL case ===
+    const marketConfig: any = await programUog.account.marketConfig.fetch(marketConfigPda);
+    const tradeFeeBps: number = marketConfig.tradeFeeBps ?? marketConfig.trade_fee_bps;
+    const outAmountRaw = BigInt(outAmount);
+    const trade_fee = (outAmountRaw * BigInt(tradeFeeBps)) / BigInt(10_000);
+
+    console.log("💸 Approving delegate for trade_fee (SOL):", trade_fee.toString());
+
+    preInstructions.push(
+      createApproveInstruction(
+        userOutTokenAccount,  // source ATA (WSOL user)
+        treasuryPda,          // delegate = treasury PDA
+        fromPubkey,           // owner = user wallet
+        Number(trade_fee)     // jumlah fee
+      )
+    );
+
+    console.log("✅ Approve instruction pushed (SOL case)");
+    console.log("   userOutTokenAccount (source):", userOutTokenAccount.toBase58());
+    console.log("   treasuryTokenAccount (destination):", treasuryTokenAccount.toBase58());
+    console.log("   delegate (treasuryPda):", treasuryPda.toBase58());
+    console.log("   owner (fromPubkey):", fromPubkey.toBase58());
+    console.log("   trade_fee (lamports):", trade_fee.toString());
+
+    // === Setelah swap selesai → unwrap WSOL kembali ke SOL ===
+    extraPostInstructions.push(
+      createCloseAccountInstruction(
+        userOutTokenAccount,
+        fromPubkey, // SOL kembali ke wallet user
+        fromPubkey
+      )
+    );
+  } else {
+    // ✅ Output = SPL biasa
+    const result = await prepareSPLOutputAccounts(
+      connection,
+      fromPubkey,
+      outputMint,
+      treasuryPda,
+      preInstructions
+    );
+
+    userOutTokenAccount = result.userOutTokenAccount;
+    treasuryTokenAccount = result.treasuryTokenAccount;
+    preInstructions.push(...result.preInstructions);
+
+    // Hitung fee SPL
+    const marketConfig: any = await programUog.account.marketConfig.fetch(marketConfigPda);
+    const tradeFeeBps: number = marketConfig.tradeFeeBps ?? marketConfig.trade_fee_bps;
+    const outAmountRaw = BigInt(outAmount);
+    const trade_fee = (outAmountRaw * BigInt(tradeFeeBps)) / BigInt(10_000);
+
+    console.log("   Estimated trade fee (SPL):", trade_fee.toString());
+
+    preInstructions.push(
+      createApproveInstruction(
+        userOutTokenAccount,  // source ATA (SPL user)
+        treasuryPda,          // delegate = treasury PDA
+        fromPubkey,           // owner = user wallet
+        Number(trade_fee)     // jumlah fee
+      )
+    );
+
+    console.log("✅ Approve instruction pushed (SPL case)");
+    console.log("   userOutTokenAccount (source):", userOutTokenAccount.toBase58());
+    console.log("   treasuryTokenAccount (destination):", treasuryTokenAccount.toBase58());
+    console.log("   delegate (treasuryPda):", treasuryPda.toBase58());
+    console.log("   owner (fromPubkey):", fromPubkey.toBase58());
+    console.log("   trade_fee (lamports):", trade_fee.toString());
+  }
+
+  return { userInTokenAccount, userOutTokenAccount, treasuryTokenAccount, preInstructions, extraPostInstructions };
+}
+
+
+/**
+ * Prepare accounts for SOL output (WSOL handling)
+ */
+async function prepareSOLOutputAccounts(
+  connection: Connection,
+  fromPubkey: PublicKey,
+  treasuryPda: PublicKey,
+  preInstructions: TransactionInstruction[],
+  extraPostInstructions: TransactionInstruction[]
+): Promise<{
+  userOutTokenAccount: PublicKey;
+  treasuryTokenAccount: PublicKey;
+  preInstructions: TransactionInstruction[];
+  extraPostInstructions: TransactionInstruction[];
+}> {
+  // Output is SOL → treat as WSOL (wrapped SOL)
+  const userOutTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
+  const treasuryTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, treasuryPda, true);
+
+  console.log("⚡ Output is SOL → pakai WSOL ATA");
+  console.log("   User WSOL ATA     :", userOutTokenAccount.toBase58());
+  console.log("   Treasury WSOL ATA :", treasuryTokenAccount.toBase58());
+
+  // Create ATA kalau belum ada
+  const userOutInfo = await connection.getAccountInfo(userOutTokenAccount);
+  if (!userOutInfo) {
+    preInstructions.push(
+      createAssociatedTokenAccountInstruction(
+        fromPubkey,
+        userOutTokenAccount,
+        fromPubkey,
+        WSOL_MINT
+      )
+    );
+    preInstructions.push(createSyncNativeInstruction(userOutTokenAccount));
+  }
+
+  const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
+  if (!treasuryInfo) {
+    preInstructions.push(
+      createAssociatedTokenAccountInstruction(
+        fromPubkey,
+        treasuryTokenAccount,
+        treasuryPda,
+        WSOL_MINT
+      )
+    );
+    preInstructions.push(createSyncNativeInstruction(treasuryTokenAccount));
+  }
+
+  // ✅ Setelah swap selesai → unwrap WSOL jadi native SOL ke wallet
+  extraPostInstructions.push(
+    createCloseAccountInstruction(
+      userOutTokenAccount,
+      fromPubkey,      // SOL kembali ke wallet
+      fromPubkey
+    )
+  );
+
+  return { userOutTokenAccount, treasuryTokenAccount, preInstructions, extraPostInstructions };
+}
+
+
+/**
+ * Prepare accounts for SPL token output
+ */
+async function prepareSPLOutputAccounts(
+  connection: Connection,
+  fromPubkey: PublicKey,
+  outputMint: PublicKey,
+  treasuryPda: PublicKey,
+  preInstructions: TransactionInstruction[]
+): Promise<{
+  userOutTokenAccount: PublicKey;
+  treasuryTokenAccount: PublicKey;
+  preInstructions: TransactionInstruction[];
+}> {
+  let userOutTokenAccount: PublicKey;
+  let treasuryTokenAccount: PublicKey;
+
+  if (outputMint.equals(WSOL_MINT)) {
+    // ✅ Kalau output = SOL → userOut harus ATA WSOL, bukan pubkey langsung
+    userOutTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
+    treasuryTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, treasuryPda, true);
+
+    console.log("⚡ Output is SOL → pakai WSOL ATA");
+    console.log("   User WSOL ATA :", userOutTokenAccount.toBase58());
+    console.log("   Treasury WSOL ATA:", treasuryTokenAccount.toBase58());
+  } else {
+    // ✅ Output = SPL biasa
+    userOutTokenAccount = await getAssociatedTokenAddress(outputMint, fromPubkey, false);
+    treasuryTokenAccount = await getAssociatedTokenAddress(outputMint, treasuryPda, true);
+
+    console.log("⚡ Output is SPL → pakai Treasury ATA SPL");
+    console.log("   SPL mint      :", outputMint.toBase58());
+    console.log("   Treasury ATA  :", treasuryTokenAccount.toBase58());
+  }
+
+  // === Create ATA kalau belum ada ===
+  const userOutInfo = await connection.getAccountInfo(userOutTokenAccount);
+  if (!userOutInfo) {
+    preInstructions.push(
+      createAssociatedTokenAccountInstruction(
+        fromPubkey,
+        userOutTokenAccount,
+        fromPubkey,
+        outputMint
+      )
+    );
+    if (outputMint.equals(WSOL_MINT)) {
+      preInstructions.push(createSyncNativeInstruction(userOutTokenAccount));
+    }
+  }
+
+  const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
+  if (!treasuryInfo) {
+    preInstructions.push(
+      createAssociatedTokenAccountInstruction(
+        fromPubkey,
+        treasuryTokenAccount,
+        treasuryPda,
+        outputMint
+      )
+    );
+    if (outputMint.equals(WSOL_MINT)) {
+      preInstructions.push(createSyncNativeInstruction(treasuryTokenAccount));
+    }
+  }
+
+  return { userOutTokenAccount, treasuryTokenAccount, preInstructions };
+}
+
+async function prepareWSOLInputAccount(
+  connection: Connection,
+  fromPubkey: PublicKey,
+  inAmount: string,
+  preInstructions: TransactionInstruction[]
+): Promise<PublicKey> {
+  const userWSOLATA = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
+
+  const ataInfo = await connection.getAccountInfo(userWSOLATA);
+  if (!ataInfo) {
+    // Buat ATA WSOL
+    preInstructions.push(
+      createAssociatedTokenAccountInstruction(
+        fromPubkey,
+        userWSOLATA,
+        fromPubkey,
+        WSOL_MINT
+      )
+    );
+  }
+
+  // Hitung rent-exempt minimum
+  const rentExemptLamports = await connection.getMinimumBalanceForRentExemption(165); // size token account
+  const solBalance = await connection.getBalance(fromPubkey);
+
+  const required = Number(inAmount) + rentExemptLamports + 100000; // +fee buffer
+  if (solBalance < required) {
+    throw new Error(
+      `Not enough SOL. Required ${required}, available ${solBalance}`
+    );
+  }
+
+  // Transfer hanya inAmount (bukan +rentExempt, karena rentExempt sudah otomatis di ATA saat dibuat)
+  preInstructions.push(
+    SystemProgram.transfer({
+      fromPubkey,
+      toPubkey: userWSOLATA,
+      lamports: Number(inAmount),
+    })
+  );
+
+  preInstructions.push(createSyncNativeInstruction(userWSOLATA));
+
+  console.log("⚡ Input is SOL → wrap jadi WSOL ATA:", userWSOLATA.toBase58());
+  return userWSOLATA;
+}
+
+/**
+ * Build the main swap instruction
+ */
+async function buildSwapInstruction(
+  programUog: anchor.Program,
+  ixData: Buffer,
+  fromPubkey: PublicKey,
+  dexProgram: PublicKey,
+  marketConfigPda: PublicKey,
+  treasuryPda: PublicKey,
+  outputMint: PublicKey,
+  treasuryTokenAccount: PublicKey,
+  userOutTokenAccount: PublicKey,
+  metas: any[],
+  inAmount: string
+): Promise<TransactionInstruction> {
+  return await programUog.methods
+    .swapToken(ixData, new anchor.BN(inAmount))
+    .accounts({
+      user: fromPubkey,
+      dexProgram,
+      marketConfig: marketConfigPda,
+      treasuryPda,
+      outputMint,
+      treasuryTokenAccount,   // kalau SOL → treasuryPda
+      userOutTokenAccount,    // kalau SOL → fromPubkey
+    })
+    .remainingAccounts(metas)
+    .instruction();
+}
+
+/**
+ * Build and finalize the transaction
+ */
+async function buildFinalTransaction(
+  connection: Connection,
+  fromPubkey: PublicKey,
+  preInstructions: TransactionInstruction[],
+  ix: TransactionInstruction,
+  extraPostInstructions: TransactionInstruction[],
+  userInTokenAccount: PublicKey,
+  userOutTokenAccount: PublicKey,
+  treasuryTokenAccount: PublicKey,
+  treasuryPda: PublicKey
+): Promise<Transaction> {
+  // Compute budget + priority fee
+  const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
+  const addPriorityFee = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5_000 });
+
+  // Debug account ownership
+  await logAccountOwner(connection, "UserInTokenAccount", userInTokenAccount);
+  await logAccountOwner(connection, "User ATA", userOutTokenAccount);
+  await logAccountOwner(connection, "Treasury ATA", treasuryTokenAccount);
+  await logAccountOwner(connection, "Treasury PDA", treasuryPda);
+  await logAccountOwner(connection, "From wallet", fromPubkey);
+
+  // Build final transaction
+  const txOut = new Transaction().add(
+    modifyComputeUnits,
+    addPriorityFee,
+    ...preInstructions,
+    ix,
+    ...extraPostInstructions
+  );
+
+  txOut.feePayer = fromPubkey;
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+  console.log("   Blockhash:", blockhash, "LastValidBlockHeight:", lastValidBlockHeight);
+  txOut.recentBlockhash = blockhash;
+
+  return txOut;
+}
 
 //
 // POST /wallet/swap/submit
@@ -1020,13 +1635,52 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const txBuffer = Buffer.from(signedTx, "base64");
 
-    const sig = await connection.sendRawTransaction(txBuffer, {
+    // 🔎 Debug panjang buffer tx
+    console.log("   signedTx length:", txBuffer.length, "bytes");
+
+    // 🔎 Decode transaction untuk debug
+    try {
+      // coba sebagai VersionedTransaction
+      try {
+        const vtx = VersionedTransaction.deserialize(txBuffer);
+        console.log("   Transaction account keys (Versioned):");
+        vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) => {
+          console.log(`     [${i}] ${key.toBase58()}`);
+        });
+        console.log("   Instructions count:", vtx.message.compiledInstructions.length);
+      } catch {
+        // fallback: Transaction legacy
+        const tx: Transaction = Transaction.from(txBuffer);
+        console.log("   Transaction account keys (Legacy):");
+        (tx as any).message.accountKeys.forEach((key: PublicKey, i: number) => {
+          console.log(`     [${i}] ${key.toBase58()}`);
+        });
+        console.log("   Instructions count:", tx.instructions.length);
+      }
+    } catch (decodeErr: unknown) {
+      if (decodeErr instanceof Error) {
+        console.warn("   ⚠️ Failed to decode transaction for debug:", decodeErr.message);
+      } else {
+        console.warn("   ⚠️ Failed to decode transaction for debug (unknown error).");
+      }
+    }
+
+    const sig = await sendAndConfirmRawTransaction(connection, txBuffer, {
       skipPreflight: false,
       maxRetries: 5,
     });
 
+    console.log("✅ Swap TX confirmed:", sig);
+
     console.log("⏳ Waiting for confirmation...");
-    const confirmation = await connection.confirmTransaction(sig, "confirmed");
+    let confirmation;
+    for (let i = 0; i < 5; i++) {
+      confirmation = await connection.confirmTransaction(sig, "confirmed");
+      if (confirmation.value.err == null) break;
+      console.warn(`⚠️ Retry confirm [${i+1}]...`);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+    console.log("   Confirmation:", confirmation?.value);
 
     console.log("✅ Swap TX confirmed:", sig);
 
@@ -1037,6 +1691,9 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error("❌ swap/submit error:", err.message);
+    if (err.logs) {
+      console.error("   On-chain logs:", err.logs);
+    }
     res.status(500).json({ error: err.message });
   }
 });

@@ -311,3 +311,6 @@ idl_uog_marketplace.json
 jupiter_payload.json
 yarn.lock
 address-generated/
+binary/
+funded_accounts.json
+mainnet_uog.so
