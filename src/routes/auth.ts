@@ -1,4 +1,5 @@
 import express from 'express';
+import { Request } from "express";
 import jwt from 'jsonwebtoken';
 import Auth from '../models/Auth';
 import { ICustodialWallet } from '../models/Auth';
@@ -13,6 +14,13 @@ import path from 'path';
 import { generateMnemonic, mnemonicToSeedSync } from 'bip39';
 import nacl from 'tweetnacl';
 import * as ed25519 from 'ed25519-hd-key';
+
+import speakeasy from "speakeasy";
+import QRCode from "qrcode";
+
+import rateLimit from "express-rate-limit";
+
+import AuditLog from '../models/AuditLog';
 
 // Multer config
 const storage = multer.diskStorage({
@@ -30,6 +38,18 @@ const upload = multer({ storage });
 const walletChallenges: Map<string, string> = new Map();
 
 const router = express.Router();
+
+const exportLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 60 menit
+  max: 3,
+  message: { error: "Too many attempts, try again later" }
+});
+
+const otpLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 menit
+  max: 3,
+  message: { error: "Too many OTP attempts, try again later" }
+});
 
 // Fungsi buat generate JWT
 const generateToken = (user: any): string => {
@@ -490,35 +510,87 @@ router.put('/user/:id/notifications', async (req, res) => {
 });
 
 // === Export Custodial Private Key (Protected) ===
-router.get("/user/:id/export/private", authenticateJWT, async (req: AuthRequest, res) => {
+router.post("/user/:id/export/private", authenticateJWT, exportLimiter, async (req: AuthRequest, res) => {
   try {
-    const { address } = req.query;
-    if (!address || typeof address !== "string") {
-      return res.status(400).json({ error: "Missing or invalid wallet address" });
+    const { address, password, otpCode } = req.body;
+
+    if (!otpCode) {
+      return res.status(400).json({ error: "Missing OTP code" });
     }
 
-    // ⚠️ Pastikan user hanya bisa akses dirinya sendiri (kecuali admin)
+    if (!address || typeof address !== "string" || !password) {
+      return res.status(400).json({ error: "Missing wallet address or password" });
+    }
+
+    // hanya owner atau admin
     if (req.user.id !== req.params.id && req.user.role !== "admin") {
       return res.status(403).json({ error: "Forbidden: not your account" });
     }
 
-    // 🔍 Cari user + ambil field privateKey
+    // cari user dengan field password + custodial wallets
     const user = await Auth.findById(req.params.id).select(
-      "+custodialWallets.privateKey +custodialWallets.address +custodialWallets.provider"
+      "+password +otpSecret +custodialWallets.privateKey +custodialWallets.address +custodialWallets.provider"
     );
+
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // 🔍 Cari wallet sesuai address
-    const wallet = user.custodialWallets.find(
-      (w: any) => w.address === address
-    );
+    if (!user.twoFactorEnabled) { 
+      return res.status(403).json({ error: "2FA not enabled" });
+    }
+
+    // ✅ validasi password pakai method dari model
+    const isValidPassword = await user.comparePassword(password);
+    if (!isValidPassword) {
+      await AuditLog.create({
+        userId: user._id,
+        walletAddress: address,
+        action: "EXPORT_PRIVATE_KEY_FAILED",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"]
+      });
+      return res.status(401).json({ error: "Invalid password" });
+    }
+
+    if (!user.otpSecret) {
+      return res.status(400).json({ error: "No OTP secret found, please setup 2FA first" });
+    }
+
+    const decryptedSecret = decrypt(user.otpSecret);
+    const isValidOTP = speakeasy.totp.verify({
+      secret: decryptedSecret,
+      encoding: "base32",
+      token: otpCode,
+      window: 1
+    });
+
+    if (!isValidOTP) {
+      console.warn(`❌ Invalid OTP for user=${user._id}, ip=${req.ip}`);
+      await AuditLog.create({
+        userId: user._id,
+        walletAddress: address,
+        action: "EXPORT_PRIVATE_KEY_OTP_FAILED",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"]
+      });
+      return res.status(401).json({ error: "Invalid OTP" });
+    }
+
+    // cari wallet
+    const wallet = user.custodialWallets.find((w: any) => w.address === address);
     if (!wallet) {
+      await AuditLog.create({
+        userId: user._id,
+        walletAddress: address,
+        action: "EXPORT_PRIVATE_KEY_WALLET_NOT_FOUND",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"]
+      });
       return res.status(404).json({ error: "Wallet not found" });
     }
 
-    // 🔓 Decrypt private key
+    // decrypt private key
     let privateKey: string;
     try {
       privateKey = decrypt(wallet.privateKey);
@@ -527,27 +599,37 @@ router.get("/user/:id/export/private", authenticateJWT, async (req: AuthRequest,
       return res.status(500).json({ error: "Failed to decrypt private key" });
     }
 
+    await AuditLog.create({
+      userId: user._id,
+      walletAddress: wallet.address,
+      action: "EXPORT_PRIVATE_KEY",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"]
+    });
+
     return res.json({
       success: true,
       userId: user._id,
-      wallet: {
-        provider: wallet.provider,
-        address: wallet.address,
-      },
-      privateKey, // ⚠️ hanya keluar kalau JWT valid
+      wallet: { provider: wallet.provider, address: wallet.address },
+      privateKey, // ⚠️ hanya untuk export, FE jangan auto-log / cache
     });
   } catch (err: any) {
-    console.error("❌ Error export private key:", err);
-    return res.status(500).json({ error: err.message || "Internal server error" });
+    console.error(`❌ Failed to decrypt private key`, err);
+    return res.status(500).json({ error: "Failed to decrypt private key" });
   }
 });
 
 // === Export Custodial Recovery Phrase (Protected) ===
-router.get("/user/:id/export/phrase", authenticateJWT, async (req: AuthRequest, res) => {
+router.post("/user/:id/export/phrase", authenticateJWT, exportLimiter, async (req: AuthRequest, res) => {
   try {
-    const { address } = req.query;
-    if (!address || typeof address !== "string") {
-      return res.status(400).json({ error: "Missing or invalid wallet address" });
+    const { address, password, otpCode } = req.body;
+
+    if (!otpCode) {
+      return res.status(400).json({ error: "Missing OTP code" });
+    }
+
+    if (!address || typeof address !== "string" || !password) {
+      return res.status(400).json({ error: "Missing wallet address or password" });
     }
 
     // hanya owner atau admin
@@ -555,20 +637,77 @@ router.get("/user/:id/export/phrase", authenticateJWT, async (req: AuthRequest, 
       return res.status(403).json({ error: "Forbidden: not your account" });
     }
 
-    // cari user
+    // cari user dengan password + custodial wallets
     const user = await Auth.findById(req.params.id).select(
-      "+custodialWallets.mnemonic +custodialWallets.address +custodialWallets.provider"
+      "+password +otpSecret +custodialWallets.mnemonic +custodialWallets.address +custodialWallets.provider"
     );
+
     if (!user) {
       return res.status(404).json({ error: "User not found" });
+    }
+
+    if (!user.twoFactorEnabled) { 
+      return res.status(403).json({ error: "2FA not enabled" });
+    }
+
+    // ✅ validasi password
+    const isValidPassword = await user.comparePassword(password);
+    if (!isValidPassword) {
+      await AuditLog.create({
+        userId: user._id,
+        walletAddress: address,
+        action: "EXPORT_PHRASE_FAILED",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"]
+      });
+      return res.status(401).json({ error: "Invalid password" });
+    }
+
+    if (!user.otpSecret) {
+      return res.status(400).json({ error: "No OTP secret found, please setup 2FA first" });
+    }
+
+    const decryptedSecret = decrypt(user.otpSecret);
+    const isValidOTP = speakeasy.totp.verify({
+      secret: decryptedSecret,
+      encoding: "base32",
+      token: otpCode,
+      window: 1
+    });
+
+    if (!isValidOTP) {
+      console.warn(`❌ Invalid OTP for user=${user._id}, ip=${req.ip}`);
+      await AuditLog.create({
+        userId: user._id,
+        walletAddress: address,
+        action: "EXPORT_PHRASE_OTP_FAILED",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"]
+      });
+      return res.status(401).json({ error: "Invalid OTP" });
     }
 
     // cari wallet
     const wallet = user.custodialWallets.find((w: any) => w.address === address);
     if (!wallet) {
+      await AuditLog.create({
+        userId: user._id,
+        walletAddress: address,
+        action: "EXPORT_PHRASE_WALLET_NOT_FOUND",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"]
+      });
       return res.status(404).json({ error: "Wallet not found" });
     }
+
     if (!wallet.mnemonic) {
+      await AuditLog.create({
+        userId: user._id,
+        walletAddress: wallet.address,
+        action: "EXPORT_PHRASE_MNEMONIC_NOT_FOUND",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"]
+      });
       return res.status(404).json({ error: "Recovery phrase not available" });
     }
 
@@ -581,6 +720,14 @@ router.get("/user/:id/export/phrase", authenticateJWT, async (req: AuthRequest, 
       return res.status(500).json({ error: "Failed to decrypt recovery phrase" });
     }
 
+    await AuditLog.create({
+      userId: user._id,
+      walletAddress: wallet.address,
+      action: "EXPORT_PHRASE",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"]
+    });
+
     return res.json({
       success: true,
       userId: user._id,
@@ -588,12 +735,95 @@ router.get("/user/:id/export/phrase", authenticateJWT, async (req: AuthRequest, 
         provider: wallet.provider,
         address: wallet.address,
       },
-      recoveryPhrase: phrase, // ⚠️ hati-hati expose ke frontend
+      recoveryPhrase: phrase, // ⚠️ hanya untuk export, FE jangan auto-log / cache
     });
   } catch (err: any) {
-    console.error("❌ Error export phrase:", err);
-    return res.status(500).json({ error: err.message || "Internal server error" });
+    console.error(`❌ Failed to decrypt phrase:`, err);
+    return res.status(500).json({ error: "Failed to decrypt phrase" });
   }
+});
+
+// === 2FA Setup ===
+router.post("/user/:id/2fa/setup", authenticateJWT, async (req: AuthRequest, res) => {
+  if (!req.user || (req.user.id !== req.params.id && req.user.role !== "admin")) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const secret = speakeasy.generateSecret({ length: 20, name: "UniverseOfGamers" });
+
+  const encrypted = encrypt(secret.base32);
+
+  const user = await Auth.findByIdAndUpdate(
+    req.params.id,
+    { otpSecret: encrypted, twoFactorEnabled: false },
+    { new: true }
+  );
+
+  // pastikan secret.otpauth_url ada
+  if (!secret.otpauth_url) {
+    return res.status(500).json({ error: "Failed to generate OTP URL" });
+  }
+  const qr = await QRCode.toDataURL(secret.otpauth_url);
+
+  if (user) {
+    await AuditLog.create({
+      userId: user._id,
+      walletAddress: null,
+      action: "2FA_SETUP",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+  }
+
+  // res.json({ qr, secret: secret.base32 }); // secret bisa disembunyikan di prod, QR cukup
+
+  res.json({ qr });
+});
+
+// === 2FA Verify ===
+router.post("/user/:id/2fa/verify", authenticateJWT, otpLimiter, async (req: AuthRequest, res) => {
+  const { otpCode } = req.body;
+  if (!otpCode) return res.status(400).json({ error: "Missing OTP code" });
+
+  if (!req.user || (req.user.id !== req.params.id && req.user.role !== "admin")) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const user = await Auth.findById(req.params.id).select("+otpSecret");
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (!user.otpSecret) return res.status(400).json({ error: "No OTP secret found, please setup 2FA first" });
+
+  const decryptedSecret = decrypt(user.otpSecret);
+  const isValidOTP = speakeasy.totp.verify({
+    secret: decryptedSecret,
+    encoding: "base32",
+    token: otpCode,
+    window: 1,
+  });
+
+  if (!isValidOTP) {
+    await AuditLog.create({
+      userId: user._id,
+      walletAddress: null,
+      action: "2FA_VERIFY_FAILED",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+    return res.status(401).json({ error: "Invalid OTP" });
+  }
+
+  await AuditLog.create({
+    userId: user._id,
+    walletAddress: null,
+    action: "2FA_VERIFY",
+    ip: req.ip,
+    userAgent: req.headers["user-agent"],
+  });
+
+  user.twoFactorEnabled = true;
+  await user.save();
+
+  res.json({ success: true, message: "2FA enabled successfully" });
 });
 
 export default router;
