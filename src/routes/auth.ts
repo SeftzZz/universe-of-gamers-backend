@@ -263,16 +263,24 @@ router.post('/create/custodial', async (req, res) => {
     const selectedProvider = (provider || 'solana') as 'solana' | 'ethereum';
 
     if (selectedProvider === 'solana') {
-      const kp = Keypair.generate();
+      // ✅ Generate custodial wallet (Solana)
+      const mnemonic = generateMnemonic(128); // 12 kata
+      const seed = mnemonicToSeedSync(mnemonic);
+      const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
+      const naclKP = nacl.sign.keyPair.fromSeed(derived);
+      const kp = Keypair.fromSecretKey(naclKP.secretKey);
+
+      const address = kp.publicKey.toBase58();
       const privateKeyBase58 = bs58.encode(kp.secretKey);
 
-      const wallet: ICustodialWallet = {
+      const custodialWallet: ICustodialWallet = {
         provider: selectedProvider,
-        address: kp.publicKey.toBase58(),
+        address,
         privateKey: encrypt(privateKeyBase58),
+        mnemonic: encrypt(mnemonic),
       };
 
-      auth.custodialWallets.push(wallet);
+      auth.custodialWallets.push(custodialWallet);
       auth.authProvider = 'custodial';
       await auth.save();
 
@@ -283,7 +291,7 @@ router.post('/create/custodial', async (req, res) => {
         message: 'Custodial wallet created',
         authId: auth._id,
         token,
-        wallet: { provider: wallet.provider, address: wallet.address },
+        wallet: { provider: custodialWallet.provider, address: custodialWallet.address },
       });
     }
 
@@ -777,7 +785,10 @@ router.post("/user/:id/2fa/setup", authenticateJWT, async (req: AuthRequest, res
 
   // res.json({ qr, secret: secret.base32 }); // secret bisa disembunyikan di prod, QR cukup
 
-  res.json({ qr });
+  res.json({ 
+    qr,
+    secret: secret.base32
+  });
 });
 
 // === 2FA Verify ===

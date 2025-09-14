@@ -40,7 +40,7 @@ const CustodialWalletSchema = new Schema<ICustodialWallet>(
     },
     address: { type: String, required: true },
     privateKey: { type: String, required: true },
-    mnemonic: { type: String, required: true },
+    mnemonic: { type: String, required: false },
   },
   { _id: false }
 );
