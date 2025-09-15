@@ -1,5 +1,4 @@
-import express from 'express';
-import { Request } from "express";
+import { Router, Request, Response } from "express";
 import jwt from 'jsonwebtoken';
 import Auth from '../models/Auth';
 import { ICustodialWallet } from '../models/Auth';
@@ -8,6 +7,7 @@ import { encrypt, decrypt } from '../utils/cryptoHelper';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import bcrypt from 'bcrypt';
+import * as crypto from "crypto";
 import multer from 'multer';
 import path from 'path';
 
@@ -28,7 +28,7 @@ const storage = multer.diskStorage({
     cb(null, path.resolve(process.cwd(), 'uploads/avatars'));
   },
   filename: (req, file, cb) => {
-    const unique = `${req.params.id}-${Date.now()}-${Math.round(Math.random() * 1e9)}.png`;
+    const unique = `${req.params.id}-${Date.now()}-${Math.round(Math.random() * 1e9)}.jpg`;
     cb(null, unique);
   }
 });
@@ -37,7 +37,7 @@ const upload = multer({ storage });
 // simpan di luar router
 const walletChallenges: Map<string, string> = new Map();
 
-const router = express.Router();
+const router = Router();
 
 const exportLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 60 menit
@@ -86,6 +86,8 @@ router.post('/register', async (req, res) => {
       mnemonic: encrypt(mnemonic),
     };
 
+    const avatarUrl = `/uploads/avatars/default.png`;
+
     const auth = new Auth({
       name,
       email,
@@ -99,7 +101,7 @@ router.post('/register', async (req, res) => {
         },
       ],
       custodialWallets: [custodialWallet],
-      avatar: '',
+      avatar: avatarUrl,
     });
 
     await auth.save();
@@ -160,8 +162,10 @@ router.post('/google', async (req, res) => {
     const { googleId, email, name } = req.body;
     let auth = await Auth.findOne({ googleId });
 
+    const avatarUrl = `/uploads/avatars/default.png`;
+
     if (!auth) {
-      auth = new Auth({ googleId, email, name, authProvider: 'google', avatar: '', });
+      auth = new Auth({ googleId, email, name, authProvider: 'google', avatar: avatarUrl, });
       await auth.save();
     }
 
@@ -215,12 +219,14 @@ router.post('/wallet', async (req, res) => {
     // === Lanjut login ===
     let auth = await Auth.findOne({ 'wallets.address': address });
 
+    const avatarUrl = `/uploads/avatars/default.png`;
+
     if (!auth) {
       auth = new Auth({
         name,
         wallets: [{ provider, address }],
         authProvider: 'wallet',
-        avatar: '',
+        avatar: avatarUrl,
       });
       await auth.save();
     } else {
@@ -318,6 +324,7 @@ router.post('/import/phrase', async (req, res) => {
     const privateKeyBase58 = bs58.encode(Buffer.from(kp.secretKey));
     const address = bs58.encode(Buffer.from(kp.publicKey));
     const displayName = name || address;
+    const avatarUrl = `/uploads/avatars/default.png`;
 
     let auth;
 
@@ -340,7 +347,7 @@ router.post('/import/phrase', async (req, res) => {
           authProvider: 'custodial',
           custodialWallets: [],
           wallets: [],
-          avatar: '',
+          avatar: avatarUrl,
         });
       }
     }
@@ -517,10 +524,22 @@ router.put('/user/:id/notifications', async (req, res) => {
   }
 });
 
+function encryptWithPassphrase(text: string, passphrase: string): string {
+  const key = crypto.createHash("sha256").update(passphrase).digest();
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+
+  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return Buffer.concat([iv, tag, encrypted]).toString("base64");
+}
+
 // === Export Custodial Private Key (Protected) ===
 router.post("/user/:id/export/private", authenticateJWT, exportLimiter, async (req: AuthRequest, res) => {
   try {
-    const { address, password, otpCode } = req.body;
+    const { address, password, otpCode, passphrase } = req.body;
+    if (!passphrase) return res.status(400).json({ error: "Missing passphrase" });
 
     if (!otpCode) {
       return res.status(400).json({ error: "Missing OTP code" });
@@ -598,14 +617,17 @@ router.post("/user/:id/export/private", authenticateJWT, exportLimiter, async (r
       return res.status(404).json({ error: "Wallet not found" });
     }
 
-    // decrypt private key
-    let privateKey: string;
+    // decrypt private key dulu
+    let privateKeyPlain: string;
     try {
-      privateKey = decrypt(wallet.privateKey);
+      privateKeyPlain = decrypt(wallet.privateKey);
     } catch (err: any) {
       console.error("❌ Failed to decrypt private key:", err);
       return res.status(500).json({ error: "Failed to decrypt private key" });
     }
+
+    // 🔑 Baru encrypt pakai passphrase user
+    const encryptedForUser = encryptWithPassphrase(privateKeyPlain, passphrase);
 
     await AuditLog.create({
       userId: user._id,
@@ -619,7 +641,7 @@ router.post("/user/:id/export/private", authenticateJWT, exportLimiter, async (r
       success: true,
       userId: user._id,
       wallet: { provider: wallet.provider, address: wallet.address },
-      privateKey, // ⚠️ hanya untuk export, FE jangan auto-log / cache
+      encryptedKey: encryptedForUser,
     });
   } catch (err: any) {
     console.error(`❌ Failed to decrypt private key`, err);
@@ -630,7 +652,8 @@ router.post("/user/:id/export/private", authenticateJWT, exportLimiter, async (r
 // === Export Custodial Recovery Phrase (Protected) ===
 router.post("/user/:id/export/phrase", authenticateJWT, exportLimiter, async (req: AuthRequest, res) => {
   try {
-    const { address, password, otpCode } = req.body;
+    const { address, password, otpCode, passphrase } = req.body;
+    if (!passphrase) return res.status(400).json({ error: "Missing passphrase" });
 
     if (!otpCode) {
       return res.status(400).json({ error: "Missing OTP code" });
@@ -719,14 +742,16 @@ router.post("/user/:id/export/phrase", authenticateJWT, exportLimiter, async (re
       return res.status(404).json({ error: "Recovery phrase not available" });
     }
 
-    // decrypt phrase
-    let phrase: string;
+    let phrasePlain: string;
     try {
-      phrase = decrypt(wallet.mnemonic);
+      phrasePlain = decrypt(wallet.mnemonic);
     } catch (err: any) {
       console.error("❌ Failed to decrypt phrase:", err);
       return res.status(500).json({ error: "Failed to decrypt recovery phrase" });
     }
+
+    // 🔑 Baru encrypt pakai passphrase user
+    const encryptedForUser = encryptWithPassphrase(phrasePlain, passphrase);
 
     await AuditLog.create({
       userId: user._id,
@@ -743,7 +768,7 @@ router.post("/user/:id/export/phrase", authenticateJWT, exportLimiter, async (re
         provider: wallet.provider,
         address: wallet.address,
       },
-      recoveryPhrase: phrase, // ⚠️ hanya untuk export, FE jangan auto-log / cache
+      recoveryPhrase: encryptedForUser,
     });
   } catch (err: any) {
     console.error(`❌ Failed to decrypt phrase:`, err);

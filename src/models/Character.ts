@@ -1,58 +1,55 @@
 import mongoose, { Schema, Document } from "mongoose";
+import { ISkill } from "./Skill";
 
-// 🔹 Skill Interface
-export interface ISkill {
-  skillName: string;
-  atkMultiplier: number;
-  defMultiplier: number;
-  hpMultiplier: number;
-  description: string;
-}
-
-// 🔹 Character Interface
 export interface ICharacter extends Document {
-  displayName: string;
+  name: string;
+  description: string;
+  image: string;
   element: "Fire" | "Water" | "Earth" | "Wind";
-  level: number;
-  hp: number;
-  atk: number;
-  def: number;
-  spd: number;
-  critRate: number;
-  critDmg: number;
+  rarity: "Common" | "Rare" | "Epic" | "Legendary"; // 🔥 NEW FIELD
+
+  baseHp: number;
+  baseAtk: number;
+  baseDef: number;
+  baseSpd: number;
+  baseCritRate: number;
+  baseCritDmg: number;
+
   basicAttack: ISkill;
   skillAttack: ISkill;
   ultimateAttack: ISkill;
+
   createdAt: Date;
 }
 
-// 🔹 Skill Schema
-const SkillSchema = new Schema<ISkill>({
-  skillName: { type: String, required: true },
-  atkMultiplier: { type: Number, default: 0 },
-  defMultiplier: { type: Number, default: 0 },
-  hpMultiplier: { type: Number, default: 0 },
-  description: { type: String, default: "" }
-});
-
-// 🔹 Character Schema
 const CharacterSchema = new Schema<ICharacter>(
-{
-  displayName: { type: String, required: true },
-  element: { type: String, enum: ["Fire", "Water", "Earth", "Wind"], required: true },
-  level: { type: Number, min: 1, default: 1 },
-  hp: { type: Number, min: 1, required: true },
-  atk: { type: Number, min: 0, required: true },
-  def: { type: Number, min: 0, required: true },
-  spd: { type: Number, min: 0, required: true },
-  critRate: { type: Number, min: 0, max: 100, default: 0 },
-  critDmg: { type: Number, min: 0, max: 500, default: 0 },
-  basicAttack: { type: SkillSchema, required: true },
-  skillAttack: { type: SkillSchema, required: true },
-  ultimateAttack: { type: SkillSchema, required: true },
-  createdAt: { type: Date, default: Date.now }
-},
-{ collection: "characters" } // add by fpp 05/09/25
+  {
+    name: { type: String, required: true },
+    description: { type: String, default: "" },
+    image: { type: String, default: "" },
+    element: { type: String, enum: ["Fire", "Water", "Earth", "Wind"], required: true },
+
+    rarity: { 
+      type: String, 
+      enum: ["Common", "Rare", "Epic", "Legendary"], 
+      required: true,
+      default: "Common" 
+    }, // 🔥 NEW FIELD
+
+    baseHp: { type: Number, min: 1, required: true },
+    baseAtk: { type: Number, min: 0, required: true },
+    baseDef: { type: Number, min: 0, required: true },
+    baseSpd: { type: Number, min: 0, required: true },
+    baseCritRate: { type: Number, min: 0, max: 100, default: 0 },
+    baseCritDmg: { type: Number, min: 0, max: 500, default: 0 },
+
+    basicAttack: { type: Object, required: true },
+    skillAttack: { type: Object, required: true },
+    ultimateAttack: { type: Object, required: true },
+
+    createdAt: { type: Date, default: Date.now }
+  },
+  { collection: "characters" }
 );
 
 export const Character = mongoose.model<ICharacter>("Character", CharacterSchema);

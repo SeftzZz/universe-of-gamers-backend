@@ -38,6 +38,7 @@ import dotenv from "dotenv";
 import { getTokenInfo } from "../services/priceService";
 import { getMint } from "@solana/spl-token";
 
+import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
 import WalletBalance from "../models/WalletBalance";
 import WalletToken from "../models/WalletToken";
 import TrendingToken from "../models/TrendingToken";
@@ -698,6 +699,14 @@ router.post("/send/build", async (req: Request, res: Response) => {
     console.log("   🔢 Token decimals:", decimals);
     console.log("   💰 Raw amount (lamports):", lamports.toString());
 
+    // === Hitung fee + approve untuk SOL case ===
+    const marketConfig: any = await program.account.marketConfig.fetch(marketConfigPda);
+    const tradeFeeBps: number = marketConfig.tradeFeeBps ?? marketConfig.trade_fee_bps;
+    const outAmountRaw = BigInt(amount);
+    const trade_fee = (outAmountRaw * BigInt(tradeFeeBps)) / BigInt(10_000);
+
+    console.log("💸 Approving delegate for trade_fee (SOL):", trade_fee.toString());
+
     let senderTokenAccount, recipientTokenAccount, treasuryTokenAccount;
     const preInstructions: TransactionInstruction[] = [];
     const tx = new Transaction();
@@ -715,7 +724,7 @@ router.post("/send/build", async (req: Request, res: Response) => {
       const transferToTreasury = SystemProgram.transfer({
         fromPubkey,
         toPubkey: treasuryPda,
-        lamports: 0, // 👉 ganti sesuai fee
+        lamports: Number(trade_fee), // 👉 ganti sesuai fee
       });
 
       tx.add(transferToRecipient, transferToTreasury);

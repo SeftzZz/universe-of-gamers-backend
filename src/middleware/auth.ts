@@ -1,11 +1,20 @@
-import jwt from "jsonwebtoken";
 import { Request, Response, NextFunction } from "express";
+import jwt from "jsonwebtoken";
 
-export interface AuthRequest extends Request {
+export interface AuthRequest<
+  P = any,
+  ResBody = any,
+  ReqBody = any,
+  ReqQuery = any
+> extends Request<P, ResBody, ReqBody, ReqQuery> {
   user?: any;
 }
 
-export function authenticateJWT(req: AuthRequest, res: Response, next: NextFunction) {
+export function authenticateJWT(
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) {
   const authHeader = req.headers.authorization;
   if (!authHeader) {
     return res.status(401).json({ error: "Missing Authorization header" });
@@ -25,7 +34,11 @@ export function authenticateJWT(req: AuthRequest, res: Response, next: NextFunct
   }
 }
 
-export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction) {
+export function requireAdmin(
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) {
   if (!req.user || req.user.role !== "admin") {
     return res.status(403).json({ error: "Admin access required" });
   }
