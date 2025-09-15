@@ -1,0 +1,65 @@
+{
+  "name": "Raka'jin",
+  "symbol": "UOG",
+  "description": "Raka'jin anak jin",
+  "image": "https://marketplace.universeofgamers.io/uploads/nfts/rakajin.jpg",
+  "seller_fee_basis_points": 0,
+  "external_url": "https://universeofgamers.io/nft/68c82283244a40377c884994",
+  "attributes": [
+    {
+      "trait_type": "Character",
+      "value": "Raka'jin"
+    },
+    {
+      "trait_type": "Element",
+      "value": "Wind"
+    },
+    {
+      "trait_type": "Level",
+      "value": 1
+    },
+    {
+      "trait_type": "EXP",
+      "value": 0
+    },
+    {
+      "trait_type": "HP",
+      "value": 100
+    },
+    {
+      "trait_type": "ATK",
+      "value": 100
+    },
+    {
+      "trait_type": "DEF",
+      "value": 100
+    },
+    {
+      "trait_type": "SPD",
+      "value": 100
+    },
+    {
+      "trait_type": "Crit Rate",
+      "value": "100%"
+    },
+    {
+      "trait_type": "Crit Dmg",
+      "value": "100%"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://marketplace.universeofgamers.io/uploads/nfts/rakajin.jpg",
+        "type": "image/jpg"
+      }
+    ],
+    "category": "image",
+    "creators": [
+      {
+        "address": "7GeP2NXT6DzX3Sw973G5mvFacG7AiyUe25XjvKDpQDGZ",
+        "share": 100
+      }
+    ]
+  }
+}

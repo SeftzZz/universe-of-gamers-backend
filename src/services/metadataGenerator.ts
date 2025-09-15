@@ -34,7 +34,7 @@ export async function generateNftMetadata(nftId: string, outputDir: any) {
       description: nft.description || `An NFT character from Universe of Gamers`,
       image: nft.image, // URL or path to image
       seller_fee_basis_points: nft.royalty ?? 500,
-      external_url: `https://universeofgamers.io/nft/${nft._id}`,
+      external_url: `https://marketplace.universeofgamers.io/nft/${nft._id}`,
 
       attributes: [
         { trait_type: "Character", value: character?.name },
@@ -64,7 +64,7 @@ export async function generateNftMetadata(nftId: string, outputDir: any) {
         files: [
           {
             uri: nft.image,
-            type: "image/png"
+            type: "image/jpg"
           }
         ],
         category: "image",

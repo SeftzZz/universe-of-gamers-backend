@@ -1,10 +1,12 @@
 import mongoose, { Schema, Document, Types } from "mongoose";
 import { ICharacter } from "./Character";
+import { IRune } from "./Rune";
 
 export interface INft extends Document {
   _id: any;
   owner: string; // wallet address user
-  character: Types.ObjectId | ICharacter; // ref ke Character blueprint
+  character?: Types.ObjectId | ICharacter; // ref ke Character blueprint
+  rune?: Types.ObjectId | IRune;          // ref ke Rune blueprint
 
   // metadata tambahan
   name: string;
@@ -38,7 +40,10 @@ export interface INft extends Document {
 const NftSchema = new Schema<INft>(
   {
     owner: { type: String, required: true },
-    character: { type: Schema.Types.ObjectId, ref: "Character", required: true },
+
+    // opsional: bisa karakter atau rune
+    character: { type: Schema.Types.ObjectId, ref: "Character" },
+    rune: { type: Schema.Types.ObjectId, ref: "Rune" },
 
     name: { type: String, required: true },
     description: { type: String, default: "" },
@@ -62,11 +67,9 @@ const NftSchema = new Schema<INft>(
     },
 
     price: { type: Number },
-    txSignature: { type: String },
-    createdAt: { type: Date, default: Date.now },
-    updatedAt: { type: Date, default: Date.now }
+    txSignature: { type: String }
   },
-  { collection: "nfts" }
+  { collection: "nfts", timestamps: true } // ✅ auto createdAt + updatedAt
 );
 
 export const Nft = mongoose.model<INft>("Nft", NftSchema);
