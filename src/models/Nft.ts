@@ -6,7 +6,7 @@ export interface INft extends Document {
   _id: any;
   owner: string; // wallet address user
   character?: Types.ObjectId | ICharacter; // ref ke Character blueprint
-  rune?: Types.ObjectId | IRune;          // ref ke Rune blueprint
+  rune?: Types.ObjectId | IRune;           // ref ke Rune blueprint
 
   // metadata tambahan
   name: string;
@@ -24,12 +24,12 @@ export interface INft extends Document {
   critRate: number;
   critDmg: number;
 
-  equipped?: {
-    weapon?: string;
-    armor?: string;
-    rune?: string;
-    [key: string]: string | undefined;
-  };
+  // ✅ sekarang equipped jadi array of rune NFT IDs
+  equipped: Types.ObjectId[]; // daftar rune NFT yang terpasang
+
+  // 🔥 Status rune (kalau NFT ini adalah Rune)
+  isEquipped: boolean;                     // apakah rune ini sedang dipakai
+  equippedTo?: Types.ObjectId | INft | null; // ref ke NFT Character yang memakai rune
 
   price?: number;
   txSignature?: string;
@@ -60,16 +60,17 @@ const NftSchema = new Schema<INft>(
     critRate: { type: Number, min: 0, max: 100, default: 0 },
     critDmg: { type: Number, min: 0, max: 500, default: 0 },
 
-    equipped: {
-      type: Map,
-      of: String,
-      default: {}
-    },
+    // ✅ ganti jadi array of rune NFT IDs
+    equipped: [{ type: Schema.Types.ObjectId, ref: "Nft" }],
+
+    isEquipped: { type: Boolean, default: false },
+    equippedTo: { type: Schema.Types.ObjectId, ref: "Nft", default: null },
 
     price: { type: Number },
     txSignature: { type: String }
   },
-  { collection: "nfts", timestamps: true } // ✅ auto createdAt + updatedAt
+  { collection: "nfts", timestamps: true }
 );
+
 
 export const Nft = mongoose.model<INft>("Nft", NftSchema);

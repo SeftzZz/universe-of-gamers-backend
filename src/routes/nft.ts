@@ -6,6 +6,8 @@ import { Skill } from "../models/Skill";
 import { Rune } from "../models/Rune";
 import { Team } from "../models/Team";
 import { generateNftMetadata } from "../services/metadataGenerator";
+import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
+import Auth from "../models/Auth";
 
 import fs from "fs";
 import path from "path";
@@ -62,6 +64,138 @@ router.get("/fetch-nft", async (req, res) => {
     res.json(nfts);
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch NFTs" });
+  }
+});
+
+// GET NFTs by owner (only owner can access)
+router.get("/my-nfts",authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    // Ambil user dari DB
+    const user = await Auth.findById(req.user.id).select(
+      "wallets custodialWallets"
+    );
+    if (!user) {
+      return res.status(401).json({ error: "User not found" });
+    }
+
+    // Gabungkan semua wallet address (custodial + external)
+    const walletAddresses = [
+      ...user.wallets.map((w) => w.address),
+      ...user.custodialWallets.map((c) => c.address),
+    ];
+
+    if (walletAddresses.length === 0) {
+      return res.json([]);
+    }
+
+    // Cari NFT berdasarkan semua address
+    const nfts = await Nft.find({ owner: { $in: walletAddresses } });
+
+    res.json(nfts);
+  } catch (err) {
+    console.error("❌ Error fetching my NFTs:", err);
+    res.status(500).json({ error: "Failed to fetch NFTs" });
+  }
+});
+
+/**
+ * Equip Rune to a Character NFT
+ */
+router.post("/:characterId/equip-rune", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { characterId } = req.params;
+    const { runeId } = req.body;
+
+    if (!runeId) return res.status(400).json({ error: "runeId is required" });
+
+    const character = await Nft.findById(characterId);
+    if (!character) return res.status(404).json({ error: "Character not found" });
+
+    if (character.owner !== req.user.walletAddress) {
+      return res.status(403).json({ error: "Not your character" });
+    }
+
+    const runeNft = await Nft.findById(runeId).populate("rune");
+    if (!runeNft || !runeNft.rune) return res.status(404).json({ error: "Rune not found" });
+    if (runeNft.owner !== req.user.walletAddress) {
+      return res.status(403).json({ error: "Not your rune" });
+    }
+    if (runeNft.isEquipped) {
+      return res.status(400).json({ error: "Rune already equipped" });
+    }
+
+    const runeData: any = runeNft.rune;
+
+    // Tambah ke array equipped
+    character.equipped.push(runeNft._id);
+
+    // Apply bonus stats
+    character.hp += runeData.hpBonus ?? 0;
+    character.atk += runeData.atkBonus ?? 0;
+    character.def += runeData.defBonus ?? 0;
+    character.spd += runeData.spdBonus ?? 0;
+
+    runeNft.isEquipped = true;
+    runeNft.equippedTo = character._id;
+
+    await runeNft.save();
+    await character.save();
+
+    res.json({ message: "✅ Rune equipped successfully", character });
+  } catch (err: any) {
+    console.error("❌ Error equipping rune:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Unequip Rune to a Character NFT
+ */
+router.post("/:characterId/unequip-rune", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { characterId } = req.params;
+    const { runeId } = req.body;
+
+    if (!runeId) return res.status(400).json({ error: "runeId is required" });
+
+    const character = await Nft.findById(characterId).populate("character");
+    if (!character) return res.status(404).json({ error: "Character not found" });
+
+    if (character.owner !== req.user.walletAddress) {
+      return res.status(403).json({ error: "Not your character" });
+    }
+
+    // cek rune ada di equipped array
+    if (!character.equipped?.includes(runeId)) {
+      return res.status(400).json({ error: "This rune is not equipped on this character" });
+    }
+
+    const runeNft = await Nft.findById(runeId).populate("rune");
+    if (!runeNft || !runeNft.rune) return res.status(404).json({ error: "Rune not found" });
+
+    const runeData: any = runeNft.rune;
+
+    // Kurangi stats
+    character.hp -= runeData.hpBonus ?? 0;
+    character.atk -= runeData.atkBonus ?? 0;
+    character.def -= runeData.defBonus ?? 0;
+    character.spd -= runeData.spdBonus ?? 0;
+
+    // Hapus rune dari equipped array
+    character.equipped = character.equipped.filter(
+      (id: any) => id.toString() !== runeId
+    );
+
+    runeNft.isEquipped = false;
+    runeNft.equippedTo = null;
+
+    await runeNft.save();
+    await character.save();
+
+    res.json({ message: "✅ Rune unequipped successfully", character });
+  } catch (err: any) {
+    console.error("❌ Error unequipping rune:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 

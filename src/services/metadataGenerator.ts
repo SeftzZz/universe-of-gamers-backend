@@ -1,7 +1,8 @@
 import fs from "fs";
 import path from "path";
-import { Nft, INft } from "../models/Nft"; // model kamu
+import { Nft, INft } from "../models/Nft";
 import { Character } from "../models/Character";
+import { Rune } from "../models/Rune";
 
 interface MetadataSuccess {
   success: true;
@@ -19,20 +20,43 @@ type MetadataResult = MetadataSuccess | MetadataError;
  * @param nftId MongoDB NFT _id
  * @param outputDir local dir on VPS
  */
-export async function generateNftMetadata(nftId: string, outputDir: any) {
+export async function generateNftMetadata(
+  nftId: string,
+  outputDir: any
+): Promise<MetadataResult> {
   try {
-    // === 1. Fetch NFT with character ref ===
-    const nft: INft | null = await Nft.findById(nftId).populate("character");
+    // === 1. Fetch NFT with refs ===
+    const nft: INft | null = await Nft.findById(nftId)
+      .populate("character")
+      .populate("equipped"); // karena equipped = array of rune NFT
+
     if (!nft) throw new Error("NFT not found");
 
     const character: any = nft.character;
 
-    // === 2. Build metadata JSON ===
+    // === 2. Handle equipped runes ===
+    let runeAttributes: any[] = [];
+    if (Array.isArray(nft.equipped) && nft.equipped.length > 0) {
+      // populate rune blueprint dari setiap NFT rune
+      const runeNfts = await Nft.find({ _id: { $in: nft.equipped } }).populate(
+        "rune"
+      );
+
+      runeAttributes = runeNfts.map((runeNft: any, idx: number) => {
+        return {
+          trait_type: `Equipped Rune #${idx + 1}`,
+          value: runeNft.rune?.name || runeNft.name,
+        };
+      });
+    }
+
+    // === 3. Build metadata JSON ===
     const metadata = {
       name: nft.name || character?.name || "Unknown NFT",
       symbol: "UOG",
-      description: nft.description || `An NFT character from Universe of Gamers`,
-      image: nft.image, // URL or path to image
+      description:
+        nft.description || `An NFT character from Universe of Gamers`,
+      image: nft.image,
       seller_fee_basis_points: nft.royalty ?? 500,
       external_url: `https://marketplace.universeofgamers.io/nft/${nft._id}`,
 
@@ -49,40 +73,33 @@ export async function generateNftMetadata(nftId: string, outputDir: any) {
         { trait_type: "Crit Rate", value: nft.critRate + "%" },
         { trait_type: "Crit Dmg", value: nft.critDmg + "%" },
 
-        nft.equipped?.weapon
-          ? { trait_type: "Equipped Weapon", value: nft.equipped.weapon }
-          : null,
-        nft.equipped?.armor
-          ? { trait_type: "Equipped Armor", value: nft.equipped.armor }
-          : null,
-        nft.equipped?.rune
-          ? { trait_type: "Equipped Rune", value: nft.equipped.rune }
-          : null,
-      ].filter(Boolean), // remove nulls
+        // 🔥 tambahkan equipped runes
+        ...runeAttributes,
+      ].filter(Boolean),
 
       properties: {
         files: [
           {
             uri: nft.image,
-            type: "image/jpg"
-          }
+            type: "image/jpg",
+          },
         ],
         category: "image",
         creators: [
           {
             address: nft.owner,
-            share: 100
-          }
-        ]
-      }
+            share: 100,
+          },
+        ],
+      },
     };
 
-    // === 3. Ensure output dir exists ===
+    // === 4. Ensure output dir exists ===
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    // === 4. Save metadata JSON ===
+    // === 5. Save metadata JSON ===
     const filePath = path.join(outputDir, `${nft._id}.json`);
     fs.writeFileSync(filePath, JSON.stringify(metadata, null, 2));
 

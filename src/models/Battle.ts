@@ -17,8 +17,8 @@ export interface IBattle extends Document {
     team: Types.ObjectId;     // ref ke Team
     isWinner?: boolean;
   }[];
-  mode: "pvp" | "pve" | "raid";
-  result: "pending" | "in_progress" | "finished";
+  mode: "pvp" | "adventure";
+  result: "init_battle" | "end_battle";
   log: IBattleLog[];
   createdAt: Date;
   updatedAt: Date;
@@ -48,13 +48,13 @@ const BattleSchema = new Schema<IBattle>(
     ],
     mode: {
       type: String,
-      enum: ["pvp", "pve", "raid"],
+      enum: ["pvp", "adventure"],
       required: true
     },
     result: {
       type: String,
-      enum: ["pending", "in_progress", "finished"],
-      default: "pending"
+      enum: ["init_battle", "end_battle"],
+      default: "init_battle"
     },
     log: { type: [BattleLogSchema], default: [] },
     createdAt: { type: Date, default: Date.now },
