@@ -311,3 +311,8 @@ idl_uog_marketplace.json
 jupiter_payload.json
 yarn.lock
 address-generated/
+binary/
+funded_accounts.json
+mainnet_uog.so
+uploads/
+db/universeofgamers-2025-09-17.archive.gz

@@ -1,43 +1,76 @@
 import mongoose, { Schema, Document, Types } from "mongoose";
-import { ICharacter } from "./Character"; // pastikan path sesuai
+import { ICharacter } from "./Character";
+import { IRune } from "./Rune";
 
-/**
- * =====================
- *  NFT Interface
- * =====================
- */
 export interface INft extends Document {
+  _id: any;
+  owner: string; // wallet address user
+  character?: Types.ObjectId | ICharacter; // ref ke Character blueprint
+  rune?: Types.ObjectId | IRune;           // ref ke Rune blueprint
+
+  // metadata tambahan
   name: string;
   description: string;
   image: string;
-  price: number;
-  metadata: object;
+  royalty?: number;
+
+  level: number;
+  exp: number;
+
+  hp: number;
+  atk: number;
+  def: number;
+  spd: number;
+  critRate: number;
+  critDmg: number;
+
+  // ✅ sekarang equipped jadi array of rune NFT IDs
+  equipped: Types.ObjectId[]; // daftar rune NFT yang terpasang
+
+  // 🔥 Status rune (kalau NFT ini adalah Rune)
+  isEquipped: boolean;                     // apakah rune ini sedang dipakai
+  equippedTo?: Types.ObjectId | INft | null; // ref ke NFT Character yang memakai rune
+
+  price?: number;
   txSignature?: string;
   createdAt: Date;
-  character?: Types.ObjectId | ICharacter; // 🔗 reference ke Character
+  updatedAt: Date;
 }
 
-/**
- * =====================
- *  NFT Schema
- * =====================
- */
-const NftSchema = new Schema<INft>({
-  name: { type: String, required: true },
-  description: String,
-  image: String,
-  price: Number,
-  metadata: Object,
-  txSignature: String,
-  createdAt: { type: Date, default: Date.now },
+const NftSchema = new Schema<INft>(
+  {
+    owner: { type: String, required: true },
 
-  // 🔗 Relasi ke Character
-  character: { type: Schema.Types.ObjectId, ref: "Character" }
-});
+    // opsional: bisa karakter atau rune
+    character: { type: Schema.Types.ObjectId, ref: "Character" },
+    rune: { type: Schema.Types.ObjectId, ref: "Rune" },
 
-/**
- * =====================
- *  Export NFT Model
- * =====================
- */
+    name: { type: String, required: true },
+    description: { type: String, default: "" },
+    image: { type: String, default: "" },
+    royalty: { type: Number, default: 0 },
+
+    level: { type: Number, min: 1, default: 1 },
+    exp: { type: Number, min: 0, default: 0 },
+
+    hp: { type: Number, min: 1, required: true },
+    atk: { type: Number, min: 0, required: true },
+    def: { type: Number, min: 0, required: true },
+    spd: { type: Number, min: 0, required: true },
+    critRate: { type: Number, min: 0, max: 100, default: 0 },
+    critDmg: { type: Number, min: 0, max: 500, default: 0 },
+
+    // ✅ ganti jadi array of rune NFT IDs
+    equipped: [{ type: Schema.Types.ObjectId, ref: "Nft" }],
+
+    isEquipped: { type: Boolean, default: false },
+    equippedTo: { type: Schema.Types.ObjectId, ref: "Nft", default: null },
+
+    price: { type: Number },
+    txSignature: { type: String }
+  },
+  { collection: "nfts", timestamps: true }
+);
+
+
 export const Nft = mongoose.model<INft>("Nft", NftSchema);

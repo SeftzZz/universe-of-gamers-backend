@@ -40,7 +40,7 @@ const CustodialWalletSchema = new Schema<ICustodialWallet>(
     },
     address: { type: String, required: true },
     privateKey: { type: String, required: true },
-    mnemonic: { type: String, required: true },
+    mnemonic: { type: String, required: false },
   },
   { _id: false }
 );
@@ -60,6 +60,8 @@ export interface IAuth extends Document {
   avatar: string;
   notifyNewItems: boolean;
   notifyEmail: boolean;
+  twoFactorEnabled: boolean;
+  otpSecret?: string; 
   createdAt: Date;
 
   comparePassword(password: string): Promise<boolean>;
@@ -100,6 +102,8 @@ const AuthSchema = new Schema<IAuth>(
     avatar: { type: String, default: '' },
     notifyNewItems: { type: Boolean, default: false },
     notifyEmail: { type: Boolean, default: false },
+    twoFactorEnabled: { type: Boolean, default: false },
+    otpSecret: { type: String, select: false },
     createdAt: { type: Date, default: Date.now },
   },
   { collection: 'users' }

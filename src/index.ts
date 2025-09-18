@@ -9,6 +9,7 @@ import authRoutes from "./routes/auth";
 import solRoutes from './routes/sol';
 import dotenv from "dotenv";
 import characterRoutes from "./routes/character"; // add by fpp 05/09/25
+import gatchaRoutes from './routes/gatcha';
 import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
 dotenv.config();
 
@@ -34,6 +35,8 @@ app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
 // app.use("/api/characters", characterRoutes);
 // app.use("/api/nft/character", characterRoutes);
+
+app.use("/api/gatcha", gatchaRoutes);
 
 const PORT = process.env.PORT || 3000;
 

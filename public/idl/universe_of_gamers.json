@@ -4,9 +4,6 @@
   "instructions": [
     {
       "name": "initializeMarket",
-      "docs": [
-        "Initialize Market Config + save fee rates"
-      ],
       "accounts": [
         {
           "name": "marketConfig",
@@ -42,9 +39,6 @@
     },
     {
       "name": "mintAndList",
-      "docs": [
-        "Mint + Create Metadata + Approve Escrow + Pay Minting Fee"
-      ],
       "accounts": [
         {
           "name": "listing",
@@ -151,9 +145,6 @@
     },
     {
       "name": "buyNft",
-      "docs": [
-        "Buy NFT"
-      ],
       "accounts": [
         {
           "name": "listing",
@@ -210,9 +201,6 @@
     },
     {
       "name": "withdrawTreasury",
-      "docs": [
-        "Withdraw treasury funds"
-      ],
       "accounts": [
         {
           "name": "marketConfig",
@@ -221,7 +209,7 @@
         },
         {
           "name": "treasuryPda",
-          "isMut": false,
+          "isMut": true,
           "isSigner": false
         },
         {
@@ -293,41 +281,6 @@
       ]
     },
     {
-      "name": "migrateMarketConfig",
-      "accounts": [
-        {
-          "name": "legacyMarketConfig",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "newMarketConfig",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "admin",
-          "isMut": true,
-          "isSigner": true
-        },
-        {
-          "name": "systemProgram",
-          "isMut": false,
-          "isSigner": false
-        }
-      ],
-      "args": [
-        {
-          "name": "mintFeeBps",
-          "type": "u16"
-        },
-        {
-          "name": "tradeFeeBps",
-          "type": "u16"
-        }
-      ]
-    },
-    {
       "name": "sendToken",
       "accounts": [
         {
@@ -370,7 +323,7 @@
           "isMut": false,
           "isSigner": false,
           "docs": [
-            "Market config (contains trade_fee_bps)"
+            "Market config"
           ]
         },
         {
@@ -415,6 +368,11 @@
           "isSigner": false
         },
         {
+          "name": "outputMint",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
           "name": "treasuryTokenAccount",
           "isMut": true,
           "isSigner": false
@@ -422,19 +380,6 @@
         {
           "name": "userOutTokenAccount",
           "isMut": true,
-          "isSigner": false,
-          "docs": [
-            "Provided by client; program does not verify mint here."
-          ]
-        },
-        {
-          "name": "systemProgram",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "tokenProgram",
-          "isMut": false,
           "isSigner": false
         }
       ],
@@ -629,16 +574,6 @@
     },
     {
       "code": 6002,
-      "name": "UnsupportedProgram",
-      "msg": "Unsupported program id"
-    },
-    {
-      "code": 6003,
-      "name": "AccountDeserializeFailed",
-      "msg": "Account deserialization failed"
-    },
-    {
-      "code": 6004,
       "name": "InvalidOwner",
       "msg": "Invalid Owner"
     }

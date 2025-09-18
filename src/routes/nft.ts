@@ -1,26 +1,17 @@
-import { Router, Request } from "express";
+import { Router, Request, Response } from "express";
 import multer from "multer";
 import { Nft } from "../models/Nft";
 import { Character } from "../models/Character";
+import { Skill } from "../models/Skill";
 import { Rune } from "../models/Rune";
+import { Team } from "../models/Team";
+import { generateNftMetadata } from "../services/metadataGenerator";
+import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
+import Auth from "../models/Auth";
 
-import { mintNftWithAnchor } from "../services/anchorService";
-import {
-  LAMPORTS_PER_SOL,
-  PublicKey,
-  SystemProgram,
-  Transaction,
-  Keypair,
-} from "@solana/web3.js";
-import * as anchor from "@project-serum/anchor";
-import { BN } from "bn.js";
-import {
-  getAssociatedTokenAddressSync,
-  TOKEN_PROGRAM_ID,
-  MINT_SIZE,
-  createInitializeMintInstruction,
-  createAssociatedTokenAccountInstruction,
-} from "@solana/spl-token";
+import fs from "fs";
+import path from "path";
+
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -31,281 +22,191 @@ interface MulterRequest extends Request {
 const router = Router();
 const upload = multer(); // memory storage
 
-const programIdStr = process.env.PROGRAM_ID;
-if (!programIdStr) throw new Error("❌ PROGRAM_ID is missing in .env");
-
-const programID = new PublicKey(programIdStr.trim());
-const idl = require("../../public/idl/universe_of_gamers.json");
-
-// 🔍 Tambahkan log debug
-console.log("⚙️ [nft.ts] PROGRAM_ID =", programID.toBase58());
-console.log("⚙️ [nft.ts] IDL name   =", idl.name);
-
-const provider = anchor.AnchorProvider.env();
-anchor.setProvider(provider);
-const program = new anchor.Program(idl, programID, provider);
-
-router.post("/make-tx", async (req: Request, res) => {
+router.post("/", async (req: Request, res: Response) => {
   try {
-    console.log("📥 Incoming make-tx request");
-    console.log("📥 Body:", JSON.stringify(req.body, null, 2));
+    const { name, description, image, price, royalty, character, owner, txSignature } = req.body;
 
-    const { owner, metadata } = req.body;
-    if (!owner) throw new Error("Owner required");
+    if (!owner || !txSignature) throw new Error("Owner & txSignature required");
 
-    const sellerPk = new PublicKey(owner);
-    console.log("👤 Seller:", sellerPk.toBase58());
+    const char = await Character.findById(character);
+    if (!char) throw new Error("Character not found");
 
-    // --- cek balance seller
-    const balSeller = await provider.connection.getBalance(sellerPk);
-    console.log("💳 Seller balance (lamports):", balSeller);
-
-    // TODO
-    // Step 1
-    // Buat struktur untuk metadata-nft
-    // Upload file json ke server
-    // "displayName": "Monster test 01",
-    // "element": "Fire",
-    // "image": "https://api.universeofgamers.io/uploads/nfts/monster.png"
-    // "level": 1,
-    // "hp": 1,
-    // "atk": 1,
-    // "def": 1,
-    // "spd": 1,
-    // "critRate": 1,
-    // "critDmg": 1,
-    // "basicAttack": {
-    //   "skillName": "Basic test 01",
-    //   "atkMultiplier": 1,
-    //   "defMultiplier": 1,
-    //   "hpMultiplier": 1,
-    //   "description": "Basic test 01",
-    //   "_id": {
-    //     "$oid": "68bef8b8ad6a1ddfd02478f4"
-    //   }
-    // },
-    // "skillAttack": {
-    //   "skillName": "Skill test 01",
-    //   "atkMultiplier": 1,
-    //   "defMultiplier": 1,
-    //   "hpMultiplier": 1,
-    //   "description": "Skill test 01",
-    //   "_id": {
-    //     "$oid": "68bef8b8ad6a1ddfd02478f5"
-    //   }
-    // },
-    // "ultimateAttack": {
-    //   "skillName": "Ultimate test 01",
-    //   "atkMultiplier": 1,
-    //   "defMultiplier": 1,
-    //   "hpMultiplier": 1,
-    //   "description": "Ultimate test 01",
-    //   "_id": {
-    //     "$oid": "68bef8b8ad6a1ddfd02478f6"
-    //   }
-    // },
-    // "createdAt": {
-    //   "$date": "2025-09-08T15:39:36.570Z"
-    // }
-
-    // Step 2
-    // Ambil url file json nft nya
-    // Buat struktur untuk metadata
-    // metadata: any = {
-    //   name: 'Monster UOG',
-    //   symbol: 'MUOG',
-    //   uri: 'isi url file json nft',
-    //   description: 'Monster with Trident',
-    //   price: '0.001',
-    //   properties: 'No Properties',
-    //   size: '10',
-    //   blockchain: 'Solana',
-    //   collection: 'UOG Collections',
-    //   royalty: '8',
-    //   owner: this.userAddress,
-    // };
-
-    // --- Konversi price & royalty ke lamports ---
-    const priceLamports = Math.floor(Number(metadata.price) * LAMPORTS_PER_SOL);
-    const royaltyPercent = Number(metadata.royalty || "0"); // frontend: 8 → 8%
-    if (isNaN(royaltyPercent)) throw new Error("Invalid royalty format");
-
-    const royaltyBps = Math.floor(royaltyPercent * 100); // 8 → 800 bps
-    if (royaltyBps > 10000) throw new Error("Royalty too high (max 10000 bps)");
-
-    console.log("💰 Parsed price & royalty:", {
-      priceInput: metadata.price,
-      royaltyInput: metadata.royalty,
-      priceLamports,
-      royaltyPercent,
-      royaltyBps,
-    });
-
-    // --- Mint baru ---
-    const mintKp = Keypair.generate();
-    const mint = mintKp.publicKey;
-    console.log("🪙 New Mint:", mint.toBase58());
-
-    const sellerAta = getAssociatedTokenAddressSync(mint, sellerPk);
-    console.log("📦 Seller ATA:", sellerAta.toBase58());
-
-    const mplTokenMetadataProgramId = new PublicKey(
-      "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-    );
-
-    const { name, uri, symbol } = metadata;
-    console.log("📝 Metadata args:", { name, symbol, uri });
-
-    // --- Derive PDA sesuai Rust ---
-    const [listingPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("listing"), mint.toBuffer()],
-      program.programId
-    );
-    const [marketConfigPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market_config")],
-      program.programId
-    );
-    const [treasuryPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("treasury")],
-      program.programId
-    );
-    const [escrowSignerPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow_signer"), mint.toBuffer()],
-      program.programId
-    );
-    const [mintAuthPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("mint_auth"), mint.toBuffer()],
-      program.programId
-    );
-    const [metadataPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("metadata"), mplTokenMetadataProgramId.toBuffer(), mint.toBuffer()],
-      mplTokenMetadataProgramId
-    );
-
-    console.log("🔑 Derived PDAs:", {
-      listingPda: listingPda.toBase58(),
-      marketConfigPda: marketConfigPda.toBase58(),
-      treasuryPda: treasuryPda.toBase58(),
-      escrowSignerPda: escrowSignerPda.toBase58(),
-      mintAuthPda: mintAuthPda.toBase58(),
-      metadataPda: metadataPda.toBase58(),
-    });
-
-    const balTreasury = await provider.connection.getBalance(treasuryPda);
-    console.log("💳 Treasury balance (lamports):", balTreasury);
-
-    // --- Create mint account ---
-    const lamportsForMint = await provider.connection.getMinimumBalanceForRentExemption(MINT_SIZE);
-    console.log("💵 Rent-exempt lamports for mint:", lamportsForMint);
-
-    const createMintIx = SystemProgram.createAccount({
-      fromPubkey: sellerPk,
-      newAccountPubkey: mint,
-      space: MINT_SIZE,
-      lamports: lamportsForMint,
-      programId: TOKEN_PROGRAM_ID,
-    });
-
-    // --- Initialize mint (decimals=0, mintAuthority=PDA) ---
-    const initMintIx = createInitializeMintInstruction(mint, 0, mintAuthPda, null);
-
-    // --- Create seller ATA ---
-    const createAtaIx = createAssociatedTokenAccountInstruction(
-      sellerPk,
-      sellerAta,
-      sellerPk,
-      mint
-    );
-
-    // --- Build Anchor ix ---
-    console.log("🚀 Building mintAndList ix...");
-    const ix = await program.methods
-      .mintAndList(
-        new BN(priceLamports),
-        true,   // useSol
-        name,
-        symbol || "",
-        uri,
-        royaltyBps
-      )  
-      .accounts({
-        listing: listingPda,
-        marketConfig: marketConfigPda,
-        treasuryPda: treasuryPda,
-        escrowSigner: escrowSignerPda,
-        seller: sellerPk,
-        sellerNftAta: sellerAta,
-        mintAuthority: mintAuthPda,
-        mint: mint,
-        metadata: metadataPda,
-        tokenMetadataProgram: mplTokenMetadataProgramId,
-        payer: sellerPk,
-        updateAuthority: sellerPk,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      })
-      .instruction();
-
-    console.log("✅ mintAndList ix built:");
-    console.log("   ↳ programId:", ix.programId.toBase58());
-    console.log("   ↳ keys:", ix.keys.map(k => ({
-      pubkey: k.pubkey.toBase58(),
-      isSigner: k.isSigner,
-      isWritable: k.isWritable
-    })));
-
-    // --- Final transaction ---
-    const tx = new Transaction().add(createMintIx, initMintIx, createAtaIx, ix);
-    tx.feePayer = sellerPk;
-    tx.recentBlockhash = (await provider.connection.getLatestBlockhash()).blockhash;
-    tx.partialSign(mintKp);
-
-    console.log("🧾 Transaction ready, feePayer:", sellerPk.toBase58());
-    console.log("🧾 Mint secretKey (base64):", Buffer.from(mintKp.secretKey).toString("base64"));
-
-    const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
-    console.log("📦 Serialized tx length:", serialized.length);
-
+    // assign base stats
     const nft = await Nft.create({
-      name: metadata.name,
-      description: metadata.description,
-      price: priceLamports,
-      properties: metadata.properties,
-      size: metadata.size,
-      blockchain: metadata.blockchain,
-      collection: metadata.collection,
-      royalty: royaltyPercent,
-      owner: metadata.owner,
-      metadata: metadata,
-      txSignature: serialized.toString("base64"),
+      name,
+      description,
+      image,
+      price,
+      royalty,
+      character,
+      owner,
+      txSignature,
+      hp: char.baseHp,
+      atk: char.baseAtk,
+      def: char.baseDef,
+      spd: char.baseSpd,
+      critRate: char.baseCritRate,
+      critDmg: char.baseCritDmg,
+      createdAt: new Date(),
+      updatedAt: new Date(),
     });
-
-    const decoded = Transaction.from(serialized);
-    console.log("📋 Instruction program IDs:", decoded.instructions.map(ix => ix.programId.toBase58()));
-
-    res.json({ 
-      tx: serialized.toString("base64"),
-      debug: {
-        listingPda: listingPda.toBase58(),
-        marketConfigPda: marketConfigPda.toBase58(),
-        treasuryPda: treasuryPda.toBase58(),
-        escrowSignerPda: escrowSignerPda.toBase58(),
-        mintAuthPda: mintAuthPda.toBase58(),
-        metadataPda: metadataPda.toBase58(),
-        mint: mint.toBase58(),
-        sellerAta: sellerAta.toBase58(),
-        sellerBalance: balSeller,
-        treasuryBalance: balTreasury
-      }
-    });
+    res.json({ success: true, nft });
   } catch (err: any) {
-    console.error("❌ make-tx error:", err);
-    console.error("❌ Stack:", err.stack);
-    try {
-      console.error("❌ Full error object:", JSON.stringify(err, null, 2));
-    } catch {}
-    res.status(500).json({ error: err.message, stack: err.stack });
+    console.error("❌ save NFT error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET all NFTs
+router.get("/fetch-nft", async (req, res) => {
+  try {
+    const nfts = await Nft.find();
+    res.json(nfts);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch NFTs" });
+  }
+});
+
+// GET NFTs by owner (only owner can access)
+router.get("/my-nfts",authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    // Ambil user dari DB
+    const user = await Auth.findById(req.user.id).select(
+      "wallets custodialWallets"
+    );
+    if (!user) {
+      return res.status(401).json({ error: "User not found" });
+    }
+
+    // Gabungkan semua wallet address (custodial + external)
+    const walletAddresses = [
+      ...user.wallets.map((w) => w.address),
+      ...user.custodialWallets.map((c) => c.address),
+    ];
+
+    if (walletAddresses.length === 0) {
+      return res.json([]);
+    }
+
+    // Cari NFT berdasarkan semua address
+    const nfts = await Nft.find({ owner: { $in: walletAddresses } });
+
+    res.json(nfts);
+  } catch (err) {
+    console.error("❌ Error fetching my NFTs:", err);
+    res.status(500).json({ error: "Failed to fetch NFTs" });
+  }
+});
+
+/**
+ * Equip Rune to a Character NFT
+ */
+router.post("/:characterId/equip-rune", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { characterId } = req.params;
+    const { runeId } = req.body;
+
+    if (!runeId) return res.status(400).json({ error: "runeId is required" });
+
+    const character = await Nft.findById(characterId);
+    if (!character) return res.status(404).json({ error: "Character not found" });
+
+    if (character.owner !== req.user.walletAddress) {
+      return res.status(403).json({ error: "Not your character" });
+    }
+
+    const runeNft = await Nft.findById(runeId).populate("rune");
+    if (!runeNft || !runeNft.rune) return res.status(404).json({ error: "Rune not found" });
+    if (runeNft.owner !== req.user.walletAddress) {
+      return res.status(403).json({ error: "Not your rune" });
+    }
+    if (runeNft.isEquipped) {
+      return res.status(400).json({ error: "Rune already equipped" });
+    }
+
+    const runeData: any = runeNft.rune;
+
+    // Tambah ke array equipped
+    character.equipped.push(runeNft._id);
+
+    // Apply bonus stats
+    character.hp += runeData.hpBonus ?? 0;
+    character.atk += runeData.atkBonus ?? 0;
+    character.def += runeData.defBonus ?? 0;
+    character.spd += runeData.spdBonus ?? 0;
+
+    runeNft.isEquipped = true;
+    runeNft.equippedTo = character._id;
+
+    await runeNft.save();
+    await character.save();
+
+    res.json({ message: "✅ Rune equipped successfully", character });
+  } catch (err: any) {
+    console.error("❌ Error equipping rune:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Unequip Rune to a Character NFT
+ */
+router.post("/:characterId/unequip-rune", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { characterId } = req.params;
+    const { runeId } = req.body;
+
+    if (!runeId) return res.status(400).json({ error: "runeId is required" });
+
+    const character = await Nft.findById(characterId).populate("character");
+    if (!character) return res.status(404).json({ error: "Character not found" });
+
+    if (character.owner !== req.user.walletAddress) {
+      return res.status(403).json({ error: "Not your character" });
+    }
+
+    // cek rune ada di equipped array
+    if (!character.equipped?.includes(runeId)) {
+      return res.status(400).json({ error: "This rune is not equipped on this character" });
+    }
+
+    const runeNft = await Nft.findById(runeId).populate("rune");
+    if (!runeNft || !runeNft.rune) return res.status(404).json({ error: "Rune not found" });
+
+    const runeData: any = runeNft.rune;
+
+    // Kurangi stats
+    character.hp -= runeData.hpBonus ?? 0;
+    character.atk -= runeData.atkBonus ?? 0;
+    character.def -= runeData.defBonus ?? 0;
+    character.spd -= runeData.spdBonus ?? 0;
+
+    // Hapus rune dari equipped array
+    character.equipped = character.equipped.filter(
+      (id: any) => id.toString() !== runeId
+    );
+
+    runeNft.isEquipped = false;
+    runeNft.equippedTo = null;
+
+    await runeNft.save();
+    await character.save();
+
+    res.json({ message: "✅ Rune unequipped successfully", character });
+  } catch (err: any) {
+    console.error("❌ Error unequipping rune:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET NFT by ID
+router.get("/nft/:id", async (req, res) => {
+  try {
+    const nft = await Nft.findById(req.params.id);
+    if (!nft) return res.status(404).json({ error: "NFT not found" });
+    res.json(nft);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch NFT" });
   }
 });
 
@@ -325,52 +226,23 @@ router.post("/character", async (req, res) => {
 });
 
 // GET all Characters
-router.get("/character", async (req, res) => {
-  // try {
-  //   const chars = await Character.find().populate("runes");
-  //   res.json(chars);
-  // } catch (err: any) {
-  //   res.status(500).json({ error: "Failed to fetch characters" });
-  // }
-
+router.get("/fetch-character", async (req, res) => {
   try {
-    const characters = await Character.find().lean();
-    res.json(characters);
-  } catch (err) {
-    console.error("Error fetching characters:", err);
+    const chars = await Character.find();
+    res.json(chars);
+  } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch characters" });
   }
 });
 
+// GET Character by ID
 router.get("/character/:id", async (req, res) => {
   try {
-    const char = await Character.findById(req.params.id).lean(); // tanpa populate
+    const char = await Character.findById(req.params.id).populate("runes");
     if (!char) return res.status(404).json({ error: "Character not found" });
     res.json(char);
   } catch (err: any) {
-    console.error("Error fetch character by id:", err);
-    res.status(500).json({ error: "Failed to fetch character", details: err.message });
-  }
-});
-
-// GET all NFTs
-router.get("/", async (req, res) => {
-  try {
-    const nfts = await Nft.find();
-    res.json(nfts);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch NFTs" });
-  }
-});
-
-// GET NFT by ID
-router.get("/:id", async (req, res) => {
-  try {
-    const nft = await Nft.findById(req.params.id);
-    if (!nft) return res.status(404).json({ error: "NFT not found" });
-    res.json(nft);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch NFT" });
+    res.status(500).json({ error: "Failed to fetch character" });
   }
 });
 
@@ -410,69 +282,190 @@ router.get("/rune/:id", async (req, res) => {
   }
 });
 
-/////////////////////////////
-// // POST NFT (simpan langsung ke MongoDB)
-// router.post("/", async (req, res) => {
-//   try {
-//     // parsing metadata jika dikirim dalam string
-//     let metadata = req.body.metadata;
-//     if (typeof metadata === "string") {
-//       try {
-//         metadata = JSON.parse(metadata);
-//       } catch {
-//         metadata = { raw: req.body.metadata }; // fallback kalau bukan JSON valid
-//       }
-//     }
+// =====================
+// Team Routes
+// =====================
 
-//     const nft = await Nft.create({
-//       name: req.body.name,
-//       description: req.body.description,
-//       image: req.body.image,
-//       price: req.body.price,
-//       metadata: metadata,
-//       blockchain: req.body.blockchain,
-//       collection: req.body.collection,
-//       royalty: req.body.royalty,
-//       character: req.body.character, // reference ObjectId ke Character
-//     });
-
-//     res.json({ success: true, data: nft });
-//   } catch (err: any) {
-//     console.error("❌ Error creating NFT:", err);
-//     res.status(500).json({ error: err.message });
-//   }
-// });
-
-// Simpan NFT ke MongoDB setelah mint sukses
-router.post("/", async (req, res) => {
+/**
+ * CREATE Team
+ * Body: { name: string, owner: string, members: [nftId1, nftId2, nftId3] }
+ */
+router.post("/team", async (req, res) => {
   try {
-    let metadata = req.body.metadata;
-    if (typeof metadata === "string") {
-      try {
-        metadata = JSON.parse(metadata);
-      } catch {
-        metadata = { raw: req.body.metadata };
-      }
+    const { name, owner, members } = req.body;
+
+    if (!members || members.length !== 3) {
+      return res.status(400).json({ error: "A team must have exactly 3 NFTs" });
     }
 
-    const nft = await Nft.create({
-      name: req.body.name,
-      description: req.body.description,
-      image: req.body.image,
-      price: req.body.price,
-      metadata,
-      blockchain: req.body.blockchain,
-      collection: req.body.collection,
-      royalty: req.body.royalty,
-      character: req.body.character,
-      owner: req.body.owner,   // tambahkan owner (wallet address)
-      txSignature: req.body.txSignature // simpan tx hash biar bisa trace di explorer
+    // Validate all NFT IDs exist
+    const nfts = await Nft.find({ _id: { $in: members }, owner });
+    if (nfts.length !== 3) {
+      return res.status(400).json({ error: "Some NFTs are invalid or not owned by this user" });
+    }
+
+    const team = new Team({ name, owner, members });
+    await team.save();
+
+    res.status(201).json(team);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to create team", details: err.message });
+  }
+});
+
+/**
+ * READ All Teams (optionally by owner)
+ * Query: ?owner=walletAddress
+ */
+router.get("/team", async (req, res) => {
+  try {
+    const { owner } = req.query;
+    const filter: any = owner ? { owner } : {};
+    const teams = await Team.find(filter).populate("members");
+    res.json(teams);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch teams" });
+  }
+});
+
+/**
+ * READ Team by ID
+ */
+router.get("/team/:id", async (req, res) => {
+  try {
+    const team = await Team.findById(req.params.id).populate("members");
+    if (!team) return res.status(404).json({ error: "Team not found" });
+    res.json(team);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch team" });
+  }
+});
+
+/**
+ * UPDATE Team
+ * Body: { name?: string, members?: string[] }
+ */
+router.put("/team/:id", async (req, res) => {
+  try {
+    const { name, members } = req.body;
+
+    if (members && members.length !== 3) {
+      return res.status(400).json({ error: "A team must have exactly 3 NFTs" });
+    }
+
+    let updateData: any = {};
+    if (name) updateData.name = name;
+    if (members) updateData.members = members;
+
+    const team = await Team.findByIdAndUpdate(req.params.id, updateData, {
+      new: true
+    }).populate("members");
+
+    if (!team) return res.status(404).json({ error: "Team not found" });
+    res.json(team);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to update team" });
+  }
+});
+
+/**
+ * DELETE Team
+ */
+router.delete("/team/:id", async (req, res) => {
+  try {
+    const team = await Team.findByIdAndDelete(req.params.id);
+    if (!team) return res.status(404).json({ error: "Team not found" });
+    res.json({ message: "Team deleted successfully" });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to delete team" });
+  }
+});
+
+/**
+ * Generate metadata JSON for a given NFT
+ * POST /nft/:id/metadata
+ * Body (optional): { outputDir: string }
+ */
+router.post("/nft/:id/metadata", async (req, res) => {
+  try {
+    const nftId = req.params.id;
+    const outputDir = process.env.METADATA_DIR;
+
+    const result = await generateNftMetadata(nftId, outputDir);
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    res.status(201).json({
+      message: "Metadata generated successfully",
+      file: result.path,
+      metadata: result.metadata
+    });
+  } catch (err: any) {
+    console.error("❌ Error generating metadata:", err.message);
+    res.status(500).json({ error: "Failed to generate metadata" });
+  }
+});
+
+/**
+ * GET all NFT metadata
+ * GET /nft/metadata
+ */
+router.get("/nft/metadata", async (req, res) => {
+  try {
+    const outputDir: string = path.resolve(
+      process.env.METADATA_DIR || "uploads/metadata/nft"
+    );
+
+    if (!fs.existsSync(outputDir)) {
+      return res.status(404).json({ error: "Metadata directory not found" });
+    }
+
+    const files: string[] = fs
+      .readdirSync(outputDir)
+      .filter((f: string) => f.endsWith(".json"));
+
+    if (files.length === 0) {
+      return res.status(404).json({ error: "No metadata files found" });
+    }
+
+    const allMetadata = files.map((file: string) => {
+      const filePath: string = path.join(outputDir, file);
+      const content = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      return { id: path.basename(file, ".json"), ...content };
     });
 
-    res.json({ success: true, data: nft });
+    res.status(200).json(allMetadata);
   } catch (err: any) {
-    console.error("❌ Error saving NFT:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Error reading all metadata:", err.message);
+    res.status(500).json({ error: "Failed to read metadata files" });
+  }
+});
+
+/**
+ * GET single NFT metadata
+ * GET /nft/:id/metadata
+ */
+router.get("/nft/:id/metadata", async (req, res) => {
+  try {
+    const nftId: string = req.params.id;
+    const outputDir: string = path.resolve(
+      process.env.METADATA_DIR || "uploads/metadata/nft"
+    );
+    const filePath: string = path.join(outputDir, `${nftId}.json`);
+
+    if (!fs.existsSync(filePath)) {
+      return res
+        .status(404)
+        .json({ error: "Metadata not found. Please generate it first." });
+    }
+
+    const metadata = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    res.status(200).json(metadata);
+  } catch (err: any) {
+    console.error("❌ Error reading metadata:", err.message);
+    res.status(500).json({ error: "Failed to read metadata" });
   }
 });
 
