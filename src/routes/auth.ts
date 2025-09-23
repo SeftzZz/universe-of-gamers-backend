@@ -1,10 +1,51 @@
 import { Router, Request, Response } from "express";
+
+import { 
+  Connection, 
+  PublicKey,
+  LAMPORTS_PER_SOL, 
+  Keypair, 
+  Transaction, 
+  SystemProgram, 
+  sendAndConfirmTransaction,
+  VersionedTransaction,
+  TransactionMessage,
+  LoadedAddresses,
+  AddressLookupTableAccount,
+  TransactionInstruction,
+  ParsedAccountData,
+} from "@solana/web3.js";
+import { ComputeBudgetProgram, sendAndConfirmRawTransaction } from "@solana/web3.js";
+import {
+  getAssociatedTokenAddress,
+  createTransferInstruction,
+  getOrCreateAssociatedTokenAccount,
+  createAssociatedTokenAccountInstruction,
+  TOKEN_PROGRAM_ID,
+  ACCOUNT_SIZE,
+  AccountLayout,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  createSyncNativeInstruction, 
+  NATIVE_MINT,
+  createCloseAccountInstruction,
+  getAccount,
+  createApproveInstruction
+} from "@solana/spl-token";
+import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
+import * as anchor from "@project-serum/anchor";
+import { BN } from "bn.js";
+import axios from "axios";
+import dotenv from "dotenv";
+import { getTokenInfo } from "../services/priceService";
+import { getMint } from "@solana/spl-token";
+
 import jwt from 'jsonwebtoken';
 import Auth from '../models/Auth';
 import { ICustodialWallet } from '../models/Auth';
+import { Team } from "../models/Team";
 import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
 import { encrypt, decrypt } from '../utils/cryptoHelper';
-import { Keypair, PublicKey } from '@solana/web3.js';
+
 import bs58 from 'bs58';
 import bcrypt from 'bcrypt';
 import * as crypto from "crypto";
@@ -64,6 +105,17 @@ const generateToken = (user: any): string => {
   );
 };
 
+function encryptWithPassphrase(text: string, passphrase: string): string {
+  const key = crypto.createHash("sha256").update(passphrase).digest();
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+
+  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return Buffer.concat([iv, tag, encrypted]).toString("base64");
+}
+
 // === Register Local + Custodial Wallet ===
 router.post('/register', async (req, res) => {
   try {
@@ -105,6 +157,19 @@ router.post('/register', async (req, res) => {
     });
 
     await auth.save();
+
+    // 🔥 Setelah user dibuat → inisialisasi 8 team default
+    const defaultTeams = [];
+    for (let i = 1; i <= 8; i++) {
+      defaultTeams.push({
+        name: `TEAM#${i}`,
+        owner: address,     // wallet custodial/external
+        members: [],        // masih kosong
+      });
+    }
+
+    await Team.insertMany(defaultTeams);
+
     const token = generateToken(auth);
 
     res.status(201).json({
@@ -524,17 +589,6 @@ router.put('/user/:id/notifications', async (req, res) => {
   }
 });
 
-function encryptWithPassphrase(text: string, passphrase: string): string {
-  const key = crypto.createHash("sha256").update(passphrase).digest();
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-
-  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-
-  return Buffer.concat([iv, tag, encrypted]).toString("base64");
-}
-
 // === Export Custodial Private Key (Protected) ===
 router.post("/user/:id/export/private", authenticateJWT, exportLimiter, async (req: AuthRequest, res) => {
   try {
@@ -860,6 +914,184 @@ router.post("/user/:id/2fa/verify", authenticateJWT, otpLimiter, async (req: Aut
   await user.save();
 
   res.json({ success: true, message: "2FA enabled successfully" });
+});
+
+//
+// POST /wallet/nft/mintAddress/buy
+//
+router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { id: userId } = req.user;
+    const { mintAddress } = req.params;
+    const { demo } = req.query; // ?demo=true untuk dummy mode
+
+    console.log("⚡ Custodian buy NFT request:", { userId, mintAddress, demo });
+
+    // 🔐 Ambil user & decrypt PK
+    const authUser = await Auth.findById(userId);
+    if (!authUser) return res.status(404).json({ error: "User not found" });
+
+    const custodian = authUser.custodialWallets.find((w) => w.provider === "solana");
+    if (!custodian) return res.status(400).json({ error: "No custodial Solana wallet" });
+
+    const decrypted = decrypt(custodian.privateKey);
+    const buyerKp = Keypair.fromSecretKey(bs58.decode(decrypted));
+    console.log("🔓 Custodian wallet:", buyerKp.publicKey.toBase58());
+
+    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+    const provider = new anchor.AnchorProvider(connection, {} as any, { preflightCommitment: "confirmed" });
+    const program = new anchor.Program(
+      require("../../public/idl/universe_of_gamers.json"),
+      new anchor.web3.PublicKey(process.env.PROGRAM_ID!),
+      provider
+    );
+
+    const nftMint = new anchor.web3.PublicKey(mintAddress);
+
+    // ✅ Resolve PDA listing
+    const [listingPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("listing"), nftMint.toBuffer()],
+      program.programId
+    );
+
+    // ✅ Resolve PDA marketConfig & treasury
+    const [marketConfigPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("market_config")],
+      program.programId
+    );
+
+    const [treasuryPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("treasury")],
+      program.programId
+    );
+
+    let listing: any;
+
+    try {
+      listing = await program.account.listing.fetch(listingPda);
+      console.log("📦 Listing fetched from chain:", {
+        price: listing.price.toString(),
+        useSol: listing.useSol,
+        seller: listing.seller.toBase58(),
+        bump: listing.bump,
+      });
+    } catch (e) {
+      console.warn("⚠️ Listing not found on chain, using dummy listing for demo");
+
+      listing = {
+        price: new anchor.BN(0.01 * anchor.web3.LAMPORTS_PER_SOL), // 0.01 SOL
+        useSol: true,
+        seller: buyerKp.publicKey, // anggap custodian sendiri yang jual
+        nftMint,
+        marketConfig: marketConfigPda,
+        tradeFeeBps: 500, // 0.5% fee
+        bump: 255, // dummy bump
+      };
+    }
+
+    if (!listing.useSol) {
+      return res.status(400).json({ error: "Only SOL payments supported for now" });
+    }
+
+    const escrowSignerPda = (
+      await anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("escrow_signer"), listing.nftMint.toBuffer()],
+        program.programId
+      )
+    )[0];
+
+    const buyerNftAta = await anchor.utils.token.associatedAddress({
+      mint: listing.nftMint,
+      owner: buyerKp.publicKey,
+    });
+    const sellerNftAta = await anchor.utils.token.associatedAddress({
+      mint: listing.nftMint,
+      owner: listing.seller,
+    });
+
+    const tx = await program.methods
+      .buyNft()
+      .accountsStrict({
+        listing: listingPda,
+        escrowSigner: escrowSignerPda,
+        buyer: buyerKp.publicKey,
+        seller: listing.seller,
+        treasuryPda,            // readonly, sesuai kontrak
+        buyerNftAta,
+        sellerNftAta,
+        marketConfig: marketConfigPda,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .transaction();
+
+    // === Demo Mode ===
+    if (demo === "true") {
+      console.log("🧪 Running in DEMO mode (no broadcast)");
+      const dummySig = `DUMMY_BUY_${Date.now()}_${listing.nftMint.toBase58().slice(0, 6)}`;
+
+      const priceSol = listing.price / anchor.web3.LAMPORTS_PER_SOL;
+      const tradeFeeSol = (listing.price * (listing.tradeFeeBps ?? 500)) / 10_000 / anchor.web3.LAMPORTS_PER_SOL;
+      const networkCostSol = 0.0005; // dummy
+      const totalCostSol = priceSol + networkCostSol;
+
+      return res.json({
+        message: "🛒 Custodian buy NFT success! (dummy mode)",
+        buyer: buyerKp.publicKey.toBase58(),
+        seller: listing.seller.toBase58(),
+        nftMint: listing.nftMint.toBase58(),
+        signature: dummySig,
+        costs: {
+          priceSol,
+          tradeFeeSol,
+          networkCostSol,
+          totalCostSol,
+        },
+      });
+    }
+
+    // === Real Mode ===
+    tx.feePayer = buyerKp.publicKey;
+    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    tx.sign(buyerKp);
+
+    const rawTx = tx.serialize();
+    const sig = await connection.sendRawTransaction(rawTx);
+    await connection.confirmTransaction(sig, "confirmed");
+
+    return res.json({
+      message: "🛒 Custodian buy NFT success! (real mode)",
+      buyer: buyerKp.publicKey.toBase58(),
+      seller: listing.seller.toBase58(),
+      nftMint: listing.nftMint.toBase58(),
+      signature: sig,
+    });
+  } catch (err: any) {
+    console.error("❌ Custodian buy NFT error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/program-info", async (req, res) => {
+  try {
+    const connection = new anchor.web3.Connection(process.env.SOLANA_CLUSTER!, "confirmed");
+    const programId = new anchor.web3.PublicKey(process.env.PROGRAM_ID!);
+
+    const accountInfo = await connection.getAccountInfo(programId);
+    if (!accountInfo) {
+      return res.status(404).json({ error: "Program not found on this cluster" });
+    }
+
+    res.json({
+      programId: programId.toBase58(),
+      owner: accountInfo.owner.toBase58(),
+      executable: accountInfo.executable,
+      lamports: accountInfo.lamports / 1e9,
+      dataLength: accountInfo.data.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;

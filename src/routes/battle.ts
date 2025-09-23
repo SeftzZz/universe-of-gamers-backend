@@ -105,7 +105,7 @@ router.delete("/battle/:id", async (req, res) => {
  */
 router.post("/battle/:id/log", async (req, res) => {
   try {
-    const { turn, attacker, defender, skill, damage, remainingHp } = req.body;
+    const { turn, attacker, defender, skill, damage, isCrit, remainingHp } = req.body;
 
     const battle = await Battle.findById(req.params.id);
     if (!battle) return res.status(404).json({ error: "Battle not found" });
@@ -116,6 +116,7 @@ router.post("/battle/:id/log", async (req, res) => {
       defender,
       skill,
       damage,
+      isCrit,
       remainingHp,
       timestamp: new Date()
     };

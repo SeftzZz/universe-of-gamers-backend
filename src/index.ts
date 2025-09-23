@@ -11,6 +11,8 @@ import dotenv from "dotenv";
 import characterRoutes from "./routes/character"; // add by fpp 05/09/25
 import gatchaRoutes from './routes/gatcha';
 import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
+import battleSimulateRouter from "./routes/battleSimulate";
+
 dotenv.config();
 
 const app = express();
@@ -36,6 +38,8 @@ app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 app.use("/api/characters", characterRoutes);
 
 app.use("/api/gatcha", gatchaRoutes);
+
+app.use("/api", battleSimulateRouter);
 
 const PORT = process.env.PORT || 3000;
 

@@ -1,7 +1,17 @@
 import express from "express";
+import bs58 from "bs58";
+import { Keypair, Transaction } from "@solana/web3.js";
 import { GatchaPack } from "../models/GatchaPack";
+import { Nft, INft } from "../models/Nft";
 import { doGatchaRoll } from "../services/gatchaService";
+import { decrypt } from "../utils/cryptoHelper";
+import Auth from "../models/Auth";
+import { authenticateJWT, AuthRequest } from "../middleware/auth";
 import { buildMintTransaction } from "../services/mintService";
+import { generateNftMetadata } from "../services/metadataGenerator";
+
+import fs from "fs";
+import path from "path";
 
 const router = express.Router();
 
@@ -106,39 +116,306 @@ router.post("/pull", async (req, res) => {
   }
 });
 
-/**
- * POST /:id/pull
- * Build raw mint transaction for frontend signing
+/** 
+ * POST /:id/pull/custodian
+ * Gatcha versi custodial:
+ * - Ambil privateKey user dari Auth
+ * - Decrypt
+ * - Sign & broadcast TX di backend
  */
-router.post("/:id/pull", async (req, res) => {
+router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res) => {
   try {
-    const { user } = req.body;
-    const pack = await GatchaPack.findById(req.params.id);
+    const { id: userId } = req.user;
+    const { id: packId } = req.params;
+
+    console.log("⚡ Custodian gatcha request:", { userId, packId });
+
+    // 🔐 Ambil user & decrypt PK
+    const authUser = await Auth.findById(userId);
+    if (!authUser) return res.status(404).json({ error: "User not found" });
+
+    const custodian = authUser.custodialWallets.find((w) => w.provider === "solana");
+    if (!custodian) return res.status(400).json({ error: "No custodial Solana wallet" });
+
+    const decrypted = decrypt(custodian.privateKey);
+    const userKp = Keypair.fromSecretKey(bs58.decode(decrypted));
+    console.log("🔓 Custodian wallet:", userKp.publicKey.toBase58());
+
+    // ✅ Cek balance dulu
+    const anchorLib = await import("@project-serum/anchor");
+    const provider = anchorLib.AnchorProvider.env();
+    const conn = provider.connection;
+    const balanceLamports = await conn.getBalance(userKp.publicKey);
+    const balanceSol = balanceLamports / anchorLib.web3.LAMPORTS_PER_SOL;
+    console.log("💰 Balance:", balanceSol, "SOL");
+
+    // if (balanceLamports < 0.01 * anchorLib.web3.LAMPORTS_PER_SOL) {
+    //   return res.status(400).json({
+    //     error: "Insufficient balance in custodial wallet",
+    //     balance: balanceSol,
+    //   });
+    // }
+
+    // 📦 Ambil pack
+    const pack = await GatchaPack.findById(packId);
     if (!pack) return res.status(404).json({ error: "Pack not found" });
 
-    const { nft, blueprint, rewardInfo, metadata } = await doGatchaRoll(pack, user);
+    // 🎲 Roll gatcha
+    let { nft, blueprint, rewardInfo } = await doGatchaRoll(pack, custodian.address);
 
-    const metadataUri = `${process.env.METADATA_URI}/${nft._id}.json`;
+    // 🔑 Generate mint lebih dulu
+    const mintKp = Keypair.generate();
+    const mintAddress = mintKp.publicKey.toBase58();
+    nft.mintAddress = mintAddress;
 
-    const txResp = await buildMintTransaction(user, {
-      name: nft.name,
-      symbol: "UOGNFT",
-      uri: metadataUri,
-      price: 0,
-      royalty: 0,
-    });
+    // 🔢 Populate character/rune biar ada name
+    if (nft.character) {
+      nft = await nft.populate("character");
+    }
+    if (nft.rune) {
+      nft = await nft.populate("rune");
+    }
+
+    let finalName: string;
+
+    if (nft.character && (nft.character as any)._id) {
+      const charId = (nft.character as any)._id;
+      const charName = (nft.character as any).name;
+      const existingCount = await Nft.countDocuments({ character: charId });
+      finalName = `${charName} #${existingCount + 1}`;
+      nft.name = finalName;
+    } else if (nft.rune && (nft.rune as any)._id) {
+      const runeId = (nft.rune as any)._id;
+      const runeName = (nft.rune as any).name;
+      const existingCount = await Nft.countDocuments({ rune: runeId });
+      finalName = `${runeName} #${existingCount + 1}`;
+      nft.name = finalName;
+    } else {
+      // 🚨 Kalau ada data rusak/aneh
+      throw new Error("NFT tidak punya karakter atau rune untuk generate name");
+    }
+
+    console.log("DEBUG finalName:", finalName);
+
+    // 💾 Simpan NFT dengan nama final
+    await nft.save();
+
+    // 📝 Buat metadata JSON pakai mintAddress + nama final
+    const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
+    const outputDir = path.join(process.cwd(), baseDir);
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+    const filePath = path.join(outputDir, `${mintAddress}.json`);
+    const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
+    if (!metadataResult.success) throw new Error(`Metadata generation failed: ${metadataResult.error}`);
+
+    const metadataUri = `https://api.universeofgamers.io/api/nft/${mintAddress}/metadata`;
+
+    // 🛠️ Build TX dengan mintKp & metadataUri
+    const txResp = await buildMintTransaction(
+      custodian.address,
+      {
+        name: nft.name,         // 👈 sudah ada nomor urut konsisten
+        symbol: "UOGNFT",
+        uri: metadataUri,
+        price: pack.priceSOL,   // 🔥 dari pack
+        royalty: nft.royalty || 0,
+      },
+      mintKp
+    );
+
+    const tx = Transaction.from(Buffer.from(txResp.tx, "base64"));
+    tx.sign(userKp);
+
+    // ❌ Jangan broadcast dulu, cukup log
+    console.log("📜 TX decoded, instr:", tx.instructions.length);
+    console.log("✍️ TX signed by:", userKp.publicKey.toBase58());
+    console.log("🪙 Mint Address:", mintAddress);
+
+    // ✅ Dummy signature (contoh pakai hash dari tx atau random string)
+    const dummySig = `DUMMY_${Date.now()}_${mintAddress.slice(0, 6)}`;
+    console.log("✅ TX confirmed (dummy):", dummySig);
+
+    // Hitung total biaya (pack + network)
+    const packPriceSol = pack.priceSOL || 0;
+    const networkCostSol = txResp.costs.totalSol;
+    const totalCostSol = packPriceSol + networkCostSol;
+
+    console.log("💰 Pack price:", packPriceSol, "SOL");
+    console.log("💸 Network cost:", networkCostSol, "SOL");
+    console.log("💵 Total user cost:", totalCostSol, "SOL");
 
     res.json({
-      message: "🎲 Gatcha success!",
+      message: "🎲 Custodian gatcha success! (dummy mode)",
       rewardInfo,
       blueprint,
       nft,
-      metadata,
-      tx: txResp.tx,
-      debug: txResp.debug,
+      metadata: {
+        path: filePath,
+        metadata: metadataResult.metadata,
+      },
+      mintAddress,
+      signature: dummySig,
+      costs: {
+        packPriceSol,
+        networkCostSol,
+        totalCostSol,
+      }
     });
+
   } catch (err: any) {
-    console.error("❌ Gatcha tx build error:", err.message);
+    console.error("❌ Custodian gatcha error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { id: userId } = req.user;
+    const { id: packId } = req.params;
+
+    console.log("⚡ Custodian gatcha request:", { userId, packId });
+
+    // 🔐 Ambil user & decrypt PK
+    const authUser = await Auth.findById(userId);
+    if (!authUser) return res.status(404).json({ error: "User not found" });
+
+    const custodian = authUser.custodialWallets.find((w) => w.provider === "solana");
+    if (!custodian) return res.status(400).json({ error: "No custodial Solana wallet" });
+
+    const decrypted = decrypt(custodian.privateKey);
+    const userKp = Keypair.fromSecretKey(bs58.decode(decrypted));
+    console.log("🔓 Custodian wallet:", userKp.publicKey.toBase58());
+
+    // ✅ Cek balance dulu
+    const anchorLib = await import("@project-serum/anchor");
+    const provider = anchorLib.AnchorProvider.env();
+    const conn = provider.connection;
+    const balanceLamports = await conn.getBalance(userKp.publicKey);
+    const balanceSol = balanceLamports / anchorLib.web3.LAMPORTS_PER_SOL;
+    console.log("💰 Balance:", balanceSol, "SOL");
+
+    if (balanceLamports < 0.01 * anchorLib.web3.LAMPORTS_PER_SOL) {
+      return res.status(400).json({
+        error: "Insufficient balance in custodial wallet",
+        balance: balanceSol,
+      });
+    }
+
+    // 📦 Ambil pack
+    const pack = await GatchaPack.findById(packId);
+    if (!pack) return res.status(404).json({ error: "Pack not found" });
+
+    // 🎲 Roll gatcha
+    let { nft, blueprint, rewardInfo } = await doGatchaRoll(pack, custodian.address);
+
+    // 🔑 Generate mint lebih dulu
+    const mintKp = Keypair.generate();
+    const mintAddress = mintKp.publicKey.toBase58();
+    nft.mintAddress = mintAddress;
+
+    // 🔢 Populate character/rune biar ada name
+    if (nft.character) {
+      nft = await nft.populate("character");
+    }
+    if (nft.rune) {
+      nft = await nft.populate("rune");
+    }
+
+    let finalName: string;
+
+    if (nft.character && (nft.character as any)._id) {
+      const charId = (nft.character as any)._id;
+      const charName = (nft.character as any).name;
+      const existingCount = await Nft.countDocuments({ character: charId });
+      finalName = `${charName} #${existingCount + 1}`;
+      nft.name = finalName;
+    } else if (nft.rune && (nft.rune as any)._id) {
+      const runeId = (nft.rune as any)._id;
+      const runeName = (nft.rune as any).name;
+      const existingCount = await Nft.countDocuments({ rune: runeId });
+      finalName = `${runeName} #${existingCount + 1}`;
+      nft.name = finalName;
+    } else {
+      // 🚨 Kalau ada data rusak/aneh
+      throw new Error("NFT tidak punya karakter atau rune untuk generate name");
+    }
+
+    console.log("DEBUG finalName:", finalName);
+
+    // 💾 Simpan NFT dengan nama final
+    await nft.save();
+
+    // 📝 Buat metadata JSON pakai mintAddress + nama final
+    const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
+    const outputDir = path.join(process.cwd(), baseDir);
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+    const filePath = path.join(outputDir, `${mintAddress}.json`);
+    const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
+    if (!metadataResult.success) throw new Error(`Metadata generation failed: ${metadataResult.error}`);
+
+    const metadataUri = `https://api.universeofgamers.io/api/nft/${mintAddress}/metadata`;
+
+    // 🛠️ Build TX dengan mintKp & metadataUri
+    const txResp = await buildMintTransaction(
+      custodian.address,
+      {
+        name: nft.name,         // 👈 sudah ada nomor urut konsisten
+        symbol: "UOGNFT",
+        uri: metadataUri,
+        price: pack.priceSOL,   // 🔥 dari pack
+        royalty: nft.royalty || 0,
+      },
+      mintKp
+    );
+
+    const tx = Transaction.from(Buffer.from(txResp.tx, "base64"));
+    tx.sign(userKp);
+
+    // ✅ Kirim transaksi ke Solana
+    const sig = await anchorLib.web3.sendAndConfirmTransaction(
+      conn,
+      tx,
+      [userKp, mintKp],
+      {
+        skipPreflight: false,
+        commitment: "confirmed",
+      }
+    );
+
+    console.log("✅ TX confirmed:", sig);
+
+    // Hitung total biaya (pack + network)
+    const packPriceSol = pack.priceSOL || 0;
+    const networkCostSol = txResp.costs.totalSol;
+    const totalCostSol = packPriceSol + networkCostSol;
+
+    console.log("💰 Pack price:", packPriceSol, "SOL");
+    console.log("💸 Network cost:", networkCostSol, "SOL");
+    console.log("💵 Total user cost:", totalCostSol, "SOL");
+
+    // ✅ Kirim response ke frontend
+    res.json({
+      message: "🎲 Custodian gatcha success!",
+      rewardInfo,
+      blueprint,
+      nft,
+      metadata: {
+        path: filePath,
+        metadata: metadataResult.metadata,
+      },
+      mintAddress,
+      signature: sig,
+      costs: {
+        packPriceSol,
+        networkCostSol,
+        totalCostSol,
+      }
+    });
+
+  } catch (err: any) {
+    console.error("❌ Custodian gatcha error:", err);
     res.status(500).json({ error: err.message });
   }
 });

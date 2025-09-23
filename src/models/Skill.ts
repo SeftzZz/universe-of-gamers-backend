@@ -12,7 +12,7 @@ export interface ISkill extends Document {
   createdAt: Date;
 }
 
-const SkillSchema = new Schema<ISkill>(
+export const SkillSchema = new Schema<ISkill>(
   {
     name: { type: String, required: true },
     description: { type: String, default: "" },
@@ -24,7 +24,7 @@ const SkillSchema = new Schema<ISkill>(
 
     createdAt: { type: Date, default: Date.now }
   },
-  { collection: "skills" }
+  { _id: false } // 👈 penting, biar gak bikin _id baru di tiap subdoc
 );
 
 export const Skill = mongoose.model<ISkill>("Skill", SkillSchema);

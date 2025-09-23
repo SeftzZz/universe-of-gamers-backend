@@ -32,23 +32,26 @@ export interface MintMetadata {
   name: string;
   symbol?: string;
   uri: string;
-  price?: number; // dalam SOL
+  price?: number;   // dalam SOL
   royalty?: number; // %
 }
 
 export async function buildMintTransaction(
   owner: string,
-  metadata: MintMetadata
+  metadata: MintMetadata,
+  mintKp?: Keypair
 ) {
   const sellerPk = new PublicKey(owner);
 
-  const priceLamports = Math.floor(Number(metadata.price || 0) * LAMPORTS_PER_SOL);
+  const priceLamports = Math.ceil(Number(metadata.price || 0) * LAMPORTS_PER_SOL);
+  console.log("📦 metadata.price:", metadata.price, "→ lamports:", priceLamports);
+
   const royaltyPercent = Number(metadata.royalty || 0);
   const royaltyBps = Math.floor(royaltyPercent * 100);
 
-  // === Buat mint baru ===
-  const mintKp = Keypair.generate();
-  const mint = mintKp.publicKey;
+  // === Buat mint baru kalau belum ada ===
+  const mintKeypair = mintKp || Keypair.generate();
+  const mint = mintKeypair.publicKey;
   const sellerAta = getAssociatedTokenAddressSync(mint, sellerPk);
 
   const mplTokenMetadataProgramId = new PublicKey(
@@ -130,7 +133,25 @@ export async function buildMintTransaction(
   const tx = new Transaction().add(createMintIx, initMintIx, createAtaIx, ix);
   tx.feePayer = sellerPk;
   tx.recentBlockhash = (await provider.connection.getLatestBlockhash()).blockhash;
-  tx.partialSign(mintKp);
+  tx.partialSign(mintKeypair);
+
+  // ✅ Hitung biaya
+  const feeCalc = await provider.connection.getFeeForMessage(tx.compileMessage());
+  const feeLamports = feeCalc.value || 0;
+  const feeSol = feeLamports / LAMPORTS_PER_SOL;
+
+  const rentMintLamports = await provider.connection.getMinimumBalanceForRentExemption(MINT_SIZE);
+  const rentMintSol = rentMintLamports / LAMPORTS_PER_SOL;
+
+  const rentAtaLamports = await provider.connection.getMinimumBalanceForRentExemption(165);
+  const rentAtaSol = rentAtaLamports / LAMPORTS_PER_SOL;
+
+  const totalSol = feeSol + rentMintSol + rentAtaSol;
+
+  console.log("💸 Estimated fee:", feeSol, "SOL");
+  console.log("💸 Rent-exempt for mint:", rentMintSol, "SOL");
+  console.log("💸 Rent-exempt for ATA:", rentAtaSol, "SOL");
+  console.log("💸 Total estimated network cost:", totalSol, "SOL");
 
   const serialized = tx.serialize({
     requireAllSignatures: false,
@@ -144,6 +165,15 @@ export async function buildMintTransaction(
       listingPda: listingPda.toBase58(),
       treasuryPda: treasuryPda.toBase58(),
       sellerAta: sellerAta.toBase58(),
+    },
+    costs: {
+      feeLamports,
+      feeSol,
+      rentMintLamports,
+      rentMintSol,
+      rentAtaLamports,
+      rentAtaSol,
+      totalSol,
     },
   };
 }

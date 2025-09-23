@@ -1,9 +1,6 @@
 import { Character } from "../models/Character";
 import { Rune } from "../models/Rune";
 import { Nft } from "../models/Nft";
-import { generateNftMetadata } from "./metadataGenerator";
-import path from "path";
-import fs from "fs";
 
 interface RewardInfo {
   type: "character" | "rune";
@@ -12,7 +9,7 @@ interface RewardInfo {
 
 /**
  * Perform one gatcha roll
- * @returns { nft, blueprint, rewardInfo, metadata }
+ * @returns { nft, blueprint, rewardInfo }
  */
 export async function doGatchaRoll(
   pack: any,
@@ -21,7 +18,6 @@ export async function doGatchaRoll(
   nft: typeof Nft.prototype;
   blueprint: any;
   rewardInfo: RewardInfo;
-  metadata: { path: string; metadata: any };
 }> {
   // 1. Tentukan reward
   const rewardInfo: RewardInfo = weightedRandom(
@@ -31,20 +27,29 @@ export async function doGatchaRoll(
     }))
   );
 
-  // 2. Ambil blueprint
+  // 2. Ambil blueprint random sesuai rarity
   let blueprint: any;
   if (rewardInfo.type === "character") {
-    blueprint = await Character.findOne({ rarity: rewardInfo.rarity });
+    const result = await Character.aggregate([
+      { $match: { rarity: rewardInfo.rarity } },
+      { $sample: { size: 1 } }
+    ]);
+    blueprint = result[0];
   } else {
-    blueprint = await Rune.findOne({ rarity: rewardInfo.rarity });
+    const result = await Rune.aggregate([
+      { $match: { rarity: rewardInfo.rarity } },
+      { $sample: { size: 1 } }
+    ]);
+    blueprint = result[0];
   }
+
   if (!blueprint) {
     throw new Error(
       `No blueprint for ${rewardInfo.type} rarity=${rewardInfo.rarity}`
     );
   }
 
-  // 3. Generate NFT
+  // 3. Generate NFT document (belum ada mintAddress)
   const nft = new Nft({
     owner: user,
     name: blueprint.name,
@@ -57,59 +62,31 @@ export async function doGatchaRoll(
 
     level: 1,
     exp: 0,
-    hp:
-      rewardInfo.type === "character"
-        ? blueprint.baseHp
-        : blueprint.hpBonus ?? 1,
-    atk:
-      rewardInfo.type === "character"
-        ? blueprint.baseAtk
-        : blueprint.atkBonus ?? 0,
-    def:
-      rewardInfo.type === "character"
-        ? blueprint.baseDef
-        : blueprint.defBonus ?? 0,
-    spd:
-      rewardInfo.type === "character"
-        ? blueprint.baseSpd
-        : blueprint.spdBonus ?? 0,
-    critRate:
-      rewardInfo.type === "character"
-        ? blueprint.baseCritRate ?? 0
-        : blueprint.critRateBonus ?? 0,
-    critDmg:
-      rewardInfo.type === "character"
-        ? blueprint.baseCritDmg ?? 0
-        : blueprint.critDmgBonus ?? 0,
+    hp: rewardInfo.type === "character"
+      ? blueprint.baseHp
+      : blueprint.hpBonus ?? 1,
+    atk: rewardInfo.type === "character"
+      ? blueprint.baseAtk
+      : blueprint.atkBonus ?? 0,
+    def: rewardInfo.type === "character"
+      ? blueprint.baseDef
+      : blueprint.defBonus ?? 0,
+    spd: rewardInfo.type === "character"
+      ? blueprint.baseSpd
+      : blueprint.spdBonus ?? 0,
+    critRate: rewardInfo.type === "character"
+      ? blueprint.baseCritRate ?? 0
+      : blueprint.critRateBonus ?? 0,
+    critDmg: rewardInfo.type === "character"
+      ? blueprint.baseCritDmg ?? 0
+      : blueprint.critDmgBonus ?? 0,
+
+    // 🔥 mintAddress akan diisi nanti (setelah buildMintTransaction)
+    mintAddress: null,
   });
-  await nft.save();
+  // await nft.save();
 
-  // 4. Tentukan folder metadata dari .env
-  const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
-  const outputDir = path.join(process.cwd(), baseDir);
-
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
-
-  // nama file = <idNFT>.json supaya unik
-  const filePath = path.join(outputDir, `${nft._id}.json`);
-
-  const metadataResult = await generateNftMetadata(nft._id.toString(), outputDir);
-
-  if (!metadataResult.success) {
-    throw new Error(`Failed to generate metadata: ${metadataResult.error}`);
-  }
-
-  return {
-    nft,
-    blueprint,
-    rewardInfo,
-    metadata: {
-      path: filePath,
-      metadata: metadataResult.metadata,
-    },
-  };
+  return { nft, blueprint, rewardInfo };
 }
 
 /**
