@@ -3,10 +3,11 @@ import { ITeam } from "./Team";
 
 export interface IBattleLog {
   turn: number;
-  attacker: string;  // NFT id / name
-  defender: string;  // NFT id / name
-  skill: string;     // skill/attack used
+  attacker: string;   // NFT id / name
+  defender: string;   // NFT id / name
+  skill: string;      // skill/attack used
   damage: number;
+  isCrit: boolean;    // ✅ baru ditambah
   remainingHp: number;
   timestamp: Date;
 }
@@ -31,6 +32,7 @@ const BattleLogSchema = new Schema<IBattleLog>(
     defender: { type: String, required: true },
     skill: { type: String, required: true },
     damage: { type: Number, required: true },
+    isCrit: { type: Boolean, default: false }, // ✅ baru ditambah
     remainingHp: { type: Number, required: true },
     timestamp: { type: Date, default: Date.now }
   },

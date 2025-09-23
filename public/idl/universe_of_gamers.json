@@ -34,8 +34,33 @@
         {
           "name": "tradeFeeBps",
           "type": "u16"
+        },
+        {
+          "name": "relistFeeBps",
+          "type": "u16"
         }
       ]
+    },
+    {
+      "name": "initializeTreasury",
+      "accounts": [
+        {
+          "name": "treasuryPda",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "admin",
+          "isMut": true,
+          "isSigner": true
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": []
     },
     {
       "name": "mintAndList",
@@ -144,6 +169,46 @@
       ]
     },
     {
+      "name": "relistNft",
+      "accounts": [
+        {
+          "name": "listing",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "seller",
+          "isMut": true,
+          "isSigner": true
+        },
+        {
+          "name": "treasuryPda",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "marketConfig",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "newPrice",
+          "type": "u64"
+        },
+        {
+          "name": "useSol",
+          "type": "bool"
+        }
+      ]
+    },
+    {
       "name": "buyNft",
       "accounts": [
         {
@@ -168,7 +233,7 @@
         },
         {
           "name": "treasuryPda",
-          "isMut": false,
+          "isMut": true,
           "isSigner": false
         },
         {
@@ -231,27 +296,6 @@
       ]
     },
     {
-      "name": "initializeTreasury",
-      "accounts": [
-        {
-          "name": "treasuryPda",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "admin",
-          "isMut": true,
-          "isSigner": true
-        },
-        {
-          "name": "systemProgram",
-          "isMut": false,
-          "isSigner": false
-        }
-      ],
-      "args": []
-    },
-    {
       "name": "updateMarketConfig",
       "accounts": [
         {
@@ -272,6 +316,10 @@
         },
         {
           "name": "newTradeFeeBps",
+          "type": "u16"
+        },
+        {
+          "name": "newRelistFeeBps",
           "type": "u16"
         },
         {
@@ -442,123 +490,15 @@
             "type": "u16"
           },
           {
+            "name": "relistFeeBps",
+            "type": "u16"
+          },
+          {
             "name": "treasuryBump",
             "type": "u8"
           }
         ]
       }
-    }
-  ],
-  "events": [
-    {
-      "name": "Minted",
-      "fields": [
-        {
-          "name": "seller",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "nftMint",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "price",
-          "type": "u64",
-          "index": false
-        }
-      ]
-    },
-    {
-      "name": "Listed",
-      "fields": [
-        {
-          "name": "seller",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "nftMint",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "price",
-          "type": "u64",
-          "index": false
-        }
-      ]
-    },
-    {
-      "name": "Bought",
-      "fields": [
-        {
-          "name": "buyer",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "seller",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "nftMint",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "price",
-          "type": "u64",
-          "index": false
-        },
-        {
-          "name": "tradeFee",
-          "type": "u64",
-          "index": false
-        }
-      ]
-    },
-    {
-      "name": "Swapped",
-      "fields": [
-        {
-          "name": "user",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "dexProgram",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "outputMint",
-          "type": "publicKey",
-          "index": false
-        },
-        {
-          "name": "inAmount",
-          "type": "u64",
-          "index": false
-        },
-        {
-          "name": "outAmount",
-          "type": "u64",
-          "index": false
-        },
-        {
-          "name": "tradeFee",
-          "type": "u64",
-          "index": false
-        },
-        {
-          "name": "tradeFeeBps",
-          "type": "u16",
-          "index": false
-        }
-      ]
     }
   ],
   "errors": [

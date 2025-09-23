@@ -1,5 +1,5 @@
 import mongoose, { Schema, Document } from "mongoose";
-import { ISkill } from "./Skill";
+import { ISkill, SkillSchema } from "./Skill";
 
 export interface ICharacter extends Document {
   name: string;
@@ -43,9 +43,9 @@ const CharacterSchema = new Schema<ICharacter>(
     baseCritRate: { type: Number, min: 0, max: 100, default: 0 },
     baseCritDmg: { type: Number, min: 0, max: 500, default: 0 },
 
-    basicAttack: { type: Object, required: true },
-    skillAttack: { type: Object, required: true },
-    ultimateAttack: { type: Object, required: true },
+    basicAttack: { type: SkillSchema, required: true },
+    skillAttack: { type: SkillSchema, required: true },
+    ultimateAttack: { type: SkillSchema, required: true },
 
     createdAt: { type: Date, default: Date.now }
   },

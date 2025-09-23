@@ -14,6 +14,9 @@ export interface INft extends Document {
   image: string;
   royalty?: number;
 
+  // 🔥 address mint di blockchain (unik & wajib)
+  mintAddress: string;
+
   level: number;
   exp: number;
 
@@ -50,6 +53,9 @@ const NftSchema = new Schema<INft>(
     image: { type: String, default: "" },
     royalty: { type: Number, default: 0 },
 
+    // 🔥 wajib ada mintAddress (unik di blockchain)
+    mintAddress: { type: String, required: true, unique: true },
+
     level: { type: Number, min: 1, default: 1 },
     exp: { type: Number, min: 0, default: 0 },
 
@@ -67,10 +73,9 @@ const NftSchema = new Schema<INft>(
     equippedTo: { type: Schema.Types.ObjectId, ref: "Nft", default: null },
 
     price: { type: Number },
-    txSignature: { type: String }
+    txSignature: { type: String },
   },
   { collection: "nfts", timestamps: true }
 );
-
 
 export const Nft = mongoose.model<INft>("Nft", NftSchema);
