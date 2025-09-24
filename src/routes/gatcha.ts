@@ -3,7 +3,7 @@ import bs58 from "bs58";
 import { Keypair, Transaction } from "@solana/web3.js";
 import { GatchaPack } from "../models/GatchaPack";
 import { Nft, INft } from "../models/Nft";
-import { doGatchaRoll } from "../services/gatchaService";
+import { doGatchaRoll, doMultiGatchaRolls } from "../services/gatchaService";
 import { decrypt } from "../utils/cryptoHelper";
 import Auth from "../models/Auth";
 import { authenticateJWT, AuthRequest } from "../middleware/auth";
@@ -149,117 +149,121 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
     const balanceSol = balanceLamports / anchorLib.web3.LAMPORTS_PER_SOL;
     console.log("💰 Balance:", balanceSol, "SOL");
 
-    // if (balanceLamports < 0.01 * anchorLib.web3.LAMPORTS_PER_SOL) {
-    //   return res.status(400).json({
-    //     error: "Insufficient balance in custodial wallet",
-    //     balance: balanceSol,
-    //   });
-    // }
-
     // 📦 Ambil pack
     const pack = await GatchaPack.findById(packId);
     if (!pack) return res.status(404).json({ error: "Pack not found" });
 
-    // 🎲 Roll gatcha
-    let { nft, blueprint, rewardInfo } = await doGatchaRoll(pack, custodian.address);
+    // 🎲 Roll gatcha → multi (contoh count=3)
+    const rolls = await doMultiGatchaRolls(pack, custodian.address, 3);
 
-    // 🔑 Generate mint lebih dulu
-    const mintKp = Keypair.generate();
-    const mintAddress = mintKp.publicKey.toBase58();
-    nft.mintAddress = mintAddress;
+    // 🚀 Proses tiap NFT
+    const processedResults = [];
+    for (let i = 0; i < rolls.length; i++) {
+      let { nft } = rolls[i];
 
-    // 🔢 Populate character/rune biar ada name
-    if (nft.character) {
-      nft = await nft.populate("character");
+      // 🔑 Generate mint
+      const mintKp = Keypair.generate();
+      const mintAddress = mintKp.publicKey.toBase58();
+      nft.mintAddress = mintAddress;
+
+      // 🔢 Populate character/rune
+      if (nft.character) nft = await nft.populate("character");
+      if (nft.rune) nft = await nft.populate("rune");
+
+      // 🚀 Generate nama unik
+      if (nft.character && (nft.character as any)._id) {
+        const charId = (nft.character as any)._id;
+        const charName = (nft.character as any).name;
+        const existingCount = await Nft.countDocuments({ character: charId });
+        nft.name = `${charName} #${existingCount + 1}`;
+      } else if (nft.rune && (nft.rune as any)._id) {
+        const runeId = (nft.rune as any)._id;
+        const runeName = (nft.rune as any).name;
+        const existingCount = await Nft.countDocuments({ rune: runeId });
+        nft.name = `${runeName} #${existingCount + 1}`;
+      } else {
+        throw new Error("NFT tidak punya karakter atau rune untuk generate name");
+      }
+
+      await nft.save();
+
+      // 📝 Generate metadata JSON per NFT
+      const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
+      const outputDir = path.join(process.cwd(), baseDir);
+      if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+      const filePath = path.join(outputDir, `${mintAddress}.json`);
+      const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
+      if (!metadataResult.success) {
+        throw new Error(`Metadata generation failed: ${metadataResult.error}`);
+      }
+
+      processedResults.push({
+        nft,
+        blueprint: rolls[i].blueprint,
+        rewardInfo: rolls[i].rewardInfo,
+        mintAddress,
+        metadata: metadataResult.metadata,
+        filePath,
+        mintKp
+      });
     }
-    if (nft.rune) {
-      nft = await nft.populate("rune");
+
+    interface BuiltTx {
+      mintAddress: string;
+      signature: string;
+      networkCostSol: number;
+      totalCostSol: number;
     }
 
-    let finalName: string;
+    // 🚀 Build TX per NFT
+    const txs: BuiltTx[] = [];
+    for (const r of processedResults) {
+      const metadataUri = `https://api.universeofgamers.io/api/nft/${r.mintAddress}/metadata`;
 
-    if (nft.character && (nft.character as any)._id) {
-      const charId = (nft.character as any)._id;
-      const charName = (nft.character as any).name;
-      const existingCount = await Nft.countDocuments({ character: charId });
-      finalName = `${charName} #${existingCount + 1}`;
-      nft.name = finalName;
-    } else if (nft.rune && (nft.rune as any)._id) {
-      const runeId = (nft.rune as any)._id;
-      const runeName = (nft.rune as any).name;
-      const existingCount = await Nft.countDocuments({ rune: runeId });
-      finalName = `${runeName} #${existingCount + 1}`;
-      nft.name = finalName;
-    } else {
-      // 🚨 Kalau ada data rusak/aneh
-      throw new Error("NFT tidak punya karakter atau rune untuk generate name");
+      const txResp = await buildMintTransaction(
+        custodian.address,
+        {
+          name: r.nft.name,
+          symbol: "UOGNFT",
+          uri: metadataUri,
+          price: pack.priceSOL,
+          royalty: r.nft.royalty || 0,
+        },
+        r.mintKp
+      );
+
+      const tx = Transaction.from(Buffer.from(txResp.tx, "base64"));
+      tx.sign(userKp);
+
+      const dummySig = `DUMMY_${Date.now()}_${r.mintAddress.slice(0, 6)}`;
+
+      txs.push({
+        mintAddress: r.mintAddress,
+        signature: dummySig,
+        networkCostSol: txResp.costs.totalSol,
+        totalCostSol: (pack.priceSOL || 0) + txResp.costs.totalSol,
+      });
     }
 
-    console.log("DEBUG finalName:", finalName);
-
-    // 💾 Simpan NFT dengan nama final
-    await nft.save();
-
-    // 📝 Buat metadata JSON pakai mintAddress + nama final
-    const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
-    const outputDir = path.join(process.cwd(), baseDir);
-    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-
-    const filePath = path.join(outputDir, `${mintAddress}.json`);
-    const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
-    if (!metadataResult.success) throw new Error(`Metadata generation failed: ${metadataResult.error}`);
-
-    const metadataUri = `https://api.universeofgamers.io/api/nft/${mintAddress}/metadata`;
-
-    // 🛠️ Build TX dengan mintKp & metadataUri
-    const txResp = await buildMintTransaction(
-      custodian.address,
-      {
-        name: nft.name,         // 👈 sudah ada nomor urut konsisten
-        symbol: "UOGNFT",
-        uri: metadataUri,
-        price: pack.priceSOL,   // 🔥 dari pack
-        royalty: nft.royalty || 0,
-      },
-      mintKp
-    );
-
-    const tx = Transaction.from(Buffer.from(txResp.tx, "base64"));
-    tx.sign(userKp);
-
-    // ❌ Jangan broadcast dulu, cukup log
-    console.log("📜 TX decoded, instr:", tx.instructions.length);
-    console.log("✍️ TX signed by:", userKp.publicKey.toBase58());
-    console.log("🪙 Mint Address:", mintAddress);
-
-    // ✅ Dummy signature (contoh pakai hash dari tx atau random string)
-    const dummySig = `DUMMY_${Date.now()}_${mintAddress.slice(0, 6)}`;
-    console.log("✅ TX confirmed (dummy):", dummySig);
-
-    // Hitung total biaya (pack + network)
-    const packPriceSol = pack.priceSOL || 0;
-    const networkCostSol = txResp.costs.totalSol;
-    const totalCostSol = packPriceSol + networkCostSol;
-
-    console.log("💰 Pack price:", packPriceSol, "SOL");
-    console.log("💸 Network cost:", networkCostSol, "SOL");
-    console.log("💵 Total user cost:", totalCostSol, "SOL");
+    const totalNetworkCostSol = txs.reduce((sum, t) => sum + t.networkCostSol, 0);
+    const totalCostSol = txs.reduce((sum, t) => sum + t.totalCostSol, 0);
 
     res.json({
       message: "🎲 Custodian gatcha success! (dummy mode)",
-      rewardInfo,
-      blueprint,
-      nft,
-      metadata: {
-        path: filePath,
-        metadata: metadataResult.metadata,
-      },
-      mintAddress,
-      signature: dummySig,
+      count: processedResults.length,
+      results: processedResults.map((r, idx) => ({
+        nft: r.nft,
+        blueprint: r.blueprint,
+        rewardInfo: r.rewardInfo,
+        mintAddress: r.mintAddress,
+        metadata: r.metadata,
+        tx: txs[idx]
+      })),
       costs: {
-        packPriceSol,
-        networkCostSol,
-        totalCostSol,
+        packPriceSol: pack.priceSOL || 0,
+        networkCostSol: totalNetworkCostSol,
+        totalCostSol
       }
     });
 
