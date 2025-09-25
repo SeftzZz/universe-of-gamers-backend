@@ -181,7 +181,7 @@ router.get("/fetch-nft", async (req, res) => {
         // ✅ Fetch raw account data
         const accountInfo = await connection.getAccountInfo(metadataPda);
         if (!accountInfo) {
-          console.warn(`⚠️ On-chain metadata not found for ${nft.mintAddress}`);
+          // console.warn(`⚠️ On-chain metadata not found for ${nft.mintAddress}`);
           continue; // skip NFT
         }
 
@@ -191,7 +191,7 @@ router.get("/fetch-nft", async (req, res) => {
         uri = uri.replace(/\0/g, "").trim();
         uri = uri.replace(/[^\x20-\x7E]+/g, ""); // buang karakter aneh
 
-        console.log(`🌐 Metadata URI for ${nft.mintAddress}:`, uri);
+        // console.log(`🌐 Metadata URI for ${nft.mintAddress}:`, uri);
 
         let metadata: any = null;
         try {
@@ -213,7 +213,7 @@ router.get("/fetch-nft", async (req, res) => {
           priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
           console.log(`💰 Price fetched from listing ${nft.mintAddress}:`, priceSol);
         } catch {
-          console.warn(`⚠️ Listing not found for ${nft.mintAddress}`);
+          // console.warn(`⚠️ Listing not found for ${nft.mintAddress}`);
           continue; // 🚨 skip NFT kalau tidak ada listing
         }
 

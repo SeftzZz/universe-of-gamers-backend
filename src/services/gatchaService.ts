@@ -11,6 +11,7 @@ interface RewardInfo {
  * Perform one gatcha roll
  * @returns { nft, blueprint, rewardInfo }
  */
+// 🎲 Roll satu item (helper tetap sama)
 export async function doGatchaRoll(
   pack: any,
   user: string
@@ -19,7 +20,6 @@ export async function doGatchaRoll(
   blueprint: any;
   rewardInfo: RewardInfo;
 }> {
-  // 1. Tentukan reward
   const rewardInfo: RewardInfo = weightedRandom(
     pack.rewards.map((r: any) => ({
       item: { type: r.type, rarity: r.rarity } as RewardInfo,
@@ -27,7 +27,6 @@ export async function doGatchaRoll(
     }))
   );
 
-  // 2. Ambil blueprint random sesuai rarity
   let blueprint: any;
   if (rewardInfo.type === "character") {
     const result = await Character.aggregate([
@@ -49,7 +48,6 @@ export async function doGatchaRoll(
     );
   }
 
-  // 3. Generate NFT document (belum ada mintAddress)
   const nft = new Nft({
     owner: user,
     name: blueprint.name,
@@ -59,7 +57,6 @@ export async function doGatchaRoll(
     royalty: 0,
     character: rewardInfo.type === "character" ? blueprint._id : undefined,
     rune: rewardInfo.type === "rune" ? blueprint._id : undefined,
-
     level: 1,
     exp: 0,
     hp: rewardInfo.type === "character"
@@ -80,13 +77,33 @@ export async function doGatchaRoll(
     critDmg: rewardInfo.type === "character"
       ? blueprint.baseCritDmg ?? 0
       : blueprint.critDmgBonus ?? 0,
-
-    // 🔥 mintAddress akan diisi nanti (setelah buildMintTransaction)
     mintAddress: null,
   });
-  // await nft.save();
 
   return { nft, blueprint, rewardInfo };
+}
+
+// 🎁 Roll banyak sekaligus
+export async function doMultiGatchaRolls(
+  pack: any,
+  user: string,
+  count: number
+): Promise<
+  { nft: typeof Nft.prototype; blueprint: any; rewardInfo: RewardInfo }[]
+> {
+  const results = [];
+  for (let i = 0; i < count; i++) {
+    const roll = await doGatchaRoll(pack, user);
+
+    if (roll.nft.character) {
+      await roll.nft.populate("character");
+    } else if (roll.nft.rune) {
+      await roll.nft.populate("rune");
+    }
+
+    results.push(roll);
+  }
+  return results;
 }
 
 /**
