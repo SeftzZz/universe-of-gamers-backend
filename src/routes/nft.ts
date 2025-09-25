@@ -51,6 +51,9 @@ import { getMint } from "@solana/spl-token";
 import fs from "fs";
 import path from "path";
 
+import Redis from "ioredis";
+import pLimit from "p-limit";
+
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -113,6 +116,31 @@ function handleSpl(parsed: any, sig: any, tx: any, history: any[]) {
   }
 }
 
+// 🔑 Redis client
+const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+
+// ⏱️ Batas concurrency (misalnya max 5 request paralel ke RPC)
+const limit = pLimit(5);
+
+// TTL cache (dalam detik)
+const CACHE_TTL = 300; // 5 menit
+
+// TTL (detik)
+const TTL_METADATA = 86400; // 24 jam
+const TTL_LISTING = 60;     // 1 menit
+
+// 🔹 Helper fetch dengan timeout
+async function fetchWithTimeout(url: string, ms = 5000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 router.post("/", async (req: Request, res: Response) => {
   try {
     const { name, description, image, price, royalty, character, owner, txSignature } = req.body;
@@ -148,9 +176,11 @@ router.post("/", async (req: Request, res: Response) => {
   }
 });
 
-// GET all NFTs dengan validasi on-chain
+// GET all NFTs dengan validasi on-chain (parallelized)
 router.get("/fetch-nft", async (req, res) => {
   try {
+    console.time("⏱ fetch-nft-total");
+
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const provider = new anchor.AnchorProvider(connection, {} as any, {
       preflightCommitment: "confirmed",
@@ -161,75 +191,131 @@ router.get("/fetch-nft", async (req, res) => {
       provider
     );
 
+    console.time("⏱ DB-find");
     const nfts = await Nft.find();
+    console.timeEnd("⏱ DB-find");
+    console.log(`📦 Total NFT: ${nfts.length}`);
+
+    // 🔹 Bikin list semua mint + metadata PDA
+    const mintPks = nfts.map((nft) => new PublicKey(nft.mintAddress));
+    const metadataPdas = mintPks.map((mintPk) =>
+      PublicKey.findProgramAddressSync(
+        [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+        METADATA_PROGRAM_ID
+      )[0]
+    );
+
+    console.time("⏱ getMultipleAccountsInfo");
+    const accounts = await connection.getMultipleAccountsInfo(metadataPdas);
+    console.timeEnd("⏱ getMultipleAccountsInfo");
+
     const results: any[] = [];
 
-    for (const nft of nfts) {
-      try {
-        const mintPk = new PublicKey(nft.mintAddress);
+    await Promise.all(
+      nfts.map((nft, i) =>
+        limit(async () => {
+          const mintAddress = nft.mintAddress;
+          const cacheKey = `nft:${mintAddress}`;
+          console.time(`⏱ NFT-${mintAddress}`);
 
-        // ✅ Cari PDA metadata (Metaplex)
-        const [metadataPda] = PublicKey.findProgramAddressSync(
-          [
-            Buffer.from("metadata"),
-            METADATA_PROGRAM_ID.toBuffer(),
-            mintPk.toBuffer(),
-          ],
-          METADATA_PROGRAM_ID
-        );
+          try {
+            // 🔑 Cache full NFT
+            const cached = await redis.get(cacheKey);
+            if (cached) {
+              console.log(`⚡ Cache HIT: ${mintAddress}`);
+              results.push(JSON.parse(cached));
+              // console.timeEnd(`⏱ NFT-${mintAddress}`);
+              return;
+            }
+            // console.log(`🆕 Cache MISS: ${mintAddress}`);
 
-        // ✅ Fetch raw account data
-        const accountInfo = await connection.getAccountInfo(metadataPda);
-        if (!accountInfo) {
-          // console.warn(`⚠️ On-chain metadata not found for ${nft.mintAddress}`);
-          continue; // skip NFT
-        }
+            const accountInfo = accounts[i];
+            if (!accountInfo) {
+              // console.warn(`❌ No accountInfo for ${mintAddress}`);
+              // console.timeEnd(`⏱ NFT-${mintAddress}`);
+              return;
+            }
 
-        // ✅ Decode URI dari buffer
-        const data = accountInfo.data;
-        let uri = data.slice(115, 115 + 200).toString("utf-8");
-        uri = uri.replace(/\0/g, "").trim();
-        uri = uri.replace(/[^\x20-\x7E]+/g, ""); // buang karakter aneh
+            // ✅ Decode URI
+            let uri = accountInfo.data
+              .slice(115, 315)
+              .toString("utf-8")
+              .replace(/\0/g, "")
+              .trim()
+              .replace(/[^\x20-\x7E]+/g, "");
 
-        // console.log(`🌐 Metadata URI for ${nft.mintAddress}:`, uri);
+            let metadata: any = null;
 
-        let metadata: any = null;
-        try {
-          const resp = await fetch(uri);
-          metadata = await resp.json();
-        } catch {
-          console.warn(`⚠️ Failed to fetch metadata JSON for ${nft.mintAddress}`);
-        }
+            // cek cache metadata
+            const cachedMeta = await redis.get(`nftmeta:${mintAddress}`);
+            if (cachedMeta) {
+              console.log(`⚡ Metadata cache HIT: ${mintAddress}`);
+              metadata = JSON.parse(cachedMeta);
+            } else if (uri && uri.startsWith("http")) {
+              console.log(`🌐 Fetching metadata: ${uri}`);
+              try {
+                console.time(`⏱ metadata-fetch-${mintAddress}`);
+                const resp = await fetchWithTimeout(uri, 7000);
+                if (resp.ok) {
+                  metadata = await resp.json();
+                  await redis.setex(`nftmeta:${mintAddress}`, TTL_METADATA, JSON.stringify(metadata));
+                  console.log(`✅ Metadata saved cache: ${mintAddress}`);
+                } else {
+                  console.warn(`⚠️ HTTP ${resp.status} fetching metadata for ${mintAddress}`);
+                }
+                console.timeEnd(`⏱ metadata-fetch-${mintAddress}`);
+              } catch (err) {
+                console.warn(`⚠️ Timeout/failed fetch metadata for ${mintAddress}`, err);
+              }
+            }
 
-        // ✅ Fetch PDA listing (marketplace program)
-        const [listingPda] = anchor.web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("listing"), mintPk.toBuffer()],
-          program.programId
-        );
+            // ✅ Fetch PDA listing (pakai cache pendek)
+            let priceSol: number | null = null;
+            const cachedListing = await redis.get(`nftlist:${mintAddress}`);
+            if (cachedListing) {
+              console.log(`⚡ Listing cache HIT: ${mintAddress}`);
+              priceSol = parseFloat(cachedListing);
+            } else {
+              console.log(`🔎 Fetching on-chain listing for ${mintAddress}`);
+              const [listingPda] = anchor.web3.PublicKey.findProgramAddressSync(
+                [Buffer.from("listing"), mintPks[i].toBuffer()],
+                program.programId
+              );
+              try {
+                console.time(`⏱ listing-fetch-${mintAddress}`);
+                const listing: any = await program.account.listing.fetch(listingPda);
+                priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
+                await redis.setex(`nftlist:${mintAddress}`, TTL_LISTING, priceSol.toString());
+                console.log(`✅ Listing cached: ${mintAddress} = ${priceSol} SOL`);
+                console.timeEnd(`⏱ listing-fetch-${mintAddress}`);
+              } catch {
+                console.warn(`❌ No listing for ${mintAddress}`);
+                console.timeEnd(`⏱ NFT-${mintAddress}`);
+                return;
+              }
+            }
 
-        let priceSol: number | null = null;
-        try {
-          const listing: any = await program.account.listing.fetch(listingPda);
-          priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
-          console.log(`💰 Price fetched from listing ${nft.mintAddress}:`, priceSol);
-        } catch {
-          // console.warn(`⚠️ Listing not found for ${nft.mintAddress}`);
-          continue; // 🚨 skip NFT kalau tidak ada listing
-        }
+            const result = {
+              ...nft.toObject(),
+              onChain: true,
+              metadata,
+              price: priceSol,
+            };
 
-        results.push({
-          ...nft.toObject(),
-          onChain: true,
-          metadata,
-          price: priceSol,
-        });
-      } catch (innerErr: any) {
-        console.error(`❌ Validation error for ${nft.mintAddress}:`, innerErr.message);
-        // skip NFT kalau gagal validasi
-        continue;
-      }
-    }
+            // 💾 Cache full NFT (gabungan metadata+listing) TTL pendek
+            await redis.setex(cacheKey, TTL_LISTING, JSON.stringify(result));
+            results.push(result);
 
+            console.timeEnd(`⏱ NFT-${mintAddress}`);
+          } catch (err: any) {
+            console.error(`❌ Validation error for ${nft.mintAddress}:`, err.message);
+            console.timeEnd(`⏱ NFT-${mintAddress}`);
+          }
+        })
+      )
+    );
+
+    console.timeEnd("⏱ fetch-nft-total");
     res.json(results);
   } catch (err) {
     console.error("❌ Fetch NFT error:", err);
@@ -880,43 +966,171 @@ router.get("/:mintAddress/metadata", async (req: Request, res: Response) => {
  * GET NFT onchain
  * GET /:mintAddress/onchain
  */
-// === Route GET /:mintAddress/onchain ===
+// GET detail NFT by mintAddress (on-chain validation + history)
 router.get("/:mintAddress/onchain", async (req: Request, res: Response) => {
-  try {
-    const { mintAddress } = req.params;
+  const { mintAddress } = req.params;
+  console.time(`⏱ onchain-${mintAddress}`);
 
+  try {
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const mintPk = new PublicKey(mintAddress);
 
+    // 🔑 Cache utama
+    const cacheKey = `nft:onchain:${mintAddress}`;
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      console.log(`⚡ Cache HIT: ${mintAddress}`);
+      console.timeEnd(`⏱ onchain-${mintAddress}`);
+      return res.json(JSON.parse(cached));
+    }
+    console.log(`🆕 Cache MISS: ${mintAddress}`);
+
     // ✅ Cari PDA metadata (Metaplex)
     const [metadataPda] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("metadata"),
-        METADATA_PROGRAM_ID.toBuffer(),
-        mintPk.toBuffer(),
-      ],
+      [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
       METADATA_PROGRAM_ID
     );
 
-    // ✅ Fetch raw account data
     const accountInfo = await connection.getAccountInfo(metadataPda);
     if (!accountInfo) {
       return res.status(404).json({ error: "On-chain metadata not found" });
     }
 
-    // ✅ Decode URI dari buffer (offset 115, panjang ±200 byte)
-    const data = accountInfo.data;
-    let uri = data.slice(115, 115 + 200).toString("utf-8");
-    uri = uri.replace(/\0/g, "").trim();
-    uri = uri.replace(/[^\x20-\x7E]+/g, ""); // buang karakter aneh
+    // ✅ Decode URI
+    let uri = accountInfo.data.slice(115, 315).toString("utf-8").replace(/\0/g, "").trim();
+    uri = uri.replace(/[^\x20-\x7E]+/g, "");
+    console.log("🌐 Metadata URI:", uri);
 
-    console.log("🌐 Metadata URI (clean):", uri);
+    // ✅ Fetch metadata JSON (pakai cache metadata)
+    let metadata: any = null;
+    const cachedMeta = await redis.get(`nftmeta:${mintAddress}`);
+    if (cachedMeta) {
+      console.log(`⚡ Metadata cache HIT: ${mintAddress}`);
+      metadata = JSON.parse(cachedMeta);
+    } else if (uri && uri.startsWith("http")) {
+      try {
+        const resp = await fetchWithTimeout(uri, 7000);
+        if (resp.ok) {
+          metadata = await resp.json();
+          await redis.setex(`nftmeta:${mintAddress}`, TTL_METADATA, JSON.stringify(metadata));
+          console.log(`✅ Metadata cached: ${mintAddress}`);
+        }
+      } catch (err) {
+        console.warn(`⚠️ Failed to fetch metadata JSON for ${mintAddress}`, err);
+      }
+    }
 
-    const resp = await fetch(uri);
-    const metadata = await resp.json();
-    console.log("✅ Metadata JSON fetched, name:", metadata.name);
+    // ✅ Fetch PDA listing (pakai cache)
+    let priceSol: number | null = null;
+    const cachedListing = await redis.get(`nftlist:${mintAddress}`);
+    if (cachedListing) {
+      console.log(`⚡ Listing cache HIT: ${mintAddress}`);
+      priceSol = parseFloat(cachedListing);
+    } else {
+      const provider = new anchor.AnchorProvider(connection, {} as any, {
+        preflightCommitment: "confirmed",
+      });
+      const program = new anchor.Program(
+        require("../../public/idl/universe_of_gamers.json"),
+        new anchor.web3.PublicKey(process.env.PROGRAM_ID!),
+        provider
+      );
 
-    // ✅ Fetch PDA listing (marketplace program)
+      const [listingPda] = anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("listing"), mintPk.toBuffer()],
+        program.programId
+      );
+
+      try {
+        const listing: any = await program.account.listing.fetch(listingPda);
+        priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
+        await redis.setex(`nftlist:${mintAddress}`, TTL_LISTING, priceSol.toString());
+        console.log(`✅ Listing cached: ${mintAddress} = ${priceSol} SOL`);
+      } catch {
+        console.warn(`⚠️ Listing not found for ${mintAddress}`);
+      }
+    }
+
+    // ✅ Ambil signatures (mint + ATA)
+    let signatures: any[] = [];
+    try {
+      const sigMint = await connection.getSignaturesForAddress(mintPk, { limit: 20 });
+      const owner = metadata?.properties?.creators?.[0]?.address;
+      if (owner) {
+        const ata = getAssociatedTokenAddressSync(mintPk, new PublicKey(owner));
+        const sigAta = await connection.getSignaturesForAddress(ata, { limit: 20 });
+        signatures = [...sigMint, ...sigAta];
+        console.log(`📌 ATA found: ${ata.toBase58()}`);
+      } else {
+        signatures = sigMint;
+      }
+      console.log(`📝 Signatures fetched: ${signatures.length}`);
+    } catch (e) {
+      console.error("⚠️ Failed to fetch signatures:", e);
+    }
+
+    // ✅ Proses signatures (Mint/Transfer/Burn)
+    const history: any[] = [];
+    for (const sig of signatures) {
+      try {
+        const tx = await connection.getParsedTransaction(sig.signature, {
+          maxSupportedTransactionVersion: 0,
+        });
+        if (!tx) continue;
+
+        const allInstructions = [
+          ...tx.transaction.message.instructions,
+          ...(tx.meta?.innerInstructions?.flatMap((ix: any) => ix.instructions) || []),
+        ];
+
+        for (const ix of allInstructions) {
+          if ("parsed" in ix && ix.program === "spl-token") {
+            const info = ix.parsed.info || {};
+            const common = {
+              signature: sig.signature,
+              slot: sig.slot,
+              blockTime: tx.blockTime ? new Date(tx.blockTime * 1000).toISOString() : null,
+            };
+            switch (ix.parsed.type) {
+              case "mintTo":
+                history.push({ ...common, event: "Mint", from: null, to: info.account, amount: info.amount });
+                break;
+              case "transfer":
+                history.push({ ...common, event: "Transfer", from: info.source, to: info.destination, amount: info.amount });
+                break;
+              case "burn":
+                history.push({ ...common, event: "Burn", from: info.account, to: null, amount: info.amount });
+                break;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`⚠️ Failed parsing tx ${sig.signature}`, err);
+      }
+    }
+
+    const result = { ...metadata, price: priceSol, history };
+    await redis.setex(cacheKey, TTL_LISTING, JSON.stringify(result));
+
+    console.log("📊 Final history length:", history.length);
+    console.timeEnd(`⏱ onchain-${mintAddress}`);
+
+    return res.json(result);
+  } catch (err: any) {
+    console.error("❌ Metadata fetch error:", err.message);
+    res.status(500).json({ error: "Failed to fetch metadata from chain" });
+  }
+});
+
+/**
+ * GET NFT list onchain
+ * GET /nft/onchain
+ */
+router.get("/onchain", async (req, res) => {
+  try {
+    console.time("⏱ onchain-total");
+
+    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const provider = new anchor.AnchorProvider(connection, {} as any, {
       preflightCommitment: "confirmed",
     });
@@ -926,114 +1140,138 @@ router.get("/:mintAddress/onchain", async (req: Request, res: Response) => {
       provider
     );
 
-    const [listingPda] = anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("listing"), mintPk.toBuffer()],
-      program.programId
+    // 🔹 Ambil NFT dari DB
+    console.time("⏱ DB-find");
+    const nfts = await Nft.find();
+    console.timeEnd("⏱ DB-find");
+    console.log(`📦 Total NFT: ${nfts.length}`);
+
+    // 🔹 Bikin PDA metadata untuk batch getMultipleAccountsInfo
+    const mintPks = nfts.map((n) => new PublicKey(n.mintAddress));
+    const metadataPdas = mintPks.map((mintPk) =>
+      PublicKey.findProgramAddressSync(
+        [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+        METADATA_PROGRAM_ID
+      )[0]
     );
 
-    let priceSol: number | null = null;
-    try {
-      const listing: any = await program.account.listing.fetch(listingPda);
-      priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
-      console.log("💰 Price fetched from listing:", priceSol);
-    } catch {
-      console.warn("⚠️ Listing not found on chain, price not available");
-    }
+    console.time("⏱ getMultipleAccountsInfo");
+    const accounts = await connection.getMultipleAccountsInfo(metadataPdas);
+    console.timeEnd("⏱ getMultipleAccountsInfo");
 
-    // ✅ Ambil signatures dari mint dan ATA
-    let signatures: any[] = [];
-    try {
-      const sigMint = await connection.getSignaturesForAddress(mintPk, { limit: 20 });
+    const results: any[] = [];
 
-      // ambil ATA berdasarkan owner dari metadata (creator address)
-      const owner = metadata?.properties?.creators?.[0]?.address;
-      if (owner) {
-        const ata = getAssociatedTokenAddressSync(mintPk, new PublicKey(owner));
-        console.log("📌 ATA:", ata.toBase58());
+    await Promise.all(
+      nfts.map((nft, i) =>
+        limit(async () => {
+          const mintAddress = nft.mintAddress;
+          const cacheKey = `nft:onchain:${mintAddress}`;
+          // console.time(`⏱ NFT-${mintAddress}`);
 
-        const sigAta = await connection.getSignaturesForAddress(ata, { limit: 20 });
-        signatures = [...sigMint, ...sigAta];
-      } else {
-        signatures = sigMint;
-      }
+          try {
+            // 🔑 Cek cache utama
+            const cached = await redis.get(cacheKey);
+            if (cached) {
+              console.log(`⚡ Cache HIT: ${mintAddress}`);
+              results.push(JSON.parse(cached));
+              // console.timeEnd(`⏱ NFT-${mintAddress}`);
+              return;
+            }
 
-      console.log("📝 Found signatures:", signatures.map(s => s.signature));
-    } catch (e) {
-      console.error("⚠️ Failed to fetch signatures:", e);
-    }
+            // console.log(`🆕 Cache MISS: ${mintAddress}`);
+            const accountInfo = accounts[i];
+            if (!accountInfo) {
+              // console.warn(`❌ No metadata PDA for ${mintAddress}`);
+              // console.timeEnd(`⏱ NFT-${mintAddress}`);
+              return;
+            }
 
-    // ✅ Proses signatures
-    const history: any[] = [];
-    for (const sig of signatures) {
-      const tx = await connection.getParsedTransaction(sig.signature, {
-        maxSupportedTransactionVersion: 0,
-      });
-      if (!tx) continue;
+            // ✅ Decode metadata URI
+            let uri = accountInfo.data
+              .slice(115, 315)
+              .toString("utf-8")
+              .replace(/\0/g, "")
+              .trim()
+              .replace(/[^\x20-\x7E]+/g, "");
 
-      const allInstructions = [
-        ...tx.transaction.message.instructions,
-        ...(tx.meta?.innerInstructions?.flatMap((ix: any) => ix.instructions) || []),
-      ];
+            let metadata: any = null;
+            const cachedMeta = await redis.get(`nftmeta:${mintAddress}`);
+            if (cachedMeta) {
+              metadata = JSON.parse(cachedMeta);
+            } else if (uri && uri.startsWith("http")) {
+              try {
+                // console.time(`⏱ metadata-fetch-${mintAddress}`);
+                const resp = await fetchWithTimeout(uri, 7000);
+                if (resp.ok) {
+                  metadata = await resp.json();
+                  await redis.setex(`nftmeta:${mintAddress}`, TTL_METADATA, JSON.stringify(metadata));
+                }
+                console.timeEnd(`⏱ metadata-fetch-${mintAddress}`);
+              } catch (err) {
+                console.warn(`⚠️ Metadata fetch failed for ${mintAddress}`, err);
+              }
+            }
 
-      for (const ix of allInstructions) {
-        if ("parsed" in ix && ix.program === "spl-token") {
-          switch (ix.parsed.type) {
-            case "mintTo":
-              history.push({
-                signature: sig.signature,
-                slot: sig.slot,
-                blockTime: tx.blockTime
-                  ? new Date(tx.blockTime * 1000).toISOString()
-                  : null,
-                event: "Mint",
-                from: null,
-                to: ix.parsed.info?.account || null,
-                amount: ix.parsed.info?.amount,
-              });
-              break;
+            // ✅ Listing price
+            let priceSol: number | null = null;
+            const cachedListing = await redis.get(`nftlist:${mintAddress}`);
+            if (cachedListing) {
+              priceSol = parseFloat(cachedListing);
+            } else {
+              const [listingPda] = anchor.web3.PublicKey.findProgramAddressSync(
+                [Buffer.from("listing"), mintPks[i].toBuffer()],
+                program.programId
+              );
+              try {
+                console.time(`⏱ listing-fetch-${mintAddress}`);
+                const listing: any = await program.account.listing.fetch(listingPda);
+                priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
+                await redis.setex(`nftlist:${mintAddress}`, TTL_LISTING, priceSol.toString());
+                console.timeEnd(`⏱ listing-fetch-${mintAddress}`);
+              } catch {
+                console.warn(`❌ No listing for ${mintAddress}`);
+              }
+            }
 
-            case "transfer":
-              history.push({
-                signature: sig.signature,
-                slot: sig.slot,
-                blockTime: tx.blockTime
-                  ? new Date(tx.blockTime * 1000).toISOString()
-                  : null,
-                event: "Transfer",
-                from: ix.parsed.info?.source || null,
-                to: ix.parsed.info?.destination || null,
-                amount: ix.parsed.info?.amount,
-              });
-              break;
+            // ✅ Hitung jumlah transaksi (signatures)
+            let txCount = 0;
+            try {
+              const sigs = await connection.getSignaturesForAddress(mintPks[i], { limit: 20 });
+              txCount = sigs.length;
+            } catch (err) {
+              console.warn(`⚠️ Failed to fetch tx count for ${mintAddress}`, err);
+            }
 
-            case "burn":
-              history.push({
-                signature: sig.signature,
-                slot: sig.slot,
-                blockTime: tx.blockTime
-                  ? new Date(tx.blockTime * 1000).toISOString()
-                  : null,
-                event: "Burn",
-                from: ix.parsed.info?.account || null,
-                to: null,
-                amount: ix.parsed.info?.amount,
-              });
-              break;
+            // 🔹 Gabung data
+            const result = {
+              ...nft.toObject(),
+              onChain: true,
+              metadata,
+              price: priceSol,
+              txCount, // 👉 jumlah transaksi
+            };
+
+            await redis.setex(cacheKey, TTL_LISTING, JSON.stringify(result));
+            results.push(result);
+
+            console.timeEnd(`⏱ NFT-${mintAddress}`);
+          } catch (err: any) {
+            console.error(`❌ Error for ${mintAddress}:`, err.message);
+            console.timeEnd(`⏱ NFT-${mintAddress}`);
           }
-        }
-      }
-    }
+        })
+      )
+    );
 
-    console.log("📊 Final history length:", history.length);
+    console.timeEnd("⏱ onchain-total");
 
-    return res.json({
-      ...metadata,
-      price: priceSol,
-      history,
-    });
-  } catch (err: any) {
-    console.error("❌ Metadata fetch error:", err.message);
-    res.status(500).json({ error: "Failed to fetch metadata from chain" });
+    // 🔹 Urutkan hasil berdasarkan jumlah transaksi (descending)
+    results.sort((a, b) => (b.txCount || 0) - (a.txCount || 0));
+    
+    res.json(results);
+  } catch (err) {
+    console.error("❌ onchain error:", err);
+    res.status(500).json({ error: "Failed to fetch NFTs on-chain" });
   }
 });
 
