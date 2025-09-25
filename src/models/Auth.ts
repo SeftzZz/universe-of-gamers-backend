@@ -63,7 +63,7 @@ export interface IAuth extends Document {
   twoFactorEnabled: boolean;
   otpSecret?: string; 
   createdAt: Date;
-
+  role?: string;
   comparePassword(password: string): Promise<boolean>;
 }
 
@@ -105,6 +105,7 @@ const AuthSchema = new Schema<IAuth>(
     twoFactorEnabled: { type: Boolean, default: false },
     otpSecret: { type: String, select: false },
     createdAt: { type: Date, default: Date.now },
+    role: { type: String, default: '' }
   },
   { collection: 'users' }
 );

@@ -214,6 +214,8 @@ router.post('/login', async (req, res) => {
       token,
       wallets: externalWallets,
       custodialWallets, // privateKey tidak dikirim
+      role: auth.role || null,
+      avatar:auth.avatar,
     });
   } catch (err: any) {
     console.error("❌ Login error:", err.message);
