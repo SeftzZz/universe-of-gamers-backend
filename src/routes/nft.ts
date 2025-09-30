@@ -531,6 +531,16 @@ router.post("/:characterId/edit-rune", authenticateJWT, async (req: AuthRequest,
   }
 });
 
+// GET all NFTs from DB
+router.get("/fetch-nftDB", async (req, res) => {
+  try {
+    const nftdb = await Nft.find();
+    res.json(nftdb);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch nft" });
+  }
+});
+
 // GET NFT by ID
 router.get("/nft/:id", async (req, res) => {
   try {
