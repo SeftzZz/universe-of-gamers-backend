@@ -213,7 +213,9 @@ router.post('/login', async (req, res) => {
       authId: auth._id,
       token,
       wallets: externalWallets,
-      custodialWallets, // privateKey tidak dikirim
+      custodialWallets,
+      role: auth.role || null,
+      avatar: auth.avatar
     });
   } catch (err: any) {
     console.error("❌ Login error:", err.message);

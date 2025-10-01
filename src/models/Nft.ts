@@ -13,6 +13,7 @@ export interface INft extends Document {
   description: string;
   image: string;
   royalty?: number;
+  base_name: string;
 
   // 🔥 address mint di blockchain (unik & wajib)
   mintAddress: string;
@@ -34,6 +35,7 @@ export interface INft extends Document {
   isEquipped: boolean;                     // apakah rune ini sedang dipakai
   equippedTo?: Types.ObjectId | INft | null; // ref ke NFT Character yang memakai rune
 
+  isSell: boolean;
   price?: number;
   txSignature?: string;
   createdAt: Date;
@@ -52,6 +54,7 @@ const NftSchema = new Schema<INft>(
     description: { type: String, default: "" },
     image: { type: String, default: "" },
     royalty: { type: Number, default: 0 },
+    base_name: { type: String, required: true },
 
     // 🔥 wajib ada mintAddress (unik di blockchain)
     mintAddress: { type: String, required: true, unique: true },
@@ -72,6 +75,7 @@ const NftSchema = new Schema<INft>(
     isEquipped: { type: Boolean, default: false },
     equippedTo: { type: Schema.Types.ObjectId, ref: "Nft", default: null },
 
+    isSell: { type: Boolean, default: false },
     price: { type: Number },
     txSignature: { type: String },
   },

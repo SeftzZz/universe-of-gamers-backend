@@ -101,6 +101,21 @@
           "isSigner": false
         },
         {
+          "name": "paymentMint",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "treasuryTokenAccount",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "sellerPaymentAta",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "marketConfig",
           "isMut": true,
           "isSigner": false
@@ -187,8 +202,28 @@
           "isSigner": false
         },
         {
+          "name": "paymentMint",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "treasuryTokenAccount",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "sellerPaymentAta",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "marketConfig",
           "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
           "isSigner": false
         },
         {
@@ -233,6 +268,26 @@
         },
         {
           "name": "treasuryPda",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "paymentMint",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "treasuryTokenAccount",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "buyerPaymentAta",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "sellerPaymentAta",
           "isMut": true,
           "isSigner": false
         },
