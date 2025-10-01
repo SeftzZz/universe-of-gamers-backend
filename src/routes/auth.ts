@@ -29,7 +29,12 @@ import {
   NATIVE_MINT,
   createCloseAccountInstruction,
   getAccount,
-  createApproveInstruction
+  createApproveInstruction,
+  mintTo,
+  getMint,
+  createMint,
+  MINT_SIZE,
+  createInitializeMintInstruction,
 } from "@solana/spl-token";
 import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
@@ -37,14 +42,20 @@ import { BN } from "bn.js";
 import axios from "axios";
 import dotenv from "dotenv";
 import { getTokenInfo } from "../services/priceService";
-import { getMint } from "@solana/spl-token";
 
 import jwt from 'jsonwebtoken';
 import Auth from '../models/Auth';
 import { ICustodialWallet } from '../models/Auth';
+import { Nft } from "../models/Nft";
+import { Character } from "../models/Character";
+import { Skill } from "../models/Skill";
+import { Rune } from "../models/Rune";
 import { Team } from "../models/Team";
 import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
 import { encrypt, decrypt } from '../utils/cryptoHelper';
+import {
+  createMetadataAccountV3,
+} from "@metaplex-foundation/mpl-token-metadata/dist/src/generated/instructions/createMetadataAccountV3";
 
 import bs58 from 'bs58';
 import bcrypt from 'bcrypt';
@@ -92,6 +103,10 @@ const otpLimiter = rateLimit({
   message: { error: "Too many OTP attempts, try again later" }
 });
 
+const METADATA_PROGRAM_ID = new PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+);
+
 // Fungsi buat generate JWT
 const generateToken = (user: any): string => {
   if (!process.env.JWT_SECRET) {
@@ -114,6 +129,24 @@ function encryptWithPassphrase(text: string, passphrase: string): string {
   const tag = cipher.getAuthTag();
 
   return Buffer.concat([iv, tag, encrypted]).toString("base64");
+}
+
+// helper logging
+async function logTxDetail(connection: Connection, sig: string, label: string) {
+  const detail = await connection.getParsedTransaction(sig, { commitment: "confirmed" });
+  if (!detail) {
+    console.warn(`❌ No detail found for ${label}:`, sig);
+    return;
+  }
+  console.log(`🔎 ${label} TX Detail:`, {
+    slot: detail.slot,
+    blockTime: detail.blockTime,
+    err: detail.meta?.err,
+    fee: detail.meta?.fee,
+    preBalances: detail.meta?.preBalances,
+    postBalances: detail.meta?.postBalances,
+    logMessages: detail.meta?.logMessages,
+  });
 }
 
 // === Register Local + Custodial Wallet ===
@@ -213,13 +246,27 @@ router.post('/login', async (req, res) => {
       authId: auth._id,
       token,
       wallets: externalWallets,
-      custodialWallets,
+      custodialWallets, // privateKey tidak dikirim
+      name: auth.name,
+      email: auth.email,
       role: auth.role || null,
-      avatar: auth.avatar
+      avatar:auth.avatar,
     });
   } catch (err: any) {
     console.error("❌ Login error:", err.message);
     res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/decrypt', async (req, res) => {
+  const encryptedFromDB =
+    "VGeGRFaaNrSGcNnyi3UvfHn37uQLtNvi/IPgeEWl8ZpinYbkccMFTUv+ygf16DPJDGNMoOOS3NQN7aZFLbBN1w0/7Wdej2BFY+jgXBUEdBfa+zGXc7FAogr6L83WSighUYKaRFqbnKTZOv//lYh3ezMz2cJ5YuM="; // ganti dengan string terenkripsi kamu
+
+  try {
+    const privateKey = decrypt(encryptedFromDB);
+    console.log("🔑 Private Key asli:", privateKey);
+  } catch (err) {
+    console.error("❌ Gagal decrypt:", err);
   }
 });
 
@@ -919,158 +966,291 @@ router.post("/user/:id/2fa/verify", authenticateJWT, otpLimiter, async (req: Aut
 });
 
 //
-// POST /wallet/nft/mintAddress/buy
+// POST /nft/:mintAddress/buy
 //
 router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, res) => {
   try {
     const { id: userId } = req.user;
     const { mintAddress } = req.params;
-    const { demo } = req.query; // ?demo=true untuk dummy mode
+    const { paymentMint, price, name, symbol } = req.body;
+    const uri = `https://api.universeofgamers.io/nft/${mintAddress}`;
+    console.log("=== 🚀 BUY FLOW START ===");
+    console.log("Params:", { mintAddress, paymentMint, price, name, symbol });
 
-    console.log("⚡ Custodian buy NFT request:", { userId, mintAddress, demo });
-
-    // 🔐 Ambil user & decrypt PK
-    const authUser = await Auth.findById(userId);
-    if (!authUser) return res.status(404).json({ error: "User not found" });
-
-    const custodian = authUser.custodialWallets.find((w) => w.provider === "solana");
-    if (!custodian) return res.status(400).json({ error: "No custodial Solana wallet" });
-
-    const decrypted = decrypt(custodian.privateKey);
-    const buyerKp = Keypair.fromSecretKey(bs58.decode(decrypted));
-    console.log("🔓 Custodian wallet:", buyerKp.publicKey.toBase58());
-
-    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+    const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
     const provider = new anchor.AnchorProvider(connection, {} as any, { preflightCommitment: "confirmed" });
     const program = new anchor.Program(
       require("../../public/idl/universe_of_gamers.json"),
-      new anchor.web3.PublicKey(process.env.PROGRAM_ID!),
+      new PublicKey(process.env.PROGRAM_ID!),
       provider
     );
 
-    const nftMint = new anchor.web3.PublicKey(mintAddress);
+    // === Buyer ===
+    const authUser = await Auth.findById(userId);
+    if (!authUser) return res.status(404).json({ error: "User not found" });
+    const buyerCustodian = authUser.custodialWallets.find((w) => w.provider === "solana");
+    if (!buyerCustodian) return res.status(400).json({ error: "No buyer wallet" });
+    const buyerKp = Keypair.fromSecretKey(bs58.decode(decrypt(buyerCustodian.privateKey)));
+    console.log("🔑 Buyer wallet:", buyerKp.publicKey.toBase58());
 
-    // ✅ Resolve PDA listing
-    const [listingPda] = anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("listing"), nftMint.toBuffer()],
+    // === NFT Doc (seller) ===
+    let mintPk = new PublicKey(mintAddress);
+    const nftDoc = await Nft.findOne({ mintAddress });
+    if (!nftDoc) return res.status(404).json({ error: "NFT not found" });
+
+    const sellerAuth = await Auth.findOne({ "custodialWallets.address": nftDoc.owner });
+    if (!sellerAuth) return res.status(404).json({ error: "Seller not found" });
+    const sellerCustodian = sellerAuth.custodialWallets.find((w) => w.provider === "solana");
+    if (!sellerCustodian) return res.status(400).json({ error: "Seller has no wallet" });
+    const sellerKp = Keypair.fromSecretKey(bs58.decode(decrypt(sellerCustodian.privateKey)));
+    console.log("🔑 Seller wallet:", sellerKp.publicKey.toBase58());
+
+    // === PDAs (gunakan let biar bisa direassign) ===
+    let [listingPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("listing"), mintPk.toBuffer()],
       program.programId
     );
-
-    // ✅ Resolve PDA marketConfig & treasury
-    const [marketConfigPda] = anchor.web3.PublicKey.findProgramAddressSync(
+    let [escrowSignerPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow_signer"), mintPk.toBuffer()],
+      program.programId
+    );
+    let [marketConfigPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("market_config")],
       program.programId
     );
-
-    const [treasuryPda] = anchor.web3.PublicKey.findProgramAddressSync(
+    let [treasuryPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("treasury")],
       program.programId
     );
+    let [mintAuthPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("mint_auth"), mintPk.toBuffer()],
+      program.programId
+    );
 
-    let listing: any;
+    console.log("📌 PDAs:", {
+      listingPda: listingPda.toBase58(),
+      escrowSignerPda: escrowSignerPda.toBase58(),
+      marketConfigPda: marketConfigPda.toBase58(),
+      treasuryPda: treasuryPda.toBase58(),
+      mintAuthPda: mintAuthPda.toBase58(),
+    });
 
-    try {
-      listing = await program.account.listing.fetch(listingPda);
-      console.log("📦 Listing fetched from chain:", {
-        price: listing.price.toString(),
-        useSol: listing.useSol,
-        seller: listing.seller.toBase58(),
-        bump: listing.bump,
-      });
-    } catch (e) {
-      console.warn("⚠️ Listing not found on chain, using dummy listing for demo");
+    // === Metadata PDA ===
+    let [metadataPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+      METADATA_PROGRAM_ID
+    );
 
-      listing = {
-        price: new anchor.BN(0.01 * anchor.web3.LAMPORTS_PER_SOL), // 0.01 SOL
-        useSol: true,
-        seller: buyerKp.publicKey, // anggap custodian sendiri yang jual
-        nftMint,
-        marketConfig: marketConfigPda,
-        tradeFeeBps: 500, // 0.5% fee
-        bump: 255, // dummy bump
-      };
-    }
+    // === Step 1: cek mint ===
+    const mintAccInfo = await connection.getAccountInfo(mintPk);
+    let mustMintAndList = false;
 
-    if (!listing.useSol) {
-      return res.status(400).json({ error: "Only SOL payments supported for now" });
-    }
+    if (!mintAccInfo) {
+      console.log("🆕 Mint not found, creating new mint...");
+      const mintKp = Keypair.generate();
+      mintPk = mintKp.publicKey;
 
-    const escrowSignerPda = (
-      await anchor.web3.PublicKey.findProgramAddressSync(
-        [Buffer.from("escrow_signer"), listing.nftMint.toBuffer()],
+      // Hitung ulang PDA setelah tahu mint baru
+      [listingPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("listing"), mintPk.toBuffer()],
         program.programId
-      )
-    )[0];
+      );
+      [escrowSignerPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("escrow_signer"), mintPk.toBuffer()],
+        program.programId
+      );
+      [mintAuthPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("mint_auth"), mintPk.toBuffer()],
+        program.programId
+      );
 
-    const buyerNftAta = await anchor.utils.token.associatedAddress({
-      mint: listing.nftMint,
-      owner: buyerKp.publicKey,
-    });
-    const sellerNftAta = await anchor.utils.token.associatedAddress({
-      mint: listing.nftMint,
-      owner: listing.seller,
+      const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
+      const tx = new Transaction().add(
+        SystemProgram.createAccount({
+          fromPubkey: sellerKp.publicKey,
+          newAccountPubkey: mintKp.publicKey,
+          space: MINT_SIZE,
+          lamports,
+          programId: TOKEN_PROGRAM_ID,
+        }),
+        createInitializeMintInstruction(
+          mintPk,
+          0,            // decimals
+          mintAuthPda,  // PDA authority
+          null,
+          TOKEN_PROGRAM_ID
+        )
+      );
+      await sendAndConfirmTransaction(connection, tx, [sellerKp, mintKp]);
+
+      nftDoc.mintAddress = mintPk.toBase58();
+      await nftDoc.save();
+
+      console.log("🔄 PDAs regenerated after mint:", {
+        listingPda: listingPda.toBase58(),
+        escrowSignerPda: escrowSignerPda.toBase58(),
+        mintAuthPda: mintAuthPda.toBase58(),
+      });
+
+      [metadataPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+        METADATA_PROGRAM_ID
+      );
+
+      // Buat ATA seller (kosong, nanti diisi program)
+      await getOrCreateAssociatedTokenAccount(connection, sellerKp, mintPk, sellerKp.publicKey);
+
+      mustMintAndList = true;
+    }
+
+    // === Step 2: setup ATAs ===
+    const paymentMintPk = new PublicKey(paymentMint);
+    const buyerPaymentAtaAcc = await getOrCreateAssociatedTokenAccount(connection, buyerKp, paymentMintPk, buyerKp.publicKey);
+    const sellerPaymentAtaAcc = await getOrCreateAssociatedTokenAccount(connection, buyerKp, paymentMintPk, sellerKp.publicKey);
+
+    const treasuryPaymentAta = await getAssociatedTokenAddress(paymentMintPk, treasuryPda, true);
+    if (!(await connection.getAccountInfo(treasuryPaymentAta))) {
+      const ix = createAssociatedTokenAccountInstruction(buyerKp.publicKey, treasuryPaymentAta, treasuryPda, paymentMintPk);
+      const tx = new Transaction({ feePayer: buyerKp.publicKey, recentBlockhash: (await connection.getLatestBlockhash()).blockhash }).add(ix);
+      const sigAta = await sendAndConfirmTransaction(connection, tx, [buyerKp]);
+      console.log("✅ Treasury ATA created:", treasuryPaymentAta.toBase58(), sigAta);
+    }
+
+    const buyerNftAtaAcc = await getOrCreateAssociatedTokenAccount(connection, buyerKp, mintPk, buyerKp.publicKey);
+    const sellerNftAtaAcc = await getOrCreateAssociatedTokenAccount(connection, sellerKp, mintPk, sellerKp.publicKey);
+
+    console.log("📌 ATAs:", {
+      buyerPaymentAta: buyerPaymentAtaAcc.address.toBase58(),
+      sellerPaymentAta: sellerPaymentAtaAcc.address.toBase58(),
+      treasuryPaymentAta: treasuryPaymentAta.toBase58(),
+      buyerNftAta: buyerNftAtaAcc.address.toBase58(),
+      sellerNftAta: sellerNftAtaAcc.address.toBase58(),
     });
 
-    const tx = await program.methods
+    // === Step 3: cek listing ===
+    let hasListing = true;
+    try {
+      await program.account.listing.fetch(listingPda);
+      console.log("📦 Listing exists");
+    } catch {
+      console.log("⚠️ No listing yet");
+      hasListing = false;
+    }
+
+    if (!hasListing && mustMintAndList) {
+      console.log("⚡ Running mint_and_list...");
+      const txMintList = await program.methods
+        .mintAndList(
+          new anchor.BN(price * anchor.web3.LAMPORTS_PER_SOL),
+          true,
+          name ?? "NFT",
+          symbol ?? "UOG",
+          uri ?? "",
+          500
+        )
+        .accountsStrict({
+          listing: listingPda,
+          escrowSigner: escrowSignerPda,
+          seller: sellerKp.publicKey,
+          mint: mintPk,
+          sellerNftAta: sellerNftAtaAcc.address,
+          mintAuthority: mintAuthPda,
+          treasuryPda,
+          paymentMint: paymentMintPk,
+          treasuryTokenAccount: treasuryPaymentAta,
+          sellerPaymentAta: sellerPaymentAtaAcc.address,
+          marketConfig: marketConfigPda,
+          metadata: metadataPda,
+          tokenMetadataProgram: METADATA_PROGRAM_ID,
+          payer: sellerKp.publicKey,
+          updateAuthority: sellerKp.publicKey,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .transaction();  // ⚡ ganti dari .rpc() ke .transaction()
+
+      // sign manual
+      txMintList.feePayer = sellerKp.publicKey;
+      txMintList.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+      txMintList.sign(sellerKp);
+
+      const sigList = await connection.sendRawTransaction(txMintList.serialize());
+      await connection.confirmTransaction(sigList, "confirmed");
+
+      console.log("✅ mint_and_list confirmed:", sigList);
+
+      const txListDetail = await connection.getParsedTransaction(sigList, { commitment: "confirmed" });
+      console.log("🔎 mint_and_list TX Detail:", {
+        slot: txListDetail?.slot,
+        blockTime: txListDetail?.blockTime,
+        err: txListDetail?.meta?.err,
+        fee: txListDetail?.meta?.fee,
+        preBalances: txListDetail?.meta?.preBalances,
+        postBalances: txListDetail?.meta?.postBalances,
+        logMessages: txListDetail?.meta?.logMessages,
+      });
+    }
+
+    // === Step 4: BUY ===
+    console.log("💸 Running buyNft...");
+    const txBuy = await program.methods
       .buyNft()
       .accountsStrict({
         listing: listingPda,
         escrowSigner: escrowSignerPda,
         buyer: buyerKp.publicKey,
-        seller: listing.seller,
-        treasuryPda,            // readonly, sesuai kontrak
-        buyerNftAta,
-        sellerNftAta,
+        seller: sellerKp.publicKey,
+        treasuryPda,
+        paymentMint: paymentMintPk,
+        buyerPaymentAta: buyerPaymentAtaAcc.address,
+        sellerPaymentAta: sellerPaymentAtaAcc.address,
+        treasuryTokenAccount: treasuryPaymentAta,
+        buyerNftAta: buyerNftAtaAcc.address,
+        sellerNftAta: sellerNftAtaAcc.address,
         marketConfig: marketConfigPda,
         tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
-        systemProgram: anchor.web3.SystemProgram.programId,
+        systemProgram: SystemProgram.programId,
       })
-      .transaction();
+      .transaction();   // 🚀 build transaction manual
 
-    // === Demo Mode ===
-    if (demo === "true") {
-      console.log("🧪 Running in DEMO mode (no broadcast)");
-      const dummySig = `DUMMY_BUY_${Date.now()}_${listing.nftMint.toBase58().slice(0, 6)}`;
+    txBuy.feePayer = buyerKp.publicKey;
+    txBuy.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    txBuy.sign(buyerKp);
 
-      const priceSol = listing.price / anchor.web3.LAMPORTS_PER_SOL;
-      const tradeFeeSol = (listing.price * (listing.tradeFeeBps ?? 500)) / 10_000 / anchor.web3.LAMPORTS_PER_SOL;
-      const networkCostSol = 0.0005; // dummy
-      const totalCostSol = priceSol + networkCostSol;
+    const sigBuy = await connection.sendRawTransaction(txBuy.serialize());
+    await connection.confirmTransaction(sigBuy, "confirmed");
 
-      return res.json({
-        message: "🛒 Custodian buy NFT success! (dummy mode)",
-        buyer: buyerKp.publicKey.toBase58(),
-        seller: listing.seller.toBase58(),
-        nftMint: listing.nftMint.toBase58(),
-        signature: dummySig,
-        costs: {
-          priceSol,
-          tradeFeeSol,
-          networkCostSol,
-          totalCostSol,
-        },
-      });
-    }
+    console.log("✅ buyNft confirmed:", sigBuy);
 
-    // === Real Mode ===
-    tx.feePayer = buyerKp.publicKey;
-    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-    tx.sign(buyerKp);
+    const txBuyDetail = await connection.getParsedTransaction(sigBuy, { commitment: "confirmed" });
+    console.log("🔎 buyNft TX Detail:", {
+      slot: txBuyDetail?.slot,
+      blockTime: txBuyDetail?.blockTime,
+      err: txBuyDetail?.meta?.err,
+      fee: txBuyDetail?.meta?.fee,
+      preBalances: txBuyDetail?.meta?.preBalances,
+      postBalances: txBuyDetail?.meta?.postBalances,
+      logMessages: txBuyDetail?.meta?.logMessages,
+    });
 
-    const rawTx = tx.serialize();
-    const sig = await connection.sendRawTransaction(rawTx);
-    await connection.confirmTransaction(sig, "confirmed");
+    // === Update DB ===
+    await Nft.findByIdAndUpdate(nftDoc._id, {
+      owner: buyerKp.publicKey.toBase58(),
+      isSell: false,
+      price: 0,
+      txSignature: sigBuy,
+    });
 
     return res.json({
-      message: "🛒 Custodian buy NFT success! (real mode)",
-      buyer: buyerKp.publicKey.toBase58(),
-      seller: listing.seller.toBase58(),
-      nftMint: listing.nftMint.toBase58(),
-      signature: sig,
+      message: "✅ Success (mint+list+buy)",
+      mint: mintPk.toBase58(),
+      listing: listingPda.toBase58(),
+      signature: sigBuy,
     });
   } catch (err: any) {
-    console.error("❌ Custodian buy NFT error:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("❌ Error in buy:", err);
+    return res.status(500).json({ error: err.message, stack: err.stack });
   }
 });
 

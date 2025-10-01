@@ -64,7 +64,6 @@ export interface IAuth extends Document {
   otpSecret?: string; 
   createdAt: Date;
   role?: string;
-
   comparePassword(password: string): Promise<boolean>;
 }
 

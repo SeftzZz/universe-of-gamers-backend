@@ -13,7 +13,7 @@ export interface INft extends Document {
   description: string;
   image: string;
   royalty?: number;
-  base_name: string;
+  base_name?: string;
 
   // 🔥 address mint di blockchain (unik & wajib)
   mintAddress: string;
@@ -54,7 +54,7 @@ const NftSchema = new Schema<INft>(
     description: { type: String, default: "" },
     image: { type: String, default: "" },
     royalty: { type: Number, default: 0 },
-    base_name: { type: String, required: true },
+    base_name: { type: String, required: false },
 
     // 🔥 wajib ada mintAddress (unik di blockchain)
     mintAddress: { type: String, required: true, unique: true },
@@ -76,7 +76,7 @@ const NftSchema = new Schema<INft>(
     equippedTo: { type: Schema.Types.ObjectId, ref: "Nft", default: null },
 
     isSell: { type: Boolean, default: false },
-    price: { type: Number },
+    price: { type: Number, default: 0 },
     txSignature: { type: String },
   },
   { collection: "nfts", timestamps: true }

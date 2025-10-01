@@ -35,7 +35,8 @@ app.get("/api/ping", (req, res) => {
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
-app.use("/api/characters", characterRoutes);
+// app.use("/api/characters", characterRoutes);
+// app.use("/api/nft/character", characterRoutes);
 
 app.use("/api/gatcha", gatchaRoutes);
 

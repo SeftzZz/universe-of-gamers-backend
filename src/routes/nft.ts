@@ -410,6 +410,16 @@ router.post("/:characterId/edit-rune", authenticateJWT, async (req: AuthRequest,
   }
 });
 
+// GET all NFTs from DB
+router.get("/fetch-nftDB", async (req, res) => {
+  try {
+    const nftdb = await Nft.find();
+    res.json(nftdb);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch nft" });
+  }
+});
+
 // GET NFT by ID
 router.get("/nft/:id", async (req, res) => {
   try {
@@ -852,13 +862,13 @@ router.get("/:mintAddress/onchain", async (req: Request, res: Response) => {
 
   try {
     // 🔑 Cache utama
-    const cacheKey = `nft:onchain:${mintAddress}`;
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      console.log(`⚡ Cache HIT: ${mintAddress}`);
-      console.timeEnd(`⏱ onchain-${mintAddress}`);
-      return res.json(JSON.parse(cached));
-    }
+    // const cacheKey = `nft:onchain:${mintAddress}`;
+    // const cached = await redis.get(cacheKey);
+    // if (cached) {
+    //   console.log(`⚡ Cache HIT: ${mintAddress}`);
+    //   console.timeEnd(`⏱ onchain-${mintAddress}`);
+    //   return res.json(JSON.parse(cached));
+    // }
 
     // 🔹 Cari NFT dari DB
     const nft = await Nft.findOne({ mintAddress });
@@ -866,16 +876,33 @@ router.get("/:mintAddress/onchain", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "NFT not found in DB" });
     }
 
+    // --- Logging raw price ---
+    const rawPrice: any = nft.price;
+    // console.log(`🔍 NFT raw:`, {
+    //   _id: nft._id,
+    //   name: nft.name,
+    //   typePrice: typeof rawPrice,
+    //   rawPrice: rawPrice,
+    //   toJSON: typeof rawPrice?.toJSON === "function" ? rawPrice.toJSON() : null,
+    //   toString: typeof rawPrice?.toString === "function" ? rawPrice.toString() : null,
+    // });
+
+    const obj = nft.toObject();
+    // console.log(`📦 NFT toObject.price:`, obj.price);
+
+    // --- Hasil final ---
     const result = {
-      ...nft.toObject(),
-      onChain: false, // tidak validasi on-chain
+      ...obj,
+      price: obj.price ? Number(obj.price) : 0, // ✅ konsisten konversi
+      onChain: false,
       metadata: null,
-      price: null,
       history: [],
     };
 
-    await redis.setex(cacheKey, TTL_LISTING, JSON.stringify(result));
-    console.timeEnd(`⏱ onchain-${mintAddress}`);
+    // Simpan ke cache
+    // await redis.setex(cacheKey, TTL_LISTING, JSON.stringify(result));
+
+    // console.timeEnd(`⏱ onchain-${mintAddress}`);
     return res.json(result);
   } catch (err: any) {
     console.error("❌ DB fetch error:", err.message);
@@ -893,19 +920,35 @@ router.get("/onchain", async (req, res) => {
     console.time("⏱ DB-find");
     // 🔹 hanya ambil NFT dengan isSell = true
     const nfts = await Nft.find({ isSell: true });
-    console.timeEnd("⏱ DB-find");
+    // console.timeEnd("⏱ DB-find");
     console.log(`📦 Total NFT (DB only, isSell=true): ${nfts.length}`);
 
-    // 👉 Hanya pakai data DB
-    const results = nfts.map((nft) => ({
-      ...nft.toObject(),
-      onChain: false,   // tandai bukan hasil validasi on-chain
-      metadata: null,
-      price: null,
-      txCount: 0,
-    }));
+    const results = nfts.map((nft, idx) => {
+      const rawPrice: any = nft.price; // cast ke any biar bisa akses method Decimal128/Double
 
-    console.timeEnd("⏱ onchain-total");
+      // console.log(`🔍 NFT #${idx + 1} raw:`, {
+      //   _id: nft._id,
+      //   name: nft.name,
+      //   typePrice: typeof rawPrice,
+      //   rawPrice: rawPrice,
+      //   toJSON: typeof rawPrice?.toJSON === "function" ? rawPrice.toJSON() : null,
+      //   toString: typeof rawPrice?.toString === "function" ? rawPrice.toString() : null,
+      // });
+
+      const obj = nft.toObject();
+
+      // console.log(`📦 NFT #${idx + 1} toObject.price:`, obj.price);
+
+      return {
+        ...obj,
+        price: obj.price ? Number(obj.price) : 0, // force konversi
+        onChain: false,
+        metadata: null,
+        history: [],
+      };
+    });
+
+    // console.timeEnd("⏱ onchain-total");
     res.json(results);
   } catch (err) {
     console.error("❌ onchain error:", err);
