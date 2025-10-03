@@ -1137,6 +1137,17 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
       hasListing = false;
     }
 
+    // === Hitung harga ===
+    const useSol = paymentMint === "So11111111111111111111111111111111111111111";
+    const mintInfo = await getMint(connection, new PublicKey(paymentMint));
+    const decimals = mintInfo.decimals;
+
+    const priceUnits = useSol
+      ? Math.ceil(price * anchor.web3.LAMPORTS_PER_SOL)
+      : Math.ceil(price * 10 ** decimals);
+
+    console.log("💰 price input:", price, "→ priceUnits:", priceUnits, "useSol:", useSol);
+
     if (!hasListing && mustMintAndList) {
       console.log("⚡ Running mint_and_list...");
       const txMintList = await program.methods

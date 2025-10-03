@@ -1,10 +1,12 @@
 import {
+  Connection,
   LAMPORTS_PER_SOL,
   PublicKey,
   SystemProgram,
   Transaction,
   Keypair,
   TransactionInstruction,
+  sendAndConfirmTransaction
 } from "@solana/web3.js";
 import * as anchor from "@project-serum/anchor";
 import { BN } from "@project-serum/anchor";
@@ -16,12 +18,15 @@ import {
   createAssociatedTokenAccountInstruction,
   getAccount,
   getAssociatedTokenAddress,
+  getOrCreateAssociatedTokenAccount,
+  getMint
 } from "@solana/spl-token";
 
 import {
   createMetadataAccountV3,
 } from "@metaplex-foundation/mpl-token-metadata/dist/src/generated/instructions/createMetadataAccountV3";
 
+import * as metadataPkg from "@metaplex-foundation/mpl-token-metadata";
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -43,6 +48,10 @@ export interface MintMetadata {
   price?: number;   // harga (SOL atau UOG)
   royalty?: number; // %
 }
+
+const METADATA_PROGRAM_ID = new PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+);
 
 export const NATIVE_SOL_MINT =
   "So11111111111111111111111111111111111111111";
@@ -90,21 +99,20 @@ async function ensureTreasuryAtaExists(
   }
 }
 
-function asSigner(pk: PublicKey) {
+function asSigner(pk: PublicKey, kp?: Keypair) {
   return {
     publicKey: pk,
     getPublicKey: () => pk,
-    // tambahin ini biar mirip beneran Signer
-    signTransaction: async <T>(tx: T) => {
-      console.warn("⚠️ signTransaction() called unexpectedly");
+    secretKey: kp?.secretKey, // 👈 tambahin ini
+    signTransaction: async (tx: Transaction) => {
+      if (kp) tx.partialSign(kp);
       return tx;
     },
-    signAllTransactions: async <T>(txs: T[]) => {
-      console.warn("⚠️ signAllTransactions() called unexpectedly");
+    signAllTransactions: async (txs: Transaction[]) => {
+      if (kp) txs.forEach(tx => tx.partialSign(kp));
       return txs;
     },
     signMessage: async (msg: Uint8Array) => {
-      console.warn("⚠️ signMessage() called unexpectedly");
       return msg;
     },
   };
@@ -117,6 +125,7 @@ function asFakeSigner(pk: PublicKey) {
   };
 }
 
+// === BUILD MINT TRANSACTION ===
 export async function buildMintTransaction(
   owner: string,
   metadata: {
@@ -128,253 +137,174 @@ export async function buildMintTransaction(
   },
   paymentMint: string,
   userKp: Keypair,
-  mintKp?: Keypair
+  mintKp: Keypair
 ) {
   console.log("=== 🏗️ BUILD MINT TRANSACTION START ===");
 
+  const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
+  const provider = new anchor.AnchorProvider(connection, {} as any, { preflightCommitment: "confirmed" });
+  const program = new anchor.Program(
+    require("../../public/idl/universe_of_gamers.json"),
+    new PublicKey(process.env.PROGRAM_ID!),
+    provider
+  );
+
   const sellerPk = new PublicKey(owner);
-  console.log("👤 Seller:", sellerPk.toBase58());
-  console.log("🔑 Custodian (userKp):", userKp.publicKey.toBase58());
 
   // === Hitung harga ===
-  let priceUnits = 0;
-  let useSol = false;
+  const useSol = paymentMint === "So11111111111111111111111111111111111111111";
+  const mintInfo = await getMint(connection, new PublicKey(paymentMint));
+  const decimals = mintInfo.decimals;
 
-  if (paymentMint === "So11111111111111111111111111111111111111112") {
-    priceUnits = Math.ceil(metadata.price * anchor.web3.LAMPORTS_PER_SOL);
-    useSol = true;
-  } else {
-    const mintInfo = await provider.connection.getParsedAccountInfo(
-      new PublicKey(paymentMint)
-    );
-    if (!mintInfo.value) throw new Error("❌ Invalid payment mint");
-    // @ts-ignore
-    const decimals = mintInfo.value.data.parsed.info.decimals || 9;
-    priceUnits = Math.ceil(metadata.price * 10 ** decimals);
-  }
+  const priceUnits = useSol
+    ? Math.ceil(metadata.price * anchor.web3.LAMPORTS_PER_SOL)
+    : Math.ceil(metadata.price * 10 ** decimals);
 
-  console.log("💲 Payment Mint:", paymentMint);
-  console.log("💲 Price Units:", priceUnits, " | Use SOL?", useSol);
+  console.log("💰 price input:", metadata.price, "→ priceUnits:", priceUnits, "useSol:", useSol);
 
-  // 💰 Balance check
-  const solBalance = await provider.connection.getBalance(sellerPk);
-  console.log("💰 Seller SOL balance:", solBalance / anchor.web3.LAMPORTS_PER_SOL);
+  // === Mint baru (pakai mintKp yang sudah digenerate di pull) ===
+  const mintPk = mintKp.publicKey;
 
-  // === Keypairs & PDAs ===
-  const mintKeypair = mintKp || Keypair.generate();
-  const mint = mintKeypair.publicKey;
-  console.log("🪙 New Mint:", mint.toBase58());
+  // === PDAs ===
+  const [listingPda] = PublicKey.findProgramAddressSync([Buffer.from("listing"), mintPk.toBuffer()], program.programId);
+  const [escrowSignerPda] = PublicKey.findProgramAddressSync([Buffer.from("escrow_signer"), mintPk.toBuffer()], program.programId);
+  const [marketConfigPda] = PublicKey.findProgramAddressSync([Buffer.from("market_config")], program.programId);
+  const [treasuryPda] = PublicKey.findProgramAddressSync([Buffer.from("treasury")], program.programId);
+  const [mintAuthPda] = PublicKey.findProgramAddressSync([Buffer.from("mint_auth"), mintPk.toBuffer()], program.programId);
 
-  const [listingPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("listing"), mint.toBuffer()],
-    program.programId
-  );
-  const [marketConfigPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("market_config")],
-    program.programId
-  );
-  const [treasuryPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("treasury")],
-    program.programId
-  );
-  const [escrowSignerPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("escrow_signer"), mint.toBuffer()],
-    program.programId
-  );
-  const [mintAuthPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("mint_auth"), mint.toBuffer()],
-    program.programId
-  );
-
-  console.log("📌 PDAs:", {
-    listingPda: listingPda.toBase58(),
-    marketConfigPda: marketConfigPda.toBase58(),
-    treasuryPda: treasuryPda.toBase58(),
-    escrowSignerPda: escrowSignerPda.toBase58(),
-    mintAuthPda: mintAuthPda.toBase58(),
+  const mc: any = await program.account.marketConfig.fetch(marketConfigPda);
+  console.log("market_config:", {
+    mintFeeBps: mc.mintFeeBps.toString(),
+    tradeFeeBps: mc.tradeFeeBps.toString(),
+    relistFeeBps: mc.relistFeeBps.toString(),
+    treasuryBump: mc.treasuryBump,
+    admin: mc.admin.toBase58()
   });
 
-  // === Payment ATAs ===
+  // === Metadata PDA ===
+  const [metadataPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+    METADATA_PROGRAM_ID
+  );
+  const royaltyBps = Math.floor((metadata.royalty || 0) * 100);
+
+  // === ATAs ===
+  const sellerNftAta = getAssociatedTokenAddressSync(mintPk, sellerPk);
+
   let ataIxs: TransactionInstruction[] = [];
-  let treasuryTokenAccount: PublicKey;
-  let sellerPaymentAta: PublicKey;
+  let treasuryPaymentAta = SystemProgram.programId;
+  let sellerPaymentAta = SystemProgram.programId;
 
   if (!useSol) {
-    const sellerRes = await ensureAtaExists(
-      provider.connection,
-      new PublicKey(paymentMint),
-      sellerPk,
-      sellerPk
-    );
+    const sellerRes = await ensureAtaExists(connection, new PublicKey(paymentMint), sellerPk, userKp.publicKey);
     sellerPaymentAta = sellerRes.ata;
     if (sellerRes.ix) ataIxs.push(sellerRes.ix);
 
-    const treasuryRes = await ensureTreasuryAtaExists(
-      provider.connection,
-      new PublicKey(paymentMint),
-      treasuryPda,
-      sellerPk
-    );
-    treasuryTokenAccount = treasuryRes.ata;
+    const treasuryRes = await ensureTreasuryAtaExists(connection, new PublicKey(paymentMint), treasuryPda, userKp.publicKey);
+    treasuryPaymentAta = treasuryRes.ata;
     if (treasuryRes.ix) ataIxs.push(treasuryRes.ix);
 
-    console.log("🏦 ATA:", {
+    console.log("📌 ATAs (SPL):", {
       sellerPaymentAta: sellerPaymentAta.toBase58(),
-      treasuryTokenAccount: treasuryTokenAccount.toBase58(),
+      treasuryPaymentAta: treasuryPaymentAta.toBase58(),
     });
   } else {
-    treasuryTokenAccount = SystemProgram.programId;
-    sellerPaymentAta = SystemProgram.programId;
-    console.log("🏦 Using SOL → treasury & sellerPaymentAta set to SystemProgram");
+    treasuryPaymentAta = await getAssociatedTokenAddress(new PublicKey(paymentMint), treasuryPda, true);
+    console.log("📌 ATAs (SOL):", {
+      treasuryPaymentAta: treasuryPaymentAta.toBase58(),
+    });
   }
 
-  // === Create Mint Account ===
-  const lamportsForMint =
-    await provider.connection.getMinimumBalanceForRentExemption(MINT_SIZE);
-  console.log(
-    "ℹ️ Rent-exempt for mint:",
-    lamportsForMint / anchor.web3.LAMPORTS_PER_SOL,
-    "SOL"
-  );
+  // === Pre-balance check Treasury ===
+  let treasuryPreLamports = 0;
+  let treasuryPreTokenBalance = 0;
 
+  if (useSol) {
+    treasuryPreLamports = await connection.getBalance(treasuryPda);
+    console.log("💰 Treasury SOL balance (pre):", treasuryPreLamports / anchor.web3.LAMPORTS_PER_SOL, "SOL");
+  } else {
+    const bal = await connection.getTokenAccountBalance(treasuryPaymentAta);
+    treasuryPreTokenBalance = parseInt(bal.value.amount);
+    console.log("💰 Treasury SPL balance (pre):", bal.value.uiAmountString, `(${decimals} decimals)`);
+  }
+
+  // === Create Mint Account + Init ===
+  const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
   const createMintIx = SystemProgram.createAccount({
-    fromPubkey: sellerPk,
-    newAccountPubkey: mint,
+    fromPubkey: userKp.publicKey,
+    newAccountPubkey: mintPk,
     space: MINT_SIZE,
-    lamports: lamportsForMint,
+    lamports,
     programId: TOKEN_PROGRAM_ID,
   });
-  const initMintIx = createInitializeMintInstruction(mint, 0, mintAuthPda, null);
-  console.log("✅ Mint account + initMintIx ready");
+  const initMintIx = createInitializeMintInstruction(mintPk, 0, mintAuthPda, null);
+  const createSellerNftAtaIx = createAssociatedTokenAccountInstruction(userKp.publicKey, sellerNftAta, sellerPk, mintPk);
 
-  // === Create Seller NFT ATA ===
-  const sellerNftAta = getAssociatedTokenAddressSync(mint, sellerPk);
-  const createSellerNftAtaIx = createAssociatedTokenAccountInstruction(
-    sellerPk,
-    sellerNftAta,
-    sellerPk,
-    mint
-  );
-  console.log("🎯 Seller NFT ATA:", sellerNftAta.toBase58());
-
-  // === Metadata PDA ===
-  const mplTokenMetadataProgramId = new PublicKey(
-    "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-  );
-
-  const [metadataPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("metadata"), mplTokenMetadataProgramId.toBuffer(), mint.toBuffer()],
-    mplTokenMetadataProgramId
-  );
-  console.log("📜 Metadata PDA:", metadataPda.toBase58());
-
-  const royaltyBps = Math.floor((metadata.royalty || 0) * 100);
-  console.log("🎨 Metadata:", {
-    name: metadata.name,
-    symbol: metadata.symbol || "",
-    uri: metadata.uri,
-    royaltyBps,
-  });
-
-  console.log("👀 Metadata Accounts to pass:", {
-    metadata: metadataPda.toBase58(),
-    mint: mint.toBase58(),
-    mintAuthority: userKp.publicKey.toBase58(),
-    payer: userKp.publicKey.toBase58(),
-    updateAuthority: userKp.publicKey.toBase58(),
-  });
-
-  const createMetadataIx = (createMetadataAccountV3 as any)(
-    {
-      metadata: metadataPda.toBase58(),
-      mint: mint.toBase58(),
-      mintAuthority: userKp.publicKey.toBase58(),
-      payer: userKp.publicKey.toBase58(),
-      updateAuthority: userKp.publicKey.toBase58(),
-    },
-    {
-      data: {
-        name: metadata.name,
-        symbol: metadata.symbol || "",
-        uri: metadata.uri,
-        sellerFeeBasisPoints: royaltyBps,
-        creators: null,
-        collection: null,
-        uses: null,
-      },
-      isMutable: true,
-      collectionDetails: null,
-    }
-  );
-
-  console.log("✅ Metadata instruction built");
-
-  // === Anchor Program call (mintAndList) ===
-  const mintAndListInstruction = await program.methods
+  // === mintAndList tx langsung ===
+  const txMintList = await program.methods
     .mintAndList(
-      new BN(priceUnits),
+      new anchor.BN(priceUnits),
       useSol,
       metadata.name,
-      metadata.symbol || "",
+      metadata.symbol || "UOGNFT",
       metadata.uri,
       royaltyBps
     )
-    .accounts({
+    .accountsStrict({
       listing: listingPda,
-      marketConfig: marketConfigPda,
-      treasuryPda,
-      paymentMint: new PublicKey(paymentMint),
-      treasuryTokenAccount,
-      sellerPaymentAta,
       escrowSigner: escrowSignerPda,
       seller: sellerPk,
+      mint: mintPk,
       sellerNftAta,
       mintAuthority: mintAuthPda,
-      mint,
+      treasuryPda,
+      paymentMint: new PublicKey(paymentMint),
+      treasuryTokenAccount: treasuryPaymentAta,
+      sellerPaymentAta,
+      marketConfig: marketConfigPda,
       metadata: metadataPda,
-      tokenMetadataProgram: mplTokenMetadataProgramId,
-      payer: sellerPk,
-      updateAuthority: sellerPk,
+      tokenMetadataProgram: METADATA_PROGRAM_ID,
+      payer: userKp.publicKey,
+      updateAuthority: userKp.publicKey,
       tokenProgram: TOKEN_PROGRAM_ID,
       systemProgram: SystemProgram.programId,
       rent: anchor.web3.SYSVAR_RENT_PUBKEY,
     })
-    .instruction();
+    .transaction();
 
-  console.log("🚀 mintAndList instruction ready");
-
-  // === Build TX ===
   const tx = new Transaction().add(
     createMintIx,
     initMintIx,
-    ...ataIxs,
     createSellerNftAtaIx,
-    createMetadataIx,
-    mintAndListInstruction
+    ...ataIxs,
+    ...txMintList.instructions
   );
 
-  tx.feePayer = sellerPk;
-  tx.recentBlockhash = (await provider.connection.getLatestBlockhash()).blockhash;
+  tx.feePayer = userKp.publicKey;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
 
-  // Partial sign mint
-  tx.partialSign(mintKeypair);
-  tx.partialSign(userKp);
+  tx.partialSign(mintKp, userKp);
 
-  console.log("📝 Transaction built & signed (partial)");
-  console.log("=== ✅ BUILD MINT TRANSACTION DONE ===");
+  const sig = await connection.sendRawTransaction(tx.serialize());
+  await connection.confirmTransaction(sig, "confirmed");
+
+  console.log("✅ mint_and_list confirmed:", sig);
+
+  // === Post-balance check Treasury ===
+  if (useSol) {
+    const treasuryPostLamports = await connection.getBalance(treasuryPda);
+    console.log("💰 Treasury SOL balance (post):", treasuryPostLamports / anchor.web3.LAMPORTS_PER_SOL, "SOL");
+    console.log("💰 Fee diff (SOL):", (treasuryPostLamports - treasuryPreLamports) / anchor.web3.LAMPORTS_PER_SOL, "SOL");
+  } else {
+    const bal = await connection.getTokenAccountBalance(treasuryPaymentAta);
+    const treasuryPostTokenBalance = parseInt(bal.value.amount);
+    console.log("💰 Treasury SPL balance (post):", bal.value.uiAmountString, `(${decimals} decimals)`);
+    console.log("💰 Fee diff (SPL):", (treasuryPostTokenBalance - treasuryPreTokenBalance) / 10 ** decimals, "tokens");
+  }
 
   return {
-    tx: tx.serialize({ requireAllSignatures: false }).toString("base64"),
-    debug: {
-      mint: mint.toBase58(),
-      listingPda: listingPda.toBase58(),
-      treasuryPda: treasuryPda.toBase58(),
-      sellerAta: sellerNftAta.toBase58(),
-      treasuryTokenAccount: treasuryTokenAccount.toBase58(),
-      sellerPaymentAta: sellerPaymentAta.toBase58(),
-      metadataPda: metadataPda.toBase58(),
-      useSol,
-      paymentMint,
-    },
+    signature: sig,
+    mint: mintPk.toBase58(),
+    listing: listingPda.toBase58(),
   };
 }

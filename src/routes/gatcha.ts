@@ -223,11 +223,11 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
   try {
     const { id: userId } = req.user;
     const { id: packId } = req.params;
-    const { paymentMint } = req.body; // 👈 frontend kirim langsung mint address
+    const { paymentMint } = req.body;
 
     console.log("⚡ Custodian gatcha request:", { userId, packId, paymentMint });
 
-    // 🧑 Ambil user & custodian wallet
+    // === Ambil user & custodian wallet
     const authUser = await Auth.findById(userId);
     if (!authUser) return res.status(404).json({ error: "User not found" });
 
@@ -242,66 +242,44 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     const provider = anchorLib.AnchorProvider.env();
     const conn = provider.connection;
 
-    // 📦 Ambil pack
+    // === Ambil pack
     const pack = await GatchaPack.findById(packId);
     if (!pack) return res.status(404).json({ error: "Pack not found" });
 
     let priceAmount = 0;
 
-    // === Native SOL (pseudo mint) ===
     if (paymentMint === "So11111111111111111111111111111111111111111") {
       const balanceLamports = await conn.getBalance(userKp.publicKey);
       const balanceSol = balanceLamports / anchorLib.web3.LAMPORTS_PER_SOL;
-
       priceAmount = pack.priceSOL || 0;
       if (balanceSol < priceAmount) {
-        return res.status(400).json({
-          error: "Insufficient SOL balance",
-          balance: balanceSol,
-          required: priceAmount,
-        });
+        return res.status(400).json({ error: "Insufficient SOL balance", balance: balanceSol, required: priceAmount });
       }
-    }
-
-    // === UOG SPL Token ===
-    else if (paymentMint === process.env.UOG_MINT) {
+    } else if (paymentMint === process.env.UOG_MINT) {
       const UOG_MINT = new PublicKey(process.env.UOG_MINT!);
-
-      const tokenAccounts = await conn.getTokenAccountsByOwner(userKp.publicKey, {
-        mint: UOG_MINT,
-      });
-
+      const tokenAccounts = await conn.getTokenAccountsByOwner(userKp.publicKey, { mint: UOG_MINT });
       if (tokenAccounts.value.length === 0) {
         return res.status(400).json({ error: "User has no UOG account" });
       }
-
       const accountInfo = await conn.getTokenAccountBalance(tokenAccounts.value[0].pubkey);
       const balanceUOG = parseFloat(accountInfo.value.uiAmountString || "0");
-
       priceAmount = pack.priceUOG || 0;
       if (balanceUOG < priceAmount) {
-        return res.status(400).json({
-          error: "Insufficient UOG balance",
-          balance: balanceUOG,
-          required: priceAmount,
-        });
+        return res.status(400).json({ error: "Insufficient UOG balance", balance: balanceUOG, required: priceAmount });
       }
-    }
-
-    // === Mint lain → invalid ===
-    else {
+    } else {
       return res.status(400).json({ error: "Invalid paymentMint" });
     }
 
-    // 🎲 Roll gatcha
+    // === Roll gatcha
     let { nft, blueprint, rewardInfo } = await doGatchaRoll(pack, custodian.address);
 
-    // 🔑 Generate mint lebih dulu
+    // === Generate mint
     const mintKp = Keypair.generate();
     const mintAddress = mintKp.publicKey.toBase58();
     nft.mintAddress = mintAddress;
 
-    // 🔢 Populate character/rune biar ada name
+    // === Populate char/rune + naming
     if (nft.character) nft = await nft.populate("character");
     if (nft.rune) nft = await nft.populate("rune");
 
@@ -323,13 +301,12 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     } else {
       throw new Error("NFT tidak punya karakter atau rune untuk generate name");
     }
-
     console.log("DEBUG finalName:", finalName);
 
-    // 💾 Simpan NFT
+    // === Save NFT doc
     await nft.save();
 
-    // 📝 Metadata JSON
+    // === Metadata
     const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
     const outputDir = path.join(process.cwd(), baseDir);
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
@@ -340,8 +317,8 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
 
     const metadataUri = `https://api.universeofgamers.io/api/nft/${mintAddress}/metadata`;
 
-    // 🛠️ Build TX
-    const txResp = await buildMintTransaction(
+    // === Build & Send TX (pakai buildMintTransaction baru)
+    const { signature } = await buildMintTransaction(
       custodian.address,
       {
         name: nft.name,
@@ -351,19 +328,17 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
         royalty: nft.royalty || 0,
       },
       paymentMint,
-      userKp,      // 👈 pass custodian keypair ke dalam
+      userKp,
       mintKp
     );
 
-    const tx = Transaction.from(Buffer.from(txResp.tx, "base64"));
-    tx.sign(userKp);
-
-    const sig = await anchorLib.web3.sendAndConfirmTransaction(conn, tx, [userKp, mintKp], {
-      skipPreflight: false,
-      commitment: "confirmed",
+    // === Update DB
+    await Nft.findByIdAndUpdate(nft._id, {
+      owner: userKp.publicKey.toBase58(),
+      isSell: false,
+      price: 0,
+      txSignature: signature,
     });
-
-    console.log("✅ TX confirmed:", sig);
 
     res.json({
       message: "🎲 Gatcha success!",
@@ -375,7 +350,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
         metadata: metadataResult.metadata,
       },
       mintAddress,
-      signature: sig,
+      signature,
       costs: {
         priceAmount,
         paymentMint,
