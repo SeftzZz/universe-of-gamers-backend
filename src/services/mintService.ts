@@ -153,8 +153,12 @@ export async function buildMintTransaction(
 
   // === Hitung harga ===
   const useSol = paymentMint === "So11111111111111111111111111111111111111111";
-  const mintInfo = await getMint(connection, new PublicKey(paymentMint));
-  const decimals = mintInfo.decimals;
+  let decimals = 0;
+
+  if(!useSol) {
+    const mintInfo = await getMint(connection, new PublicKey(paymentMint));
+    const decimals = mintInfo.decimals;
+  }
 
   const priceUnits = useSol
     ? Math.ceil(metadata.price * anchor.web3.LAMPORTS_PER_SOL)
@@ -193,9 +197,10 @@ export async function buildMintTransaction(
 
   let ataIxs: TransactionInstruction[] = [];
   let treasuryPaymentAta = SystemProgram.programId;
-  let sellerPaymentAta = SystemProgram.programId;
+  let sellerPaymentAta = sellerPk; // 👈 tambahkan ini
 
   if (!useSol) {
+    // SPL token
     const sellerRes = await ensureAtaExists(connection, new PublicKey(paymentMint), sellerPk, userKp.publicKey);
     sellerPaymentAta = sellerRes.ata;
     if (sellerRes.ix) ataIxs.push(sellerRes.ix);
@@ -209,8 +214,11 @@ export async function buildMintTransaction(
       treasuryPaymentAta: treasuryPaymentAta.toBase58(),
     });
   } else {
-    treasuryPaymentAta = await getAssociatedTokenAddress(new PublicKey(paymentMint), treasuryPda, true);
+    // SOL payment
+    sellerPaymentAta = sellerPk; // ✅ untuk mut constraint, pakai seller sebagai placeholder writable
+    treasuryPaymentAta = treasuryPda; // ✅ biasanya treasury PDA langsung
     console.log("📌 ATAs (SOL):", {
+      sellerPaymentAta: sellerPaymentAta.toBase58(),
       treasuryPaymentAta: treasuryPaymentAta.toBase58(),
     });
   }
