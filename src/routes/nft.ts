@@ -911,48 +911,162 @@ router.get("/:mintAddress/onchain", async (req: Request, res: Response) => {
 });
 
 /**
- * GET NFT list onchain
+ * GET NFT list history
+ * GET /nft/history
  */
-router.get("/onchain", async (req, res) => {
+router.get("/history", async (req, res) => {
+  console.time("⏱ onchain-total");
   try {
-    console.time("⏱ onchain-total");
+    const connection = new Connection(
+      process.env.SOLANA_CLUSTER as string,
+      "confirmed"
+    );
 
-    console.time("⏱ DB-find");
-    // 🔹 hanya ambil NFT dengan isSell = true
     const nfts = await Nft.find({ isSell: true });
-    // console.timeEnd("⏱ DB-find");
     console.log(`📦 Total NFT (DB only, isSell=true): ${nfts.length}`);
 
-    const results = nfts.map((nft, idx) => {
-      const rawPrice: any = nft.price; // cast ke any biar bisa akses method Decimal128/Double
+    const results: any[] = [];
 
-      // console.log(`🔍 NFT #${idx + 1} raw:`, {
-      //   _id: nft._id,
-      //   name: nft.name,
-      //   typePrice: typeof rawPrice,
-      //   rawPrice: rawPrice,
-      //   toJSON: typeof rawPrice?.toJSON === "function" ? rawPrice.toJSON() : null,
-      //   toString: typeof rawPrice?.toString === "function" ? rawPrice.toString() : null,
-      // });
+    for (const nft of nfts) {
+      const mintPk = new PublicKey(nft.mintAddress);
 
-      const obj = nft.toObject();
+      try {
+        // === Cari metadata PDA ===
+        const [metadataPda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+          METADATA_PROGRAM_ID
+        );
+        const accountInfo = await connection.getAccountInfo(metadataPda);
 
-      // console.log(`📦 NFT #${idx + 1} toObject.price:`, obj.price);
+        let metadata: any = null;
+        if (accountInfo) {
+          let uri = accountInfo.data
+            .slice(115, 315)
+            .toString("utf-8")
+            .replace(/\0/g, "")
+            .trim();
+          uri = uri.replace(/[^\x20-\x7E]+/g, "");
+
+          if (uri && uri.startsWith("http")) {
+            try {
+              const resp = await fetchWithTimeout(uri, 5000);
+              if (resp.ok) metadata = await resp.json();
+            } catch (err) {
+              console.warn(`⚠️ Failed fetch metadata ${nft.mintAddress}`, err);
+            }
+          }
+        }
+
+        // === Cek listing PDA hanya jika env true ===
+        let priceSol: number | null = null;
+        if (process.env.USE_ONCHAIN_LISTING === "true") {
+          try {
+            const provider = new anchor.AnchorProvider(connection, {} as any, {
+              preflightCommitment: "confirmed",
+            });
+            const program = new anchor.Program(
+              require("../../public/idl/universe_of_gamers.json"),
+              new PublicKey(process.env.PROGRAM_ID!),
+              provider
+            );
+
+            const [listingPda] = PublicKey.findProgramAddressSync(
+              [Buffer.from("listing"), mintPk.toBuffer()],
+              program.programId
+            );
+
+            const listing: any = await program.account.listing.fetch(listingPda);
+            priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
+          } catch {
+            // kalau USE_ONCHAIN_LISTING true tapi PDA gak ada → skip
+            console.log(`⚠️ No onchain listing for ${nft.mintAddress}`);
+          }
+        }
+
+        results.push({
+          _id: nft._id,
+          name: nft.name,
+          mintAddress: nft.mintAddress,
+          image: nft.image,
+          owner: nft.owner,
+          price: priceSol ?? Number(nft.price) ?? 0,
+          updatedAt: nft.updatedAt,
+          metadata,
+          onChain: true,
+        });
+      } catch (err) {
+        console.warn(`⚠️ Failed fetch onchain for ${nft.mintAddress}`, err);
+        results.push({
+          _id: nft._id,
+          name: nft.name,
+          mintAddress: nft.mintAddress,
+          image: nft.image,
+          owner: nft.owner,
+          price: Number(nft.price) ?? 0,
+          updatedAt: nft.updatedAt,
+          metadata: null,
+          onChain: false,
+        });
+      }
+    }
+
+    console.timeEnd("⏱ onchain-total");
+    return res.json({ history: results });
+  } catch (err) {
+    console.error("❌ onchain error:", err);
+    return res.status(500).json({ error: "Failed to fetch NFTs (onchain)" });
+  }
+});
+
+// GET /nft/top-creators
+router.get("/top-creators", async (req, res) => {
+  try {
+    // ambil semua NFT dari DB (tidak hanya isSell)
+    const nfts = await Nft.find({}).select("owner");
+
+    if (!nfts || nfts.length === 0) {
+      return res.json([]);
+    }
+
+    // hitung jumlah NFT per owner
+    const ownerMap: Record<string, number> = {};
+    nfts.forEach((nft) => {
+      if (!nft.owner) return;
+      ownerMap[nft.owner] = (ownerMap[nft.owner] || 0) + 1;
+    });
+
+    // ambil semua user (hanya name + avatar + addresses)
+    const users = await Auth.find({})
+      .select("name avatar wallets.address custodialWallets.address")
+      .lean();
+
+    // gabungkan data
+    const creators = Object.entries(ownerMap).map(([owner, count]) => {
+      const user = users.find(
+        (u: any) =>
+          (u.wallets?.some((w: any) => w.address === owner) ||
+            u.custodialWallets?.some((c: any) => c.address === owner))
+      );
 
       return {
-        ...obj,
-        price: obj.price ? Number(obj.price) : 0, // force konversi
-        onChain: false,
-        metadata: null,
-        history: [],
+        owner,
+        count,
+        name: user?.name || null,
+        avatar: user?.avatar
+          ? `${process.env.BASE_URL || "http://localhost:3000"}/${
+              user.avatar.startsWith("/") ? user.avatar.slice(1) : user.avatar
+            }`
+          : "assets/images/avatar/avatar-small-01.png",
       };
     });
 
-    // console.timeEnd("⏱ onchain-total");
-    res.json(results);
-  } catch (err) {
-    console.error("❌ onchain error:", err);
-    res.status(500).json({ error: "Failed to fetch NFTs (DB only)" });
+    // urutkan dari terbanyak & ambil top 5
+    const topCreators = creators.sort((a, b) => b.count - a.count).slice(0, 5);
+
+    return res.json(topCreators);
+  } catch (err: any) {
+    console.error("❌ Error fetching top creators:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 

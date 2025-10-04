@@ -541,6 +541,33 @@ router.post('/forget-password', async (req, res) => {
   }
 });
 
+// GET /users/basic
+router.get('/users/basic', async (req, res) => {
+  try {
+    // Ambil semua user tapi hanya field name + avatar + wallets.address
+    const users = await Auth.find({})
+      .select('name avatar wallets.address custodialWallets.address')
+      .lean();
+
+    // Pastikan ada avatar fallback
+    const mappedUsers = users.map(user => ({
+      _id: user._id,
+      name: user.name,
+      avatar: user.avatar,
+      // gabungkan semua wallet address biar bisa dipetakan ke NFT.owner
+      addresses: [
+        ...(user.wallets?.map(w => w.address) || []),
+        ...(user.custodialWallets?.map(c => c.address) || [])
+      ]
+    }));
+
+    res.json(mappedUsers);
+  } catch (err: any) {
+    console.error('❌ Error fetching basic users:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // 🔹 Get user by ID
 router.get('/user/:id', async (req, res) => {
   try {
@@ -1264,6 +1291,82 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
     return res.status(500).json({ error: err.message, stack: err.stack });
   }
 });
+
+//
+// POST /nft/:mintAddress/sell
+//
+router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { id: userId } = req.user;
+    const { mintAddress } = req.params;
+    const { paymentMint, price, name, symbol } = req.body;
+    const uri = `https://api.universeofgamers.io/nft/${mintAddress}`;
+
+    console.log("=== 🚀 SELL FLOW START ===");
+    console.log("Params:", { mintAddress, paymentMint, price, name, symbol });
+
+    const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
+    const provider = new anchor.AnchorProvider(connection, {} as any, { preflightCommitment: "confirmed" });
+    const program = new anchor.Program(
+      require("../../public/idl/universe_of_gamers.json"),
+      new PublicKey(process.env.PROGRAM_ID!),
+      provider
+    );
+
+    // === Seller ===
+    const authUser = await Auth.findById(userId);
+    if (!authUser) return res.status(404).json({ error: "User not found" });
+    const sellerCustodian = authUser.custodialWallets.find((w) => w.provider === "solana");
+    if (!sellerCustodian) return res.status(400).json({ error: "No seller wallet" });
+    const sellerKp = Keypair.fromSecretKey(bs58.decode(decrypt(sellerCustodian.privateKey)));
+    console.log("🔑 Seller wallet:", sellerKp.publicKey.toBase58());
+
+    // === NFT Doc ===
+    let mintPk = new PublicKey(mintAddress);
+    const nftDoc = await Nft.findOne({ mintAddress });
+    if (!nftDoc) return res.status(404).json({ error: "NFT not found" });
+
+    // === Update DB ===
+    await Nft.findByIdAndUpdate(nftDoc._id, {
+      isSell: true,
+      price: price,
+      updatedAt: new Date()
+    });
+
+    return res.json({
+      message: "✅ NFT listed for sale",
+      mint: mintPk.toBase58(),
+    });
+  } catch (err: any) {
+    console.error("❌ Error in sell:", err);
+    return res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+//
+// POST /nft/:mintAddress/delist
+//
+router.post("/nft/:mintAddress/delist", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { mintAddress } = req.params;
+    const nftDoc = await Nft.findOneAndUpdate(
+      { mintAddress },
+      {
+        isSell: false,
+        price: 0,
+        updatedAt: new Date()
+      },
+      { new: true }
+    );
+    if (!nftDoc) return res.status(404).json({ success: false, error: "NFT not found" });
+
+    return res.json({ success: true, nft: nftDoc });
+  } catch (err: any) {
+    console.error("❌ Error delisting NFT:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 
 router.get("/program-info", async (req, res) => {
   try {
