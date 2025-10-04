@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import { Client } from '@solana-tracker/data-api';
+import fetch from 'node-fetch';
 
 const router = express.Router();
 const client = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
@@ -12,6 +13,59 @@ type Candle = {
   volume: number;
   timestamp: number;
 };
+
+/** =============================
+ *  GET /token/search
+ *  ============================= */
+router.get('/token/search', async (req: Request, res: Response) => {
+  try {
+    const { q, page = '1', limit = '20', sortBy = 'createdAt', sortOrder = 'desc' } = req.query;
+    if (!q || typeof q !== 'string') {
+      return res.status(400).json({ error: 'Missing query parameter q' });
+    }
+
+    console.log(`🔍 Searching tokens on Solana Tracker for: "${q}"`);
+
+    // Panggil API bawaan dari SDK Solana Tracker
+    const response = await client.searchTokens({
+      query: q,
+      page: Number(page),
+      limit: Number(limit),
+      sortBy: String(sortBy),
+      sortOrder: String(sortOrder),
+      showAllPools: false,
+    });
+
+    // SDK sudah mengembalikan objek { status, data }
+    if (!response || !response.data) {
+      return res.json({ status: 'success', data: [] });
+    }
+
+    // Map agar tetap seragam (beberapa field bisa beda tergantung versi API)
+    const tokens = response.data.map((t: any) => ({
+      name: t.name,
+      symbol: t.symbol,
+      mint: t.mint || t.address,
+      decimals: t.decimals ?? 9,
+      image: t.image || t.logoURI || null,
+      holders: t.holders ?? 0,
+      verified: !!t.verified,
+      jupiter: !!t.jupiter,
+      liquidityUsd: t.liquidityUsd ?? 0,
+      marketCapUsd: t.marketCapUsd ?? 0,
+      priceUsd: t.priceUsd ?? 0,
+      volume_24h: t.volume_24h ?? t.volume24h ?? 0,
+      poolAddress: t.poolAddress ?? null,
+      tokenDetails: t.tokenDetails || null,
+    }));
+
+    res.json({ status: 'success', count: tokens.length, data: tokens });
+  } catch (err) {
+    const e = err as Error;
+    console.error('❌ Error while searching tokens from Solana Tracker:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 /** =============================
  *  GET /token/ohlcv
@@ -49,7 +103,6 @@ router.get('/token/ohlcv', async (req: Request, res: Response) => {
       fastCache: true,
     });
 
-    // handle fallback oclhv / ohlcv dan pastikan semua field ada
     const rawCandles: any[] = (chartData as any).oclhv || (chartData as any).ohlcv || [];
     const candles: Candle[] = rawCandles.map((c: any) => ({
       open: c.open,
