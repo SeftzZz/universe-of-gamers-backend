@@ -74,6 +74,8 @@ import rateLimit from "express-rate-limit";
 
 import AuditLog from '../models/AuditLog';
 
+import { broadcast } from "../index";
+
 // Multer config
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -1331,6 +1333,13 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
       isSell: true,
       price: price,
       updatedAt: new Date()
+    });
+
+    broadcast({
+      type: "selling-update",
+      user: sellerCustodian,
+      result: mintAddress,
+      timestamp: new Date().toISOString(),
     });
 
     return res.json({
