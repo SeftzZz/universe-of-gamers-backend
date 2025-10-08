@@ -199,7 +199,8 @@ router.post('/register', async (req, res) => {
       defaultTeams.push({
         name: `TEAM#${i}`,
         owner: address,     // wallet custodial/external
-        members: [],        // masih kosong
+        members: [],
+        isActive: i === 1 ? true : false, // ✅ TEAM#1 aktif
       });
     }
 
@@ -499,6 +500,86 @@ router.post('/import/phrase', async (req, res) => {
     });
   } catch (err: any) {
     console.error('❌ Import phrase error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Import Private Key ===
+router.post('/import/private', async (req, res) => {
+  try {
+    const { userId, privateKey, name } = req.body;
+    if (!privateKey) {
+      return res.status(400).json({ error: 'Missing private key' });
+    }
+
+    // 🔑 decode base58 → keypair Solana
+    const secretKey = bs58.decode(privateKey);
+    const kp = Keypair.fromSecretKey(secretKey);
+
+    const address = kp.publicKey.toBase58();
+    const displayName = name || address;
+    const avatarUrl = `/uploads/avatars/default.png`;
+
+    let auth;
+
+    if (userId) {
+      // kalau userId dikirim → kaitkan ke akun yang sudah ada
+      auth = await Auth.findById(userId);
+      if (!auth) return res.status(404).json({ error: 'User not found' });
+    } else {
+      // cari apakah user dengan address ini sudah ada
+      auth = await Auth.findOne({
+        $or: [
+          { name: displayName },
+          { 'wallets.address': address },
+          { 'custodialWallets.address': address },
+        ],
+      });
+
+      if (!auth) {
+        // buat akun baru
+        auth = new Auth({
+          name: displayName,
+          authProvider: 'custodial',
+          custodialWallets: [],
+          wallets: [],
+          avatar: avatarUrl,
+        });
+      }
+    }
+
+    // 🚫 Cek apakah wallet sudah terdaftar
+    const alreadyExists =
+      auth.wallets.some((w) => w.address === address) ||
+      auth.custodialWallets.some((w) => w.address === address);
+
+    if (!alreadyExists) {
+      const wallet: ICustodialWallet = {
+        provider: 'solana',
+        address,
+        privateKey: encrypt(privateKey),
+        mnemonic: '', // tidak ada mnemonic
+      };
+
+      auth.custodialWallets.push(wallet);
+      await auth.save();
+    }
+
+    // refresh dari DB
+    const freshAuth = await Auth.findById(auth._id);
+    if (!freshAuth) return res.status(404).json({ error: 'User not found after save' });
+
+    const token = generateToken(freshAuth);
+
+    res.json({
+      success: true,
+      message: alreadyExists ? 'Wallet already exists' : 'Private key imported',
+      authId: freshAuth._id,
+      wallet: { provider: 'solana', address },
+      token,
+    });
+  } catch (err: any) {
+    console.error('❌ Import private key error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1375,7 +1456,6 @@ router.post("/nft/:mintAddress/delist", authenticateJWT, async (req: AuthRequest
     res.status(500).json({ success: false, error: err.message });
   }
 });
-
 
 router.get("/program-info", async (req, res) => {
   try {

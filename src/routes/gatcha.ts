@@ -127,7 +127,7 @@ router.post("/pull", async (req, res) => {
 // Untuk demo custodian, ga perlu paymentMint
 router.post("/:id/pull/custodian", async (req: AuthRequest, res) => {
   try {
-    const userId = "68be1ad93e98e411515ee1aa";
+    const userId = "68d6b0cb7087a4fea2243cd5";
     const packId = "68d15469578e8ad7ead06f18";
 
     console.log("⚡ Custodian gatcha request:", { userId, packId });
