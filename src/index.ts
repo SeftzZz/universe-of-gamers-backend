@@ -13,6 +13,7 @@ import authRoutes from "./routes/auth";
 import solRoutes from "./routes/sol";
 import characterRoutes from "./routes/character";
 import gatchaRoutes from "./routes/gatcha";
+import battleRoutes from "./routes/battle";
 import battleSimulateRouter from "./routes/battleSimulate";
 import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
 
@@ -27,6 +28,7 @@ app.use("/api/nft", nftRoutes);
 app.use("/api/wallet", walletRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/gatcha", gatchaRoutes);
+app.use("/api", battleRoutes);
 app.use("/api", solRoutes);
 app.use("/api", battleSimulateRouter);
 

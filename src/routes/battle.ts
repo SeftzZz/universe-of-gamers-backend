@@ -15,7 +15,7 @@ router.post("/battle", async (req, res) => {
       return res.status(400).json({ error: "At least 2 players required" });
     }
 
-    const battle = new Battle({ players, mode, result: "pending", log: [] });
+    const battle = new Battle({ players, mode, result: "init_battle", log: [] });
     await battle.save();
 
     res.status(201).json(battle);

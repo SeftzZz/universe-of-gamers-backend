@@ -182,30 +182,27 @@ router.get("/fetch-nft", async (req, res) => {
     console.time("⏱ fetch-nft-total");
 
     console.time("⏱ DB-find");
-    // Ambil hanya NFT yang `isSell = true`
-    const nfts = await Nft.find({ isSell: true });
+    // ✅ Ambil NFT yang sedang dijual dan populate karakter/rune (seperti /my-nfts)
+    const nfts = await Nft.find({ isSell: true })
+      .populate("character", "name rarity element")
+      .populate("rune", "name rarity");
     console.timeEnd("⏱ DB-find");
 
     console.log(`📦 Total NFT for sale: ${nfts.length}`);
 
-    // Langsung return semua NFT dari DB
-    const results = nfts.map((nft) => ({
-      ...nft.toObject(),
-      onChain: false, // tandai kalau ini hanya dari DB
-    }));
+    // ✅ Tidak perlu flatten manual → langsung kirim hasil populate
+    res.json(nfts);
 
     console.timeEnd("⏱ fetch-nft-total");
-    res.json(results);
   } catch (err) {
     console.error("❌ Fetch NFT error (DB only):", err);
-    res.status(500).json({ error: "Failed to fetch NFTs from DB" });
+    res.status(500).json({ error: "Failed to fetch NFTs" });
   }
 });
 
 // GET NFTs by owner (only owner can access)
-router.get("/my-nfts",authenticateJWT, async (req: AuthRequest, res) => {
+router.get("/my-nfts", authenticateJWT, async (req: AuthRequest, res) => {
   try {
-    // Ambil user dari DB
     const user = await Auth.findById(req.user.id).select(
       "wallets custodialWallets"
     );
@@ -213,7 +210,6 @@ router.get("/my-nfts",authenticateJWT, async (req: AuthRequest, res) => {
       return res.status(401).json({ error: "User not found" });
     }
 
-    // Gabungkan semua wallet address (custodial + external)
     const walletAddresses = [
       ...user.wallets.map((w) => w.address),
       ...user.custodialWallets.map((c) => c.address),
@@ -223,8 +219,10 @@ router.get("/my-nfts",authenticateJWT, async (req: AuthRequest, res) => {
       return res.json([]);
     }
 
-    // Cari NFT berdasarkan semua address
-    const nfts = await Nft.find({ owner: { $in: walletAddresses } });
+    // ✅ populate karakter (nama, rarity, element)
+    const nfts = await Nft.find({ owner: { $in: walletAddresses } })
+      .populate("character", "name rarity element")
+      .populate("rune", "name rarity");
 
     res.json(nfts);
   } catch (err) {
@@ -1053,7 +1051,7 @@ router.get("/top-creators", async (req, res) => {
         count,
         name: user?.name || null,
         avatar: user?.avatar
-          ? `${process.env.BASE_URL || "http://localhost:3000"}/${
+          ? `${process.env.BASE_URL}/${
               user.avatar.startsWith("/") ? user.avatar.slice(1) : user.avatar
             }`
           : "assets/images/avatar/avatar-small-01.png",
