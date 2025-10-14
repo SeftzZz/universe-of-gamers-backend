@@ -281,7 +281,7 @@ router.post('/login', async (req, res) => {
 
 router.get('/decrypt', async (req, res) => {
   const encryptedFromDB =
-    "VGeGRFaaNrSGcNnyi3UvfHn37uQLtNvi/IPgeEWl8ZpinYbkccMFTUv+ygf16DPJDGNMoOOS3NQN7aZFLbBN1w0/7Wdej2BFY+jgXBUEdBfa+zGXc7FAogr6L83WSighUYKaRFqbnKTZOv//lYh3ezMz2cJ5YuM="; // ganti dengan string terenkripsi kamu
+    "xdrdgKeF2Qdua0KdHZ23anX0dUGf9ebwo31zgAZcabgxK2RttZY1UO0EsB8s+ZhFyprmtTKFOeKKe1AhgiVdFsx352tLN9WaFTqt5tPZjf2qM5/1kP+MSiIy6KWhUTBy/+9pkuJLsF8em6085LEfrHL+2F/2DCIs"; // ganti dengan string terenkripsi kamu
 
   try {
     const privateKey = decrypt(encryptedFromDB);
@@ -1494,6 +1494,86 @@ router.get("/program-info", async (req, res) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/wallet/custodial/:address
+ * Ambil wallet custodial berdasarkan address
+ */
+router.get("/custodial/:address", async (req: Request, res: Response) => {
+  try {
+    const { address } = req.params;
+
+    if (!address) {
+      return res.status(400).json({ error: "Missing wallet address" });
+    }
+
+    // 🔍 Cari user yang memiliki custodial wallet dengan address ini
+    const user = await Auth.findOne(
+      { "custodialWallets.address": address },
+      { "custodialWallets.$": 1, name: 1, email: 1, role: 1, createdAt: 1 }
+    ).lean();
+
+    if (!user) {
+      return res.status(404).json({ error: "Custodial wallet not found" });
+    }
+
+    const wallet = user.custodialWallets[0];
+
+    console.log("✅ Wallet ditemukan:", wallet.address);
+
+    // 🚫 Tidak ada proses decrypt atau Keypair
+    return res.json({
+      profile: {
+        name: user.name,
+        email: user.email,
+        role: user.role || "user",
+        createdAt: user.createdAt,
+      },
+      custodialWallet: {
+        provider: wallet.provider,
+        address: wallet.address,
+      },
+    });
+  } catch (err) {
+    console.error("❌ Error get custodial wallet:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.get("/debug-keypair", async (req: Request, res: Response) => {
+  try {
+    // ⚠️ ganti string ini dengan private key base58 kamu
+    const PRIVATE_KEY_BS58 =
+      "4CdfLjnqPaecZ8vb6yRjaFaUxDEtJbJrb3e7GMVJ3UCsXdqtursWWH4GnpdaoYMVQTDgq5ekAyM22y7J8Wn3oP4S"; // base58 string
+
+    // 🔁 decode base58 → Uint8Array
+    const secretKey = bs58.decode(PRIVATE_KEY_BS58);
+
+    // 🔑 buat keypair
+    const keypair = Keypair.fromSecretKey(secretKey);
+
+    // 🌐 buat koneksi ke Solana RPC
+    const connection = new Connection(
+      process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
+      "confirmed"
+    );
+
+    // 💰 ambil balance
+    const balance = await connection.getBalance(keypair.publicKey);
+
+    console.log("✅ Public Key:", keypair.publicKey.toBase58());
+    console.log("💰 Balance:", balance / LAMPORTS_PER_SOL, "SOL");
+
+    return res.json({
+      ok: true,
+      publicKey: keypair.publicKey.toBase58(),
+      balance: balance / LAMPORTS_PER_SOL,
+    });
+  } catch (err: any) {
+    console.error("❌ Gagal generate keypair:", err);
+    return res.status(500).json({ error: "Failed to generate keypair", detail: err.message });
   }
 });
 

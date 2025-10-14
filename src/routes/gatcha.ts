@@ -125,7 +125,7 @@ router.post("/pull", async (req, res) => {
  * - Sign & broadcast TX di backend
  */
 // Untuk demo custodian, ga perlu paymentMint
-router.post("/:id/pull/custodian", async (req: AuthRequest, res) => {
+router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res) => {
   try {
     const { id: userId } = req.user;
     const { id: packId } = req.params;

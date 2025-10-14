@@ -1016,6 +1016,172 @@ router.get("/history", async (req, res) => {
   }
 });
 
+/**
+ * GET NFT list history milik user login
+ * GET /nft/my-history
+ */
+router.get("/my-history", authenticateJWT, async (req: AuthRequest, res) => {
+  console.time("⏱ my-history-total");
+  try {
+    // 🔑 Ambil data user dari JWT
+    const user = await Auth.findById(req.user.id).select("wallets custodialWallets");
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    const walletAddresses = [
+      ...(user.wallets?.map((w) => w.address) || []),
+      ...(user.custodialWallets?.map((c) => c.address) || []),
+    ];
+
+    if (!walletAddresses.length) {
+      console.warn("⚠️ No wallet found in user profile");
+      return res.json({ history: [] });
+    }
+
+    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+    const results: any[] = [];
+
+    const nfts = await Nft.find({
+      owner: { $in: walletAddresses },
+      isSell: true,
+    });
+
+    console.log(`📦 Found ${nfts.length} NFT(s) owned by user`);
+
+    for (const nft of nfts) {
+      const mintPk = new PublicKey(nft.mintAddress);
+      let metadata: any = null;
+      let sellerAta: string | null = null;
+      let sellerWallet: string | null = null;
+
+      const spl = await import("@solana/spl-token");
+
+      try {
+        console.log(`🔍 Checking on-chain transfer for ${nft.name} (${nft.mintAddress})`);
+
+        // === (1) Ambil ATA owner saat ini ===
+        const ownerPk = new PublicKey(nft.owner);
+        const ataPk = spl.getAssociatedTokenAddressSync(mintPk, ownerPk);
+        console.log(`💳 Current ATA: ${ataPk.toBase58()}`);
+
+        // === (2) Ambil transaksi terakhir dari ATA ===
+        const signatures = await connection.getSignaturesForAddress(ataPk, { limit: 1 });
+        if (signatures.length === 0) {
+          console.warn(`⚠️ No transaction found for ATA ${ataPk.toBase58()}`);
+        }
+
+        if (signatures.length > 0) {
+          const txSig = signatures[0].signature;
+          console.log(`🧾 Latest Tx Signature: ${txSig}`);
+
+          const parsedTx = await connection.getParsedTransaction(txSig, {
+            maxSupportedTransactionVersion: 0,
+          });
+
+          if (parsedTx?.meta?.preTokenBalances?.length && parsedTx.meta.postTokenBalances?.length) {
+            const preBalances = parsedTx.meta.preTokenBalances;
+            const postBalances = parsedTx.meta.postTokenBalances;
+
+            const sellerBalance = preBalances.find((pre: any) => {
+              const post = postBalances.find((p: any) => p.accountIndex === pre.accountIndex);
+              const preAmt = pre?.uiTokenAmount?.uiAmount ?? 0;
+              const postAmt = post?.uiTokenAmount?.uiAmount ?? 0;
+              return preAmt > postAmt;
+            });
+
+            if (sellerBalance) {
+              sellerAta =
+                parsedTx.transaction.message.accountKeys[
+                  sellerBalance.accountIndex
+                ]?.pubkey?.toBase58?.() ?? null;
+              sellerWallet = sellerBalance.owner || null;
+              console.log(
+                `✅ Found seller: ${sellerWallet} (ATA: ${sellerAta}) for ${nft.mintAddress}`
+              );
+            } else {
+              console.warn(`⚠️ No seller ATA found for ${nft.mintAddress}`);
+            }
+          } else {
+            console.warn(`⚠️ No token balances in tx meta for ${nft.mintAddress}`);
+          }
+        }
+      } catch (err) {
+        console.warn(`⚠️ Failed to fetch seller ATA for ${nft.mintAddress}:`, err);
+      }
+
+      // === (3) Fetch metadata (optional) ===
+      try {
+        const [metadataPda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+          METADATA_PROGRAM_ID
+        );
+        const accountInfo = await connection.getAccountInfo(metadataPda);
+        if (accountInfo) {
+          let uri = accountInfo.data
+            .slice(115, 315)
+            .toString("utf-8")
+            .replace(/\0/g, "")
+            .trim()
+            .replace(/[^\x20-\x7E]+/g, "");
+          if (uri.startsWith("http")) {
+            console.log(`🌐 Fetching metadata: ${uri}`);
+            const resp = await fetch(uri);
+            if (resp.ok) metadata = await resp.json();
+          }
+        }
+      } catch (err) {
+        console.warn(`⚠️ Failed fetch metadata ${nft.mintAddress}:`, err);
+      }
+
+      // === (4) Optional: On-chain listing ===
+      let priceSol: number | null = null;
+      if (process.env.USE_ONCHAIN_LISTING === "true") {
+        try {
+          const provider = new anchor.AnchorProvider(connection, {} as any, {
+            preflightCommitment: "confirmed",
+          });
+          const program = new anchor.Program(
+            require("../../public/idl/universe_of_gamers.json"),
+            new PublicKey(process.env.PROGRAM_ID!),
+            provider
+          );
+          const [listingPda] = PublicKey.findProgramAddressSync(
+            [Buffer.from("listing"), mintPk.toBuffer()],
+            program.programId
+          );
+          const listing: any = await program.account.listing.fetch(listingPda);
+          priceSol = listing.price.toNumber() / anchor.web3.LAMPORTS_PER_SOL;
+          console.log(`💰 Listing price found on-chain: ${priceSol} SOL`);
+        } catch (err: any) {
+          console.log(`⚠️ No onchain listing for ${nft.mintAddress}:`, err?.message || err);
+        }
+      }
+
+      results.push({
+        _id: nft._id,
+        name: nft.name,
+        mintAddress: nft.mintAddress,
+        image: nft.image,
+        owner: nft.owner,
+        sellerWallet,
+        sellerAta,
+        price: priceSol ?? Number(nft.price) ?? 0,
+        updatedAt: nft.updatedAt,
+        metadata,
+        onChain: true,
+      });
+
+      console.log(`✅ Processed NFT ${nft.name} (${nft.mintAddress})`);
+    }
+
+    console.timeEnd("⏱ my-history-total");
+    console.log(`📊 Returning ${results.length} NFT history entries`);
+    return res.json({ history: results });
+  } catch (err) {
+    console.error("❌ my-history error:", err);
+    return res.status(500).json({ error: "Failed to fetch my-history NFTs" });
+  }
+});
+
 // GET /nft/top-creators
 router.get("/top-creators", async (req, res) => {
   try {

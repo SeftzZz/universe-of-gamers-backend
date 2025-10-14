@@ -880,19 +880,40 @@ router.post("/send/sign", authenticateJWT, async (req: AuthRequest, res) => {
     const { id: userId } = req.user!;
     const { tx, wallet } = req.body;
 
-    if (!tx || !wallet)
+    // 🔍 Validasi awal
+    if (!tx || !wallet) {
+      console.warn("⚠️ Missing tx or wallet in /send/sign:", { tx: !!tx, wallet: !!wallet });
       return res.status(400).json({ error: "tx and wallet required" });
+    }
 
+    // 🔍 Ambil user dari DB
     const authUser = await Auth.findById(userId);
     if (!authUser) return res.status(404).json({ error: "User not found" });
 
-    const walletEntry = authUser.custodialWallets.find(
-      (w: any) => w.provider === "solana" && w.address === wallet
-    );
-    if (!walletEntry)
-      return res.status(400).json({ error: "No matching custodial wallet found" });
+    // 🔍 Log debug custodial wallets
+    console.log("🔍 Custodial wallets for user:", JSON.stringify(authUser.custodialWallets, null, 2));
+    console.log("🔍 Searching wallet:", wallet);
 
-    // 🧾 Simpan ke pending transaksi
+    // 🔎 Cari wallet secara case-insensitive dan normalisasi provider
+    const walletEntry = authUser.custodialWallets.find(
+      (w: any) =>
+        (w.provider?.toLowerCase?.() ?? "") === "solana" &&
+        w.address?.toLowerCase?.() === wallet.toLowerCase()
+    );
+
+    if (!walletEntry) {
+      console.warn("❌ No matching custodial wallet found for:", wallet);
+      console.log(
+        "📜 Available wallets:",
+        authUser.custodialWallets.map((w: any) => ({
+          provider: w.provider,
+          address: w.address,
+        }))
+      );
+      return res.status(400).json({ error: "No matching custodial wallet found" });
+    }
+
+    // 🧾 Simpan transaksi pending
     const pendingTx = await PendingTx.create({
       userId,
       wallet,
@@ -908,7 +929,7 @@ router.post("/send/sign", authenticateJWT, async (req: AuthRequest, res) => {
     console.log("📬 Saved pending transaction:", pendingTx._id);
     console.log("📅 Created at:", pendingTx.createdAt);
 
-    // ✅ pastikan kembalikan txId ke frontend
+    // ✅ Kembalikan txId ke frontend
     res.json({
       message: "Transaction waiting for manual sign",
       txId: pendingTx._id.toString(),
