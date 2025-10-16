@@ -274,7 +274,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     // === Roll gatcha
     let { nft, blueprint, rewardInfo } = await doGatchaRoll(pack, custodian.address);
 
-    // === Generate mint
+    // === Generate mint keypair
     const mintKp = Keypair.generate();
     const mintAddress = mintKp.publicKey.toBase58();
     nft.mintAddress = mintAddress;
@@ -303,59 +303,89 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     }
     console.log("DEBUG finalName:", finalName);
 
-    // === Save NFT doc
-    await nft.save();
-
-    // === Metadata
+    // === Direktori metadata
     const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
     const outputDir = path.join(process.cwd(), baseDir);
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-
     const filePath = path.join(outputDir, `${mintAddress}.json`);
-    const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
-    if (!metadataResult.success) throw new Error(`Metadata generation failed: ${metadataResult.error}`);
 
-    const metadataUri = `https://api.universeofgamers.io/api/nft/${mintAddress}/metadata`;
-
-    // === Build & Send TX (pakai buildMintTransaction baru)
-    const { signature } = await buildMintTransaction(
-      custodian.address,
-      {
-        name: nft.name,
-        symbol: "UOGNFT",
-        uri: metadataUri,
-        price: priceAmount,
-        royalty: nft.royalty || 0,
-      },
-      paymentMint,
-      userKp,
-      mintKp
-    );
-
-    // === Update DB
-    await Nft.findByIdAndUpdate(nft._id, {
-      owner: userKp.publicKey.toBase58(),
-      isSell: false,
-      price: 0,
-      txSignature: signature,
-    });
-
-    res.json({
-      message: "🎲 Gatcha success!",
-      rewardInfo,
-      blueprint,
-      nft,
-      metadata: {
-        path: filePath,
-        metadata: metadataResult.metadata,
-      },
-      mintAddress,
-      signature,
-      costs: {
-        priceAmount,
+    try {
+      // === 1️⃣ Bayar + Mint (langsung dari buildMintTransaction)
+      const { paymentSignature, mintSignature, mint, listing } = await buildMintTransaction(
+        custodian.address,
+        {
+          name: nft.name,
+          symbol: "UOGNFT",
+          uri: "", // metadata dibuat setelah mint sukses
+          price: priceAmount,
+          royalty: nft.royalty || 0,
+        },
         paymentMint,
-      },
-    });
+        userKp,
+        mintKp
+      );
+
+      if (!mintSignature) throw new Error("Mint transaction failed");
+
+      console.log("✅ Payment + Mint confirmed:", { paymentSignature, mintSignature });
+
+      // === 3️⃣ Simpan ke database lebih awal agar bisa ditemukan saat generate metadata
+      nft.txSignature = mintSignature;
+      nft.owner = userKp.publicKey.toBase58();
+      nft.isSell = false;
+      nft.price = 0;
+      await nft.save();
+      await Nft.findByIdAndUpdate(nft._id, { mintAddress });
+
+      // === 4️⃣ Generate metadata setelah NFT tersimpan
+      const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
+      if (!metadataResult.success) throw new Error(`Metadata generation failed: ${metadataResult.error}`);
+
+      fs.writeFileSync(filePath, JSON.stringify(metadataResult.metadata, null, 2));
+      console.log(`✅ Metadata for NFT ${mintAddress} saved to ${filePath}`);
+
+      const metadataUri = `https://api.universeofgamers.io/api/nft/${mintAddress}/metadata`;
+
+      // (Optional) — bisa update metadata URI on-chain lewat metode updateMetadataUri()
+      // await updateNftMetadataUri(mintAddress, metadataUri, userKp);
+
+      // === 5️⃣ Response sukses
+      res.json({
+        message: "🎲 Gatcha success!",
+        rewardInfo,
+        blueprint,
+        nft,
+        metadata: {
+          path: filePath,
+          metadata: metadataResult.metadata,
+        },
+        mintAddress,
+        signature: mintSignature,
+        paymentSignature,
+        listing,
+        costs: {
+          priceAmount,
+          paymentMint,
+        },
+      });
+
+    } catch (err: any) {
+      console.error("❌ Gatcha failed:", err);
+
+      // === Rollback otomatis
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        if (nft && nft._id) await Nft.findByIdAndDelete(nft._id);
+      } catch (rollbackErr: any) {
+        console.warn("⚠️ Rollback warning:", rollbackErr.message);
+      }
+
+      res.status(500).json({
+        error: "Payment or mint transaction failed",
+        details: err.message,
+      });
+    }
+
   } catch (err: any) {
     console.error("❌ Gatcha error:", err);
     res.status(500).json({ error: err.message });

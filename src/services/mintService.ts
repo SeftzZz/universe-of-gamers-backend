@@ -19,7 +19,8 @@ import {
   getAccount,
   getAssociatedTokenAddress,
   getOrCreateAssociatedTokenAccount,
-  getMint
+  getMint,
+  createTransferInstruction
 } from "@solana/spl-token";
 
 import {
@@ -150,14 +151,12 @@ export async function buildMintTransaction(
   );
 
   const sellerPk = new PublicKey(owner);
-
-  // === Hitung harga ===
   const useSol = paymentMint === "So11111111111111111111111111111111111111111";
   let decimals = 0;
 
-  if(!useSol) {
+  if (!useSol) {
     const mintInfo = await getMint(connection, new PublicKey(paymentMint));
-    const decimals = mintInfo.decimals;
+    decimals = mintInfo.decimals;
   }
 
   const priceUnits = useSol
@@ -166,15 +165,12 @@ export async function buildMintTransaction(
 
   console.log("💰 price input:", metadata.price, "→ priceUnits:", priceUnits, "useSol:", useSol);
 
-  // === Mint baru (pakai mintKp yang sudah digenerate di pull) ===
-  const mintPk = mintKp.publicKey;
-
   // === PDAs ===
-  const [listingPda] = PublicKey.findProgramAddressSync([Buffer.from("listing"), mintPk.toBuffer()], program.programId);
-  const [escrowSignerPda] = PublicKey.findProgramAddressSync([Buffer.from("escrow_signer"), mintPk.toBuffer()], program.programId);
+  const [listingPda] = PublicKey.findProgramAddressSync([Buffer.from("listing"), mintKp.publicKey.toBuffer()], program.programId);
+  const [escrowSignerPda] = PublicKey.findProgramAddressSync([Buffer.from("escrow_signer"), mintKp.publicKey.toBuffer()], program.programId);
   const [marketConfigPda] = PublicKey.findProgramAddressSync([Buffer.from("market_config")], program.programId);
   const [treasuryPda] = PublicKey.findProgramAddressSync([Buffer.from("treasury")], program.programId);
-  const [mintAuthPda] = PublicKey.findProgramAddressSync([Buffer.from("mint_auth"), mintPk.toBuffer()], program.programId);
+  const [mintAuthPda] = PublicKey.findProgramAddressSync([Buffer.from("mint_auth"), mintKp.publicKey.toBuffer()], program.programId);
 
   const mc: any = await program.account.marketConfig.fetch(marketConfigPda);
   console.log("market_config:", {
@@ -182,25 +178,79 @@ export async function buildMintTransaction(
     tradeFeeBps: mc.tradeFeeBps.toString(),
     relistFeeBps: mc.relistFeeBps.toString(),
     treasuryBump: mc.treasuryBump,
-    admin: mc.admin.toBase58()
+    admin: mc.admin.toBase58(),
   });
 
   // === Metadata PDA ===
   const [metadataPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintPk.toBuffer()],
+    [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintKp.publicKey.toBuffer()],
     METADATA_PROGRAM_ID
   );
   const royaltyBps = Math.floor((metadata.royalty || 0) * 100);
 
   // === ATAs ===
-  const sellerNftAta = getAssociatedTokenAddressSync(mintPk, sellerPk);
-
+  const sellerNftAta = getAssociatedTokenAddressSync(mintKp.publicKey, sellerPk);
   let ataIxs: TransactionInstruction[] = [];
   let treasuryPaymentAta = SystemProgram.programId;
-  let sellerPaymentAta = sellerPk; // 👈 tambahkan ini
+  let sellerPaymentAta = sellerPk;
+
+  // =============== 💸 STEP 1: PAYMENT ===============
+  console.log("💸 Starting payment to treasury...");
+  let paymentSig = "";
+  if (useSol) {
+    // === SOL payment ===
+    const balance = await connection.getBalance(userKp.publicKey);
+    if (balance < priceUnits) {
+      throw new Error(`Insufficient SOL balance: ${balance / LAMPORTS_PER_SOL} SOL`);
+    }
+
+    const txPay = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: userKp.publicKey,
+        toPubkey: treasuryPda,
+        lamports: priceUnits,
+      })
+    );
+
+    txPay.feePayer = userKp.publicKey;
+    txPay.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    txPay.partialSign(userKp);
+
+    paymentSig = await connection.sendRawTransaction(txPay.serialize());
+    await connection.confirmTransaction(paymentSig, "confirmed");
+    console.log("✅ SOL Payment confirmed:", paymentSig);
+
+  } else {
+    // === SPL token payment (UOG, etc) ===
+    const fromAta = await getAssociatedTokenAddress(new PublicKey(paymentMint), userKp.publicKey);
+    const toAta = await getAssociatedTokenAddress(new PublicKey(paymentMint), treasuryPda, true);
+
+    const tokenAccount = await getAccount(connection, fromAta);
+    const bal = Number(tokenAccount.amount);
+    if (bal < priceUnits) {
+      throw new Error(`Insufficient token balance: ${bal / 10 ** decimals}`);
+    }
+
+    const ixPay = createTransferInstruction(
+      fromAta,
+      toAta,
+      userKp.publicKey,
+      priceUnits
+    );
+    const txPay = new Transaction().add(ixPay);
+    txPay.feePayer = userKp.publicKey;
+    txPay.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    txPay.partialSign(userKp);
+
+    paymentSig = await connection.sendRawTransaction(txPay.serialize());
+    await connection.confirmTransaction(paymentSig, "confirmed");
+    console.log("✅ SPL Payment confirmed:", paymentSig);
+  }
+
+  // =============== 🪙 STEP 2: MINT NFT (setelah payment sukses) ===============
+  console.log("🎯 Proceeding to mint NFT...");
 
   if (!useSol) {
-    // SPL token
     const sellerRes = await ensureAtaExists(connection, new PublicKey(paymentMint), sellerPk, userKp.publicKey);
     sellerPaymentAta = sellerRes.ata;
     if (sellerRes.ix) ataIxs.push(sellerRes.ix);
@@ -214,41 +264,22 @@ export async function buildMintTransaction(
       treasuryPaymentAta: treasuryPaymentAta.toBase58(),
     });
   } else {
-    // SOL payment
-    sellerPaymentAta = sellerPk; // ✅ untuk mut constraint, pakai seller sebagai placeholder writable
-    treasuryPaymentAta = treasuryPda; // ✅ biasanya treasury PDA langsung
-    console.log("📌 ATAs (SOL):", {
-      sellerPaymentAta: sellerPaymentAta.toBase58(),
-      treasuryPaymentAta: treasuryPaymentAta.toBase58(),
-    });
-  }
-
-  // === Pre-balance check Treasury ===
-  let treasuryPreLamports = 0;
-  let treasuryPreTokenBalance = 0;
-
-  if (useSol) {
-    treasuryPreLamports = await connection.getBalance(treasuryPda);
-    console.log("💰 Treasury SOL balance (pre):", treasuryPreLamports / anchor.web3.LAMPORTS_PER_SOL, "SOL");
-  } else {
-    const bal = await connection.getTokenAccountBalance(treasuryPaymentAta);
-    treasuryPreTokenBalance = parseInt(bal.value.amount);
-    console.log("💰 Treasury SPL balance (pre):", bal.value.uiAmountString, `(${decimals} decimals)`);
+    sellerPaymentAta = sellerPk;
+    treasuryPaymentAta = treasuryPda;
   }
 
   // === Create Mint Account + Init ===
   const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
   const createMintIx = SystemProgram.createAccount({
     fromPubkey: userKp.publicKey,
-    newAccountPubkey: mintPk,
+    newAccountPubkey: mintKp.publicKey,
     space: MINT_SIZE,
     lamports,
     programId: TOKEN_PROGRAM_ID,
   });
-  const initMintIx = createInitializeMintInstruction(mintPk, 0, mintAuthPda, null);
-  const createSellerNftAtaIx = createAssociatedTokenAccountInstruction(userKp.publicKey, sellerNftAta, sellerPk, mintPk);
+  const initMintIx = createInitializeMintInstruction(mintKp.publicKey, 0, mintAuthPda, null);
+  const createSellerNftAtaIx = createAssociatedTokenAccountInstruction(userKp.publicKey, sellerNftAta, sellerPk, mintKp.publicKey);
 
-  // === mintAndList tx langsung ===
   const txMintList = await program.methods
     .mintAndList(
       new anchor.BN(priceUnits),
@@ -262,7 +293,7 @@ export async function buildMintTransaction(
       listing: listingPda,
       escrowSigner: escrowSignerPda,
       seller: sellerPk,
-      mint: mintPk,
+      mint: mintKp.publicKey,
       sellerNftAta,
       mintAuthority: mintAuthPda,
       treasuryPda,
@@ -290,29 +321,17 @@ export async function buildMintTransaction(
 
   tx.feePayer = userKp.publicKey;
   tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-
   tx.partialSign(mintKp, userKp);
 
-  const sig = await connection.sendRawTransaction(tx.serialize());
-  await connection.confirmTransaction(sig, "confirmed");
+  const sigMint = await connection.sendRawTransaction(tx.serialize());
+  await connection.confirmTransaction(sigMint, "confirmed");
 
-  console.log("✅ mint_and_list confirmed:", sig);
-
-  // === Post-balance check Treasury ===
-  if (useSol) {
-    const treasuryPostLamports = await connection.getBalance(treasuryPda);
-    console.log("💰 Treasury SOL balance (post):", treasuryPostLamports / anchor.web3.LAMPORTS_PER_SOL, "SOL");
-    console.log("💰 Fee diff (SOL):", (treasuryPostLamports - treasuryPreLamports) / anchor.web3.LAMPORTS_PER_SOL, "SOL");
-  } else {
-    const bal = await connection.getTokenAccountBalance(treasuryPaymentAta);
-    const treasuryPostTokenBalance = parseInt(bal.value.amount);
-    console.log("💰 Treasury SPL balance (post):", bal.value.uiAmountString, `(${decimals} decimals)`);
-    console.log("💰 Fee diff (SPL):", (treasuryPostTokenBalance - treasuryPreTokenBalance) / 10 ** decimals, "tokens");
-  }
+  console.log("✅ mint_and_list confirmed:", sigMint);
 
   return {
-    signature: sig,
-    mint: mintPk.toBase58(),
+    paymentSignature: paymentSig,
+    mintSignature: sigMint,
+    mint: mintKp.publicKey.toBase58(),
     listing: listingPda.toBase58(),
   };
 }
