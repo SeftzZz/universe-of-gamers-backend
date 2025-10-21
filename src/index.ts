@@ -20,6 +20,7 @@ import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1);
 
 /* 🌐 === CORS Configuration === */
 const allowedOrigins = [
@@ -27,11 +28,14 @@ const allowedOrigins = [
   "http://localhost:8100", // Ionic
   "http://localhost:4200", // Angular
   "http://localhost:5173", // Vite
+  "https://localhost", // DEV SSL
   "https://play.unity.com", // Unity
   "https://play.unity.com/en/games/71c840ea-345a-422f-bf58-77c1e6b6a17d/world-of-monsters-webgl", // WebGL Game
   "https://universeofgamers.io", // Domain utama
   "https://api.universeofgamers.io", // API
   "https://worldofmonsters.universeofgamers.io", // Game World Of Monsters
+  "https://marketplace.universeofgamers.io", // Marketplace Website
+  "https://solscan.io", // SolScan
 ];
 
 app.use(

@@ -37,6 +37,9 @@ export interface INft extends Document {
 
   isSell: boolean;
   price?: number;
+  paymentSymbol: string, // ex: SOL, USDC, BONK, UOG
+  paymentMint: string,      // optional: mint address SPL token
+
   txSignature?: string;
   createdAt: Date;
   updatedAt: Date;
@@ -77,6 +80,9 @@ const NftSchema = new Schema<INft>(
 
     isSell: { type: Boolean, default: false },
     price: { type: Number, default: 0 },
+    paymentSymbol: { type: String, default: "SOL" }, // ex: SOL, USDC, BONK, UOG
+    paymentMint: { type: String, default: "" },      // optional: mint address SPL token
+
     txSignature: { type: String },
   },
   { collection: "nfts", timestamps: true }

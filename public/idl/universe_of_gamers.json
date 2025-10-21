@@ -34,10 +34,6 @@
         {
           "name": "tradeFeeBps",
           "type": "u16"
-        },
-        {
-          "name": "relistFeeBps",
-          "type": "u16"
         }
       ]
     },
@@ -184,76 +180,11 @@
       ]
     },
     {
-      "name": "relistNft",
-      "accounts": [
-        {
-          "name": "listing",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "seller",
-          "isMut": true,
-          "isSigner": true
-        },
-        {
-          "name": "treasuryPda",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "paymentMint",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "treasuryTokenAccount",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "sellerPaymentAta",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "marketConfig",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "tokenProgram",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "systemProgram",
-          "isMut": false,
-          "isSigner": false
-        }
-      ],
-      "args": [
-        {
-          "name": "newPrice",
-          "type": "u64"
-        },
-        {
-          "name": "useSol",
-          "type": "bool"
-        }
-      ]
-    },
-    {
       "name": "buyNft",
       "accounts": [
         {
           "name": "listing",
           "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "escrowSigner",
-          "isMut": false,
           "isSigner": false
         },
         {
@@ -263,21 +194,6 @@
         },
         {
           "name": "seller",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "treasuryPda",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "paymentMint",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "treasuryTokenAccount",
           "isMut": true,
           "isSigner": false
         },
@@ -292,7 +208,17 @@
           "isSigner": false
         },
         {
-          "name": "buyerNftAta",
+          "name": "treasuryTokenAccount",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "treasuryPda",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "escrowTemp",
           "isMut": true,
           "isSigner": false
         },
@@ -302,7 +228,17 @@
           "isSigner": false
         },
         {
+          "name": "buyerNftAta",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "marketConfig",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "escrowSigner",
           "isMut": true,
           "isSigner": false
         },
@@ -333,12 +269,43 @@
           "isSigner": false
         },
         {
+          "name": "mint",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "SPL mint (UOG, USDC, dll) atau So111..."
+          ]
+        },
+        {
+          "name": "treasuryTokenAccount",
+          "isMut": true,
+          "isSigner": false,
+          "isOptional": true,
+          "docs": [
+            "Token account treasury_pda"
+          ]
+        },
+        {
+          "name": "adminTokenAccount",
+          "isMut": true,
+          "isSigner": false,
+          "isOptional": true,
+          "docs": [
+            "Token account admin"
+          ]
+        },
+        {
           "name": "admin",
           "isMut": true,
           "isSigner": true
         },
         {
           "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "tokenProgram",
           "isMut": false,
           "isSigner": false
         }
@@ -371,10 +338,6 @@
         },
         {
           "name": "newTradeFeeBps",
-          "type": "u16"
-        },
-        {
-          "name": "newRelistFeeBps",
           "type": "u16"
         },
         {
@@ -496,6 +459,56 @@
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "relistNft",
+      "accounts": [
+        {
+          "name": "listing",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "newOwner",
+          "isMut": true,
+          "isSigner": true
+        },
+        {
+          "name": "mint",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "sellerNftAta",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "escrowSigner",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "newPrice",
+          "type": "u64"
+        },
+        {
+          "name": "useSol",
+          "type": "bool"
+        }
+      ]
     }
   ],
   "accounts": [
@@ -545,10 +558,6 @@
             "type": "u16"
           },
           {
-            "name": "relistFeeBps",
-            "type": "u16"
-          },
-          {
             "name": "treasuryBump",
             "type": "u8"
           }
@@ -560,17 +569,27 @@
     {
       "code": 6000,
       "name": "InvalidPrice",
-      "msg": "Invalid price"
+      "msg": "Invalid Price"
     },
     {
       "code": 6001,
       "name": "FeeTooHigh",
-      "msg": "Fee too high"
+      "msg": "Fee too High"
     },
     {
       "code": 6002,
       "name": "InvalidOwner",
       "msg": "Invalid Owner"
+    },
+    {
+      "code": 6003,
+      "name": "MissingAccount",
+      "msg": "Missing Account"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidNFT",
+      "msg": "Invalid NFT"
     }
   ]
 }

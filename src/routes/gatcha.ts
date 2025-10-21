@@ -311,7 +311,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
 
     try {
       // === 1️⃣ Bayar + Mint (langsung dari buildMintTransaction)
-      const { paymentSignature, mintSignature, mint, listing } = await buildMintTransaction(
+      const { mintSignature, mint, listing } = await buildMintTransaction(
         custodian.address,
         {
           name: nft.name,
@@ -327,7 +327,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
 
       if (!mintSignature) throw new Error("Mint transaction failed");
 
-      console.log("✅ Payment + Mint confirmed:", { paymentSignature, mintSignature });
+      console.log("✅ Payment + Mint confirmed:", { mintSignature });
 
       // === 3️⃣ Simpan ke database lebih awal agar bisa ditemukan saat generate metadata
       nft.txSignature = mintSignature;
@@ -361,7 +361,6 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
         },
         mintAddress,
         signature: mintSignature,
-        paymentSignature,
         listing,
         costs: {
           priceAmount,

@@ -33,6 +33,7 @@ import {
 import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
 import { BN } from "bn.js";
+import BigNumber from "bignumber.js";
 import axios from "axios";
 import dotenv from "dotenv";
 import { getTokenInfo } from "../services/priceService";
@@ -52,6 +53,7 @@ import { Nft } from "../models/Nft";
 import { PendingTx } from "../models/PendingTx";
 const fs = require("fs");
 import { Client } from "@solana-tracker/data-api";
+import { broadcast } from "../index";
 
 dotenv.config();
 const router = Router();
@@ -485,11 +487,20 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       const percentChange = t.events?.["24h"]?.priceChangePercentage ?? 0;
       const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
 
+      // ✅ Ganti mint WSOL → native SOL agar disatukan
+      const mint =
+        t.token.mint === "So11111111111111111111111111111111111111112"
+          ? "So11111111111111111111111111111111111111111"
+          : t.token.mint;
+
       return {
-        mint: t.token.mint,
-        name: t.token.name,
-        symbol: t.token.symbol,
-        logoURI: t.token.image,
+        mint,
+        name: mint === "So11111111111111111111111111111111111111111" ? "Solana" : t.token.name,
+        symbol: mint === "So11111111111111111111111111111111111111111" ? "SOL" : t.token.symbol,
+        logoURI:
+          mint === "So11111111111111111111111111111111111111111"
+            ? "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png"
+            : t.token.image,
         decimals: t.token.decimals,
         amount: t.balance,
         priceUsd: parseFloat(priceUsd.toFixed(6)),
@@ -504,7 +515,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
 
     // 6️⃣ Merge token hasil API + DB + Default
     const defaults = await getDefaultTokens();
-    const mergedTokens = [
+    let mergedTokens = [
       ...apiTokens,
       ...dbTokens.filter((d: any) => !apiTokens.find((x: any) => x.mint === d.mint)),
       ...defaults.filter(
@@ -514,18 +525,59 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       ),
     ];
 
-    // 7️⃣ Update database dengan data terbaru
-    await Promise.all(
-      mergedTokens.map((t: any) =>
-        WalletToken.findOneAndUpdate(
-          { address, mint: t.mint },
-          { ...t, address, lastUpdated: new Date() },
-          { upsert: true, new: true }
-        )
-      )
+    // ✅ Gabungkan native SOL & Wrapped SOL jika keduanya ada
+    const SOL_MINT = "So11111111111111111111111111111111111111111";
+    const solVariants = mergedTokens.filter((t) =>
+      ["So11111111111111111111111111111111111111111", "So11111111111111111111111111111111111111112"].includes(t.mint)
     );
 
+    if (solVariants.length > 1) {
+      const totalAmount = solVariants.reduce((sum, t) => sum + (t.amount ?? 0), 0);
+      const totalUsdValue = solVariants.reduce((sum, t) => sum + (t.usdValue ?? 0), 0);
+      const base = solVariants.find((t) => t.mint === SOL_MINT) ?? solVariants[0];
+
+      const unifiedSol = {
+        ...base,
+        amount: parseFloat(totalAmount.toFixed(6)),
+        usdValue: parseFloat(totalUsdValue.toFixed(2)),
+        mint: SOL_MINT,
+        name: "Solana",
+        symbol: "SOL",
+      };
+
+      if (!base.priceUsd || base.priceUsd === 0) {
+        try {
+          const coingecko = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+          const solPrice = (await coingecko.json()).solana.usd;
+          unifiedSol.priceUsd = solPrice;
+          unifiedSol.usdValue = parseFloat((totalAmount * solPrice).toFixed(2));
+        } catch (e: any) {
+          console.warn("⚠️ Failed to fetch SOL price fallback:", e.message);
+        }
+      }
+
+      // Hapus WSOL & SOL lama → tambahkan hasil gabungan
+      mergedTokens = mergedTokens.filter(
+        (t) =>
+          !["So11111111111111111111111111111111111111111", "So11111111111111111111111111111111111111112"].includes(
+            t.mint
+          )
+      );
+      mergedTokens.unshift(unifiedSol);
+    }
+
     console.log(`✅ Returning ${mergedTokens.length} tokens for ${address}`);
+
+    broadcast({
+      type: "tokens-update",
+      address,
+      tokens: mergedTokens,
+      total: mergedTokens.reduce((s, t) => s + (t.usdValue ?? 0), 0),
+      totalSol: mergedTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+      source: "api+db",
+      timestamp: new Date().toISOString(),
+    });
+
     res.json({
       address,
       tokens: mergedTokens,
@@ -533,6 +585,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       totalSol: mergedTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
       source: "api+db",
     });
+
   } catch (err: any) {
     console.error("❌ Error fetching wallet:", err);
     res.status(500).json({ error: err.message });
@@ -624,9 +677,12 @@ router.get("/trending", async (req: Request, res: Response) => {
       })
     );
 
+    // ✅ tampilkan hanya 10 token teratas
+    const limitedTokens = tokens.slice(0, 10);
+
     res.json({
-      tokens,
-      total: tokens.length,
+      tokens: limitedTokens,
+      total: limitedTokens.length,
       totalSol: 0,
     });
   } catch (err: any) {
@@ -891,7 +947,7 @@ router.post("/send/sign", authenticateJWT, async (req: AuthRequest, res) => {
     if (!authUser) return res.status(404).json({ error: "User not found" });
 
     // 🔍 Log debug custodial wallets
-    console.log("🔍 Custodial wallets for user:", JSON.stringify(authUser.custodialWallets, null, 2));
+    // console.log("🔍 Custodial wallets for user:", JSON.stringify(authUser.custodialWallets, null, 2));
     console.log("🔍 Searching wallet:", wallet);
 
     // 🔎 Cari wallet secara case-insensitive dan normalisasi provider
@@ -979,13 +1035,27 @@ router.post("/send/manual-sign", authenticateJWT, async (req: AuthRequest, res) 
 
     // 4️⃣ Deserialize transaction & tanda tangan
     const txBuffer = Buffer.from(txDoc.txBase64, "base64");
-    const tx = anchor.web3.Transaction.from(txBuffer);
-    console.log("🧱 Transaction decoded. Instruction count:", tx.instructions.length);
+    let signedTx: string;
 
-    tx.partialSign(signer);
-    const signedTx = tx.serialize().toString("base64");
+    try {
+      const vtx = VersionedTransaction.deserialize(txBuffer);
+      console.log("🧱 Transaction type: Versioned (v0)");
+      console.log("   Instruction count:", vtx.message.compiledInstructions.length);
 
-    // 5️⃣ Update database
+      vtx.sign([signer]);
+      signedTx = Buffer.from(vtx.serialize()).toString("base64");
+
+    } catch (versionedErr) {
+      console.warn("⚠️ Not a versioned transaction, trying legacy format...");
+
+      const legacyTx = anchor.web3.Transaction.from(txBuffer);
+      console.log("🧱 Transaction type: Legacy");
+      console.log("   Instruction count:", legacyTx.instructions.length);
+
+      legacyTx.partialSign(signer);
+      signedTx = legacyTx.serialize().toString("base64");
+    }
+
     txDoc.status = "signed";
     txDoc.signedTx = signedTx;
     txDoc.signedAt = new Date();
@@ -1098,62 +1168,57 @@ router.post("/swap/quote", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "from, fromMint, toMint, amount required" });
     }
 
-    // ✅ Normalize dummy SOL → WSOL
-    const normalizeMint = (mint: string) => mint === DUMMY_SOL_MINT ? SOL_MINT : mint;
-
+    const normalizeMint = (mint: string) =>
+      mint === "So11111111111111111111111111111111111111111"
+        ? "So11111111111111111111111111111111111111112"
+        : mint;
     fromMint = normalizeMint(fromMint);
     toMint = normalizeMint(toMint);
 
-    console.log("📩 [SWAP QUOTE] Request received");
-    console.log("   🔑 From    :", from);
-    console.log("   🪙 FromMint:", fromMint);
-    console.log("   🪙 ToMint  :", toMint);
-    console.log("   💰 Amount (UI):", amount);
+    console.log("===============================================");
+    console.log(`📩 [SWAP QUOTE - Raydium] Request received at ${new Date().toISOString()}`);
+    console.log("   🔑 From wallet :", from);
+    console.log("   🪙 FromMint    :", fromMint);
+    console.log("   🪙 ToMint      :", toMint);
+    console.log("   💰 UI Amount   :", amount);
 
+    // === Get decimals from mint
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
-
-    // === cek decimals untuk input
     let inputDecimals = 9;
-    if (fromMint !== SOL_MINT) {
+    try {
       const mintInfo = await getMint(connection, new PublicKey(fromMint));
       inputDecimals = mintInfo.decimals;
+    } catch {
+      console.warn("⚠️ Failed to fetch mint decimals, fallback to 9");
     }
 
-    // === cek decimals untuk output (opsional)
-    let outputDecimals = 9;
-    if (toMint !== SOL_MINT) {
-      const mintInfo = await getMint(connection, new PublicKey(toMint));
-      outputDecimals = mintInfo.decimals;
-    }
+    const rawAmount = Math.floor(amount * 10 ** inputDecimals);
+    console.log("   💰 Raw amount:", rawAmount);
 
-    // konversi ke raw integer (lamports/token units)
-    const rawAmount = BigInt(Math.floor(amount * 10 ** inputDecimals));
-    console.log("   💰 Amount raw:", rawAmount.toString());
-
-    // request quote ke DFLOW (pakai normalized mint!)
-    const { data: quote } = await axios.get("https://quote-api.dflow.net/intent", {
+    // === Call Raydium route API
+    console.log("🌐 Calling Raydium /swap/route ...");
+    const { data: rayRoute } = await axios.get("https://api-v3.raydium.io/swap/route", {
       params: {
-        userPublicKey: from,
         inputMint: fromMint,
         outputMint: toMint,
-        amount: rawAmount.toString(),
-        slippageBps: 50,
-        wrapAndUnwrapSol: true,
+        amount: rawAmount,
+        slippage: 0.5,
       },
     });
 
-    if (!quote?.openTransaction) throw new Error("❌ Missing openTransaction from DFLOW");
+    if (!rayRoute?.routePlan?.length)
+      throw new Error("❌ No route found from Raydium /swap/route");
 
-    console.log("✅ Quote received");
-    console.log("   InAmount   :", quote.inAmount);
-    console.log("   OutAmount  :", quote.outAmount);
-    console.log("   MinOutAmt  :", quote.minOutAmount);
+    console.log("✅ Route received from Raydium");
+    console.log("   OutAmount:", rayRoute.outAmount);
+    console.log("   MinOutAmount:", rayRoute.minOutAmount);
 
     res.json({
-      inAmount: quote.inAmount,
-      outAmount: quote.outAmount,
-      minOutAmount: quote.minOutAmount,
-      openTransaction: quote.openTransaction,
+      source: "Raydium",
+      routePlan: rayRoute.routePlan,
+      inAmount: rawAmount,
+      outAmount: rayRoute.outAmount,
+      minOutAmount: rayRoute.minOutAmount,
     });
   } catch (err: any) {
     console.error("❌ swap/quote error:", err.response?.data || err.message);
@@ -1166,94 +1231,37 @@ router.post("/swap/quote", async (req: Request, res: Response) => {
 //
 router.post("/swap/build", async (req: Request, res: Response) => {
   try {
-    const { from, openTransaction, toMint, outAmount, fromMint, inAmount } = req.body;
-    if (!from || !openTransaction || !fromMint || !inAmount) {
-      return res.status(400).json({ error: "from, openTransaction, fromMint, inAmount required" });
+    const { from, routePlan } = req.body;
+    if (!from || !routePlan) {
+      return res.status(400).json({ error: "from and routePlan required" });
     }
 
-    console.log("📩 [SWAP BUILD] Request received");
-
+    console.log("📩 [SWAP BUILD - Raydium] Request received");
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
-    const fromPubkey = new PublicKey(from);
-    const fromMintPublicKey = new PublicKey(fromMint);
-    const outputMint = new PublicKey(toMint);
 
-    // Validate user balances
-    await validateUserBalances(connection, fromPubkey, fromMintPublicKey, inAmount, outputMint);
+    console.log("   🔑 From wallet:", from);
+    console.log("   🔁 RoutePlan length:", routePlan.length);
 
-    // Load program and parse transaction
-    const { programUog, aggIx, metas: baseMetas, ixData } = await loadProgramAndParseTransaction(
-      connection,
-      openTransaction,
-      fromPubkey
+    // === Build transaction via Raydium
+    const { data: txData } = await axios.post(
+      "https://api-v3.raydium.io/swap/transaction",
+      {
+        routePlan,
+        userPublicKey: from,
+        wrapAndUnwrapSol: true,
+        computeUnitPriceMicroLamports: 150,
+      }
     );
 
-    // Get PDAs
-    const [marketConfigPda, treasuryPda] = await getProgramDerivedAddresses(programUog);
+    if (!txData?.tx) throw new Error("❌ No transaction returned from Raydium");
 
-    // Prepare token accounts and instructions
-    const {
-      userInTokenAccount,
-      userOutTokenAccount,
-      treasuryTokenAccount,
-      preInstructions,
-      extraPostInstructions
-    } = await prepareTokenAccountsAndInstructions(
-      connection,
-      fromPubkey,
-      fromMintPublicKey,   // ✅ input mint
-      inAmount,            // ✅ amount input
-      outputMint,          // ✅ output mint
-      treasuryPda,
-      programUog,
-      marketConfigPda,
-      outAmount
-    );
-
-    // 🔎 Final metas (gabung aggregator + akun wajib UOG)
-    const metas = [
-      ...baseMetas,
-      { pubkey: fromPubkey, isSigner: true, isWritable: false },           // user wallet
-      { pubkey: treasuryPda, isSigner: false, isWritable: false },         // treasury PDA
-      { pubkey: treasuryTokenAccount, isSigner: false, isWritable: true }, // treasury ATA
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-    ];
-
-    console.log("🔎 Remaining metas:", metas.map(m => m.pubkey.toBase58()));
-
-    // Build the main swap instruction
-    const ix = await buildSwapInstruction(
-      programUog,
-      ixData,
-      fromPubkey,
-      aggIx.programId,
-      marketConfigPda,
-      treasuryPda,
-      outputMint,
-      treasuryTokenAccount,
-      userOutTokenAccount,
-      metas,
-      inAmount
-    );
-
-    // Build and finalize transaction
-    const txOut = await buildFinalTransaction(
-      connection,
-      fromPubkey,
-      preInstructions,
-      ix,
-      extraPostInstructions,
-      userInTokenAccount,
-      userOutTokenAccount,
-      treasuryTokenAccount,
-      treasuryPda
-    );
-
-    const serialized = txOut.serialize({ requireAllSignatures: false });
-    res.json({ tx: serialized.toString("base64") });
+    console.log("✅ Final Raydium transaction built");
+    res.json({
+      source: "Raydium",
+      tx: txData.tx,
+    });
   } catch (err: any) {
-    console.error("❌ swap/build error:", err.message, err.stack);
+    console.error("❌ swap/build error:", err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1320,18 +1328,32 @@ async function validateUserBalances(
 }
 
 /**
- * Load UOG program and parse DFLOW transaction
+ * Inject real inAmount ke DFLOW ixData (Anchor format)
+ */
+function patchDflowIxData(ixData: Buffer, newInAmount: bigint): Buffer {
+  const patched = Buffer.from(ixData);
+
+  // Anchor discriminator panjangnya 8 byte → tulis setelah itu
+  const offset = 8; // <--- ganti dari 1 ke 8
+  patched.writeBigUInt64LE(newInAmount, offset);
+
+  console.log(`✅ Patched DFLOW amount di offset ${offset}:`, newInAmount.toString());
+  return patched;
+}
+
+/**
+ * Load UOG program & parse DFLOW tx, lalu patch ixData dengan inAmount
  */
 async function loadProgramAndParseTransaction(
   connection: Connection,
   openTransaction: string,
-  fromPubkey: PublicKey
+  fromPubkey: PublicKey,
+  inAmount?: string
 ): Promise<{ programUog: anchor.Program; aggIx: TransactionInstruction; metas: any[]; ixData: Buffer }> {
   const provider = new anchor.AnchorProvider(connection, {} as any, {
     preflightCommitment: "confirmed",
   });
 
-  // Load UOG marketplace IDL
   const idlUog = require("../../public/idl/universe_of_gamers.json");
   const programUog = new anchor.Program(
     idlUog,
@@ -1339,22 +1361,26 @@ async function loadProgramAndParseTransaction(
     provider
   );
 
-  // Parse DFLOW transaction
   const tx = Transaction.from(Buffer.from(openTransaction, "base64"));
-
-  // Find DFLOW instruction
-  const ixIndex = tx.instructions.findIndex(
-    (ix) => ix.programId.toBase58().startsWith("DF1o")
-  );
+  const ixIndex = tx.instructions.findIndex(ix => ix.programId.toBase58().startsWith("DF1o"));
   if (ixIndex < 0) throw new Error("❌ DFLOW instruction not found in tx");
 
   const aggIx = tx.instructions[ixIndex];
+  let ixData = aggIx.data;
+
+  console.log("🔹 DFLOW ixData sebelum patch:", ixData.toString("hex").slice(0, 40) + "...");
+
+  if (inAmount) {
+    const newAmount = BigInt(inAmount);
+    ixData = patchDflowIxData(ixData, newAmount);
+    console.log("🔹 DFLOW ixData sesudah patch:", ixData.toString("hex").slice(0, 40) + "...");
+  }
+
   const metas = [
-    ...aggIx.keys,   // aggregator accounts
+    ...aggIx.keys,
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
   ];
-  const ixData = aggIx.data;
 
   return { programUog, aggIx, metas, ixData };
 }
@@ -1793,54 +1819,95 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
 
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const txBuffer = Buffer.from(signedTx, "base64");
-
-    // 🔎 Debug panjang buffer tx
     console.log("   signedTx length:", txBuffer.length, "bytes");
 
-    // 🔎 Decode transaction untuk debug
+    // =========================================================
+    // ✅ Decode Transaction (Versioned / Legacy)
+    // =========================================================
+    let isVersioned = false;
     try {
-      // coba sebagai VersionedTransaction
+      const vtx = VersionedTransaction.deserialize(txBuffer);
+      isVersioned = true;
+      console.log("🧱 Transaction type: Versioned (v0)");
+      console.log("   Account keys:");
+      vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) => {
+        console.log(`     [${i}] ${key.toBase58()}`);
+      });
+      console.log("   Instruction count:", vtx.message.compiledInstructions.length);
+
+      // Tambahkan deteksi program
+      const programs = new Set(
+        vtx.message.compiledInstructions.map(ix =>
+          vtx.message.staticAccountKeys[ix.programIdIndex].toBase58()
+        )
+      );
+      console.log("📦 Program IDs inside TX:", Array.from(programs));
+    } catch {
       try {
-        const vtx = VersionedTransaction.deserialize(txBuffer);
-        console.log("   Transaction account keys (Versioned):");
-        vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) => {
-          console.log(`     [${i}] ${key.toBase58()}`);
-        });
-        console.log("   Instructions count:", vtx.message.compiledInstructions.length);
-      } catch {
-        // fallback: Transaction legacy
-        const tx: Transaction = Transaction.from(txBuffer);
-        console.log("   Transaction account keys (Legacy):");
-        (tx as any).message.accountKeys.forEach((key: PublicKey, i: number) => {
-          console.log(`     [${i}] ${key.toBase58()}`);
-        });
-        console.log("   Instructions count:", tx.instructions.length);
-      }
-    } catch (decodeErr: unknown) {
-      if (decodeErr instanceof Error) {
-        console.warn("   ⚠️ Failed to decode transaction for debug:", decodeErr.message);
-      } else {
-        console.warn("   ⚠️ Failed to decode transaction for debug (unknown error).");
+        const tx = Transaction.from(txBuffer);
+        console.log("🧱 Transaction type: Legacy");
+        tx.instructions.forEach((ix, i) =>
+          console.log(`     [${i}] ${ix.programId.toBase58()}`)
+        );
+        console.log("   Instruction count:", tx.instructions.length);
+      } catch (decodeErr) {
+        console.warn("⚠️ Failed to decode transaction:", decodeErr);
       }
     }
 
+    // =========================================================
+    // ✅ Simulate Transaction sebelum broadcast
+    // =========================================================
+    try {
+      let sim;
+
+      if (isVersioned) {
+        const vtx = VersionedTransaction.deserialize(txBuffer);
+        sim = await connection.simulateTransaction(vtx, {
+          sigVerify: true,
+          replaceRecentBlockhash: true,
+        });
+      } else {
+        const legacyTx = Transaction.from(txBuffer);
+        // untuk legacy transaction, cukup panggil tanpa config
+        sim = await connection.simulateTransaction(legacyTx);
+      }
+
+      if (sim.value.err) {
+        console.error("❌ Simulation failed:", sim.value.err);
+        if (sim.value.logs) {
+          console.log("📜 Simulation logs:");
+          sim.value.logs.forEach((log: string) => console.log("   ", log));
+        }
+        throw new Error("Simulation failed before sending — aborting");
+      }
+      console.log("✅ Simulation passed, proceeding to broadcast...");
+    } catch (simErr: any) {
+      console.error("⚠️ Simulation exception:", simErr.message);
+    }
+
+    // =========================================================
+    // ✅ Broadcast ke Solana
+    // =========================================================
     const sig = await sendAndConfirmRawTransaction(connection, txBuffer, {
       skipPreflight: false,
       maxRetries: 5,
     });
+    console.log("✅ Swap TX submitted:", sig);
 
-    console.log("✅ Swap TX confirmed:", sig);
-
+    // =========================================================
+    // ✅ Manual confirmation loop
+    // =========================================================
     console.log("⏳ Waiting for confirmation...");
     let confirmation;
     for (let i = 0; i < 5; i++) {
       confirmation = await connection.confirmTransaction(sig, "confirmed");
       if (confirmation.value.err == null) break;
-      console.warn(`⚠️ Retry confirm [${i+1}]...`);
-      await new Promise(r => setTimeout(r, 5000));
+      console.warn(`⚠️ Retry confirm [${i + 1}]...`);
+      await new Promise(r => setTimeout(r, 4000));
     }
-    console.log("   Confirmation:", confirmation?.value);
 
+    console.log("   Confirmation:", confirmation?.value);
     console.log("✅ Swap TX confirmed:", sig);
 
     res.json({
