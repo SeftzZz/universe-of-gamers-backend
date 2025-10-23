@@ -132,6 +132,9 @@ const CACHE_TTL = 300; // 5 menit
 // TTL (detik)
 const TTL_METADATA = 86400; // 24 jam
 const TTL_LISTING = 60;     // 1 menit
+const NFT_CACHE_KEY = "fetch-nft:list";
+const NFT_CACHE_TTL = 5; // 60 detik
+const MYNFT_CACHE_TTL = 5; // 60 detik
 
 // 🔹 Helper fetch dengan timeout
 async function fetchWithTimeout(url: string, ms = 5000) {
@@ -681,12 +684,21 @@ router.post("/", async (req: Request, res: Response) => {
 });
 
 // GET all NFTs langsung dari DB tanpa validasi on-chain
-router.get("/fetch-nft", async (req, res) => {
+router.get("/fetch-nft", async (req: Request, res: Response) => {
   try {
     console.time("⏱ fetch-nft-total");
 
+    // === 1️⃣ Cek cache Redis lebih dulu ===
+    const cached = await redis.get(NFT_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      console.log(`⚡ [Redis] Returning cached NFT list (${parsed.length} items)`);
+      console.timeEnd("⏱ fetch-nft-total");
+      return res.json(parsed); // 👈 langsung kirim array, bukan object wrapper
+    }
+
+    // === 2️⃣ Query ke MongoDB ===
     console.time("⏱ DB-find");
-    // ✅ Ambil NFT yang sedang dijual & punya txSignature valid
     const nfts = await Nft.find({
       isSell: true,
       txSignature: { $exists: true, $ne: "" },
@@ -697,15 +709,23 @@ router.get("/fetch-nft", async (req, res) => {
 
     console.log(`📦 Total NFT for sale (with txSignature): ${nfts.length}`);
 
+    // === 3️⃣ Simpan hasil ke Redis ===
+    await redis.set(
+      NFT_CACHE_KEY,
+      JSON.stringify(nfts),
+      "EX",
+      NFT_CACHE_TTL
+    );
+    console.log(`💾 [Redis] Cached ${nfts.length} NFTs for ${NFT_CACHE_TTL}s`);
+
+    // === 4️⃣ Broadcast ke client (tetap sama) ===
     broadcast({
       type: "collection-update",
-      data: {
-        nfts,
-      },
+      data: { nfts },
       timestamp: new Date().toISOString(),
     });
 
-    // ✅ Kirim hasil populate langsung
+    // === 5️⃣ Kirim hasil langsung (array mentah) ===
     res.json(nfts);
 
     console.timeEnd("⏱ fetch-nft-total");
@@ -717,10 +737,30 @@ router.get("/fetch-nft", async (req, res) => {
 
 // GET NFTs by owner (only owner can access)
 router.get("/my-nfts", authenticateJWT, async (req: AuthRequest, res) => {
+  const userId = req.user.id;
+  const cacheKey = `my-nfts:${userId}`;
+
   try {
-    const user = await Auth.findById(req.user.id).select(
-      "wallets custodialWallets"
-    );
+    console.time("⏱ my-nfts-total");
+    console.log(`\n🚀 Fetching /my-nfts for user: ${userId}`);
+
+    const forceRefresh = req.query.force === "true";
+
+    // 1️⃣ Cek Redis cache (jangan ubah struktur respon)
+    if (!forceRefresh) {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        console.log(`⚡ [Redis] Returning cached NFTs for user ${userId}`);
+        console.timeEnd("⏱ my-nfts-total");
+        return res.json(parsed); // <== struktur sama seperti hasil Nft.find()
+      }
+    } else {
+      console.log("♻️ Force refresh cache for /my-nfts");
+    }
+
+    // 2️⃣ Ambil data wallet user
+    const user = await Auth.findById(userId).select("wallets custodialWallets");
     if (!user) {
       return res.status(401).json({ error: "User not found" });
     }
@@ -734,16 +774,33 @@ router.get("/my-nfts", authenticateJWT, async (req: AuthRequest, res) => {
       return res.json([]);
     }
 
-    // ✅ populate karakter (nama, rarity, element)
+    // 3️⃣ Query NFT dari database
+    console.time("⏱ DB-find");
     const nfts = await Nft.find({
       owner: { $in: walletAddresses },
-      txSignature: { $exists: true, $ne: "" }, // filter disini
+      txSignature: { $exists: true, $ne: "" },
     })
       .populate("character", "name rarity element")
       .populate("rune", "name rarity")
-      .sort({ updatedAt: -1 });
+      .sort({ updatedAt: -1 })
+      .lean();
+    console.timeEnd("⏱ DB-find");
 
+    console.log(`📦 Found ${nfts.length} NFTs owned by user ${userId}`);
+
+    // 4️⃣ Simpan hasil ke Redis (cache raw data, tanpa ubah struktur)
+    await redis.set(
+      cacheKey,
+      JSON.stringify(nfts),
+      "EX",
+      MYNFT_CACHE_TTL
+    );
+    console.log(`💾 [Redis] Cached ${nfts.length} NFTs for user ${userId}`);
+
+    // 5️⃣ Return hasil asli (tanpa ubah struktur JSON)
     res.json(nfts);
+
+    console.timeEnd("⏱ my-nfts-total");
   } catch (err) {
     console.error("❌ Error fetching my NFTs:", err);
     res.status(500).json({ error: "Failed to fetch NFTs" });
@@ -1547,17 +1604,16 @@ router.get("/history", async (req, res) => {
  * GET NFT list history milik user login
  * GET /nft/my-history
  */
-router.get("/my-history", authenticateJWT, async (req: AuthRequest, res) => {
+router.get("/my-history", authenticateJWT, async (req: AuthRequest, res: Response) => {
   console.time("⏱ my-history-total");
   const userId = req.user.id;
 
   try {
     console.log("\n🚀 Starting /my-history fetch for user:", userId);
-
     const walletQuery = (req.query.wallet as string)?.trim();
     if (walletQuery) console.log(`🧩 Wallet override detected: ${walletQuery}`);
 
-    // === 1️⃣ Ambil wallet ===
+    // === 1️⃣ Ambil wallet addresses ===
     let walletAddresses: string[] = [];
     if (walletQuery) {
       walletAddresses = [walletQuery];
@@ -1567,17 +1623,28 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res) => {
       walletAddresses = user.wallets?.map((w) => w.address) || [];
       if (!walletAddresses.length) return res.json({ history: [] });
     }
-
     console.log(`👛 Wallets: ${walletAddresses.join(", ")}`);
 
-    // === 2️⃣ Setup connection ===
+    // === 2️⃣ Cek Redis cache ===
+    const cacheKey = `my-history:${userId}:${walletQuery || "default"}`;
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      const ageSec = (Date.now() - new Date(parsed.timestamp).getTime()) / 1000;
+      if (ageSec < CACHE_TTL) {
+        console.log(`⚡ [Redis] Returning cached /my-history for user ${userId} (${ageSec.toFixed(1)}s old)`);
+        console.timeEnd("⏱ my-history-total");
+        return res.json({ ...parsed.data, cached: true, source: "redis-cache" });
+      }
+    }
+
+    // === 3️⃣ Setup connection ===
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const programId = new PublicKey(process.env.PROGRAM_ID!);
-    const limit = pLimit(5);
     const results: any[] = [];
     const signatures: any[] = [];
 
-    // === 3️⃣ Ambil signatures ===
+    // === 4️⃣ Ambil signatures ===
     console.time("⏱ FetchSignatures");
     for (const address of walletAddresses) {
       const walletPk = new PublicKey(address);
@@ -1587,7 +1654,7 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res) => {
     console.timeEnd("⏱ FetchSignatures");
     console.log(`🧮 Total signatures: ${signatures.length}`);
 
-    // === 4️⃣ Filter transaksi MintAndList / BuyNft ===
+    // === 5️⃣ Filter transaksi MintAndList / BuyNft ===
     console.time("⏱ FilterTransactions");
     await Promise.all(
       signatures.map((sig) =>
@@ -1606,7 +1673,6 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res) => {
 
             const eventType = hasMintAndList ? "MintAndList" : "BuyNft";
 
-            // === 💰 Hitung perubahan balance (SOL) ===
             const accountKeys = tx.transaction.message.getAccountKeys().staticAccountKeys;
             const walletIndex = accountKeys.findIndex((k) => k.toBase58() === sig.wallet);
             let amountFrom = null;
@@ -1639,16 +1705,17 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res) => {
     console.timeEnd("⏱ FilterTransactions");
     console.log(`📊 Filtered ${results.length} MintAndList/BuyNft transactions`);
 
-    // === 5️⃣ Enrich mintAddress ===
+    // === 6️⃣ Enrich mint addresses ===
     console.time("⏱ EnrichMint");
     await enrichMintAddresses(results, connection, programId, walletAddresses);
     console.timeEnd("⏱ EnrichMint");
 
-    // === 6️⃣ Attach NFT model dari database ===
+    // === 7️⃣ Attach NFT model data ===
     console.time("⏱ AttachModels");
     await attachNftModel(results);
     console.timeEnd("⏱ AttachModels");
 
+    // === 8️⃣ Final data
     const responseData = {
       cached: false,
       totalWallets: walletAddresses.length,
@@ -1657,22 +1724,27 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res) => {
       history: results,
     };
 
+    // === 9️⃣ Simpan ke Redis ===
+    await redis.set(
+      cacheKey,
+      JSON.stringify({ timestamp: new Date().toISOString(), data: responseData }),
+      "EX",
+      CACHE_TTL
+    );
+    console.log(`💾 [Redis] Cached /my-history for user ${userId}`);
+
+    // === 🔔 Broadcast ke socket client
     broadcast({
       type: "history-update",
       userId,
-      data: {
-        totalWallets: walletAddresses.length,
-        totalSignatures: signatures.length,
-        totalFromProgram: results.length,
-        history: results,
-      },
+      data: responseData,
       timestamp: new Date().toISOString(),
     });
 
     console.timeEnd("⏱ my-history-total");
     console.log(`✅ Returning ${results.length} entries\n`);
-    return res.json(responseData);
-  } catch (err) {
+    return res.json({ ...responseData, source: "onchain" });
+  } catch (err: any) {
     console.error("❌ my-history error:", err);
     console.timeEnd("⏱ my-history-total");
     return res.status(500).json({ error: "Failed to fetch my-history NFTs" });
