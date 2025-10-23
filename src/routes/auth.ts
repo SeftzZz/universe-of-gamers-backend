@@ -1755,39 +1755,4 @@ router.get("/custodial/:address", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/debug-keypair", async (req: Request, res: Response) => {
-  try {
-    // ⚠️ ganti string ini dengan private key base58 kamu
-    const PRIVATE_KEY_BS58 =
-      "4CdfLjnqPaecZ8vb6yRjaFaUxDEtJbJrb3e7GMVJ3UCsXdqtursWWH4GnpdaoYMVQTDgq5ekAyM22y7J8Wn3oP4S"; // base58 string
-
-    // 🔁 decode base58 → Uint8Array
-    const secretKey = bs58.decode(PRIVATE_KEY_BS58);
-
-    // 🔑 buat keypair
-    const keypair = Keypair.fromSecretKey(secretKey);
-
-    // 🌐 buat koneksi ke Solana RPC
-    const connection = new Connection(
-      process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
-      "confirmed"
-    );
-
-    // 💰 ambil balance
-    const balance = await connection.getBalance(keypair.publicKey);
-
-    console.log("✅ Public Key:", keypair.publicKey.toBase58());
-    console.log("💰 Balance:", balance / LAMPORTS_PER_SOL, "SOL");
-
-    return res.json({
-      ok: true,
-      publicKey: keypair.publicKey.toBase58(),
-      balance: balance / LAMPORTS_PER_SOL,
-    });
-  } catch (err: any) {
-    console.error("❌ Gagal generate keypair:", err);
-    return res.status(500).json({ error: "Failed to generate keypair", detail: err.message });
-  }
-});
-
 export default router;
