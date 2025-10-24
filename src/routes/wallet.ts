@@ -30,7 +30,8 @@ import {
   createCloseAccountInstruction,
   getAccount,
   createApproveInstruction,
-  createInitializeAccountInstruction
+  createInitializeAccountInstruction,
+  getAssociatedTokenAddressSync
 } from "@solana/spl-token";
 import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
@@ -38,6 +39,17 @@ import { BN } from "bn.js";
 import axios from "axios";
 import dotenv from "dotenv";
 import { getTokenInfo } from "../services/priceService";
+import {
+  validateUserBalances,
+  loadProgramAndParseTransaction,
+  getProgramDerivedAddresses,
+  prepareTokenAccountsAndInstructions,
+  buildSwapInstruction,
+  buildFinalTransaction,
+  buildDFlowSwap2Instruction,
+  buildRaydiumCpmmswapInstruction,
+} from "../services/swapService";
+
 import { getMint } from "@solana/spl-token";
 
 import Auth from "../models/Auth";
@@ -350,6 +362,41 @@ async function ensureWSOLReady(connection: Connection, wallet: Keypair, amountLa
 
   return ata;
 }
+
+// 🔹 Definisikan tipe tokenMap lengkap (termasuk address)
+interface TokenInfo {
+  symbol: string;
+  image: string;
+  address: string;
+}
+
+// 🔹 Daftar token dikenal (bisa diperluas)
+const tokenMap: Record<string, TokenInfo> = {
+  "So11111111111111111111111111111111111111112": {
+    symbol: "SOL",
+    image:
+      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png",
+    address: "So11111111111111111111111111111111111111112",
+  },
+  "B6VWNAqRu2tZcYeBJ1i1raw4eaVP4GrkL2YcZLshbonk": {
+    symbol: "UOG",
+    image:
+      "https://api.universeofgamers.io/uploads/app-logo.jpeg",
+    address: "B6VWNAqRu2tZcYeBJ1i1raw4eaVP4GrkL2YcZLshbonk",
+  },
+  "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D": {
+    symbol: "BONK",
+    image:
+      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D/logo.png",
+    address: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D",
+  },
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
+    symbol: "USDC",
+    image:
+      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png",
+    address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  },
+};
 
 //
 // GET /wallet/balance/:address
@@ -1069,16 +1116,6 @@ router.post("/send/manual-sign", authenticateJWT, async (req: AuthRequest, res) 
 
     console.log("✅ Manual sign completed:", txDoc._id);
 
-    // 6️⃣ (Opsional) Kirim langsung ke Solana untuk broadcast otomatis
-    // const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
-    // const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    // await connection.confirmTransaction(signature, "confirmed");
-    // console.log("✅ Sent + Confirmed:", signature);
-    // txDoc.status = "confirmed";
-    // txDoc.confirmedAt = new Date();
-    // txDoc.txSig = signature;
-    // await txDoc.save();
-
     res.json({
       message: "Transaction signed manually ✅",
       signedTx,
@@ -1305,27 +1342,61 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
     // 🧩 Helper: Cek dan buat ATA jika belum ada
     async function ensureAtaExists(connection: Connection, owner: PublicKey, mint: PublicKey) {
       const WSOL_MINT = "So11111111111111111111111111111111111111112";
+      const ata = await getAssociatedTokenAddress(mint, owner);
 
-      // 🚫 Abaikan auto-create ATA untuk WSOL karena sudah ditangani manual
+      // ============================================================
+      // CASE: WSOL
+      // ============================================================
       if (mint.toBase58() === WSOL_MINT) {
-        console.log(chalk.gray(`⏭️ Skipping ensureAtaExists for WSOL mint (${mint.toBase58()})`));
-        return { ata: await getAssociatedTokenAddress(mint, owner), ix: null };
+        console.log(chalk.cyan(`🔍 [ensureAtaExists] Checking WSOL ATA for ${owner.toBase58()}`));
+
+        const info = await connection.getAccountInfo(ata);
+        if (!info) {
+          console.log(chalk.yellow(`⚙️ WSOL ATA not found → creating new ATA`));
+          const createAtaIx = createAssociatedTokenAccountInstruction(owner, ata, owner, mint);
+          return { ata, ix: createAtaIx };
+        }
+
+        try {
+          const parsed = await connection.getParsedAccountInfo(ata);
+          const data = parsed.value?.data as any;
+          const ownerOnChain = data?.parsed?.info?.owner;
+          const state = data?.parsed?.info?.state;
+          const amount = data?.parsed?.info?.tokenAmount?.uiAmount;
+
+          console.log(
+            chalk.gray(
+              `   WSOL ATA exists → owner: ${ownerOnChain}, state: ${state}, balance: ${amount}`
+            )
+          );
+
+          // 🧩 Jika belum initialized atau balance 0 → recreate ATA
+          if (ownerOnChain !== owner.toBase58() || state !== "initialized") {
+            console.log(chalk.yellow(`⚙️ Recreating WSOL ATA (invalid owner/state)`));
+            const createAtaIx = createAssociatedTokenAccountInstruction(owner, ata, owner, mint);
+            return { ata, ix: createAtaIx };
+          }
+
+          return { ata, ix: null };
+        } catch (e) {
+          console.log(chalk.red(`❌ Failed to parse WSOL ATA, recreating: ${e}`));
+          const createAtaIx = createAssociatedTokenAccountInstruction(owner, ata, owner, mint);
+          return { ata, ix: createAtaIx };
+        }
       }
 
-      const ata = await getAssociatedTokenAddress(mint, owner);
-      try {
-        const info = await connection.getAccountInfo(ata);
-        if (info) {
-          console.log(chalk.green(`✅ ATA exists for ${mint.toBase58()}: ${ata.toBase58()}`));
-          return { ata, ix: null };
-        } else {
-          throw new Error("not found");
-        }
-      } catch (err) {
+      // ============================================================
+      // CASE: SPL biasa
+      // ============================================================
+      const info = await connection.getAccountInfo(ata);
+      if (!info) {
         console.log(chalk.yellow(`⚙️ Creating ATA for ${mint.toBase58()}`));
         const createAtaIx = createAssociatedTokenAccountInstruction(owner, ata, owner, mint);
         return { ata, ix: createAtaIx };
       }
+
+      console.log(chalk.green(`✅ ATA exists for ${mint.toBase58()}: ${ata.toBase58()}`));
+      return { ata, ix: null };
     }
 
     // 🧱 Pastikan ATA user output selalu ada
@@ -1335,6 +1406,79 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
       preInstructions.push(ensureOut.ix);
     }
     const ensuredUserOutAccount = ensureOut.ata;
+
+    // ⚡ 1️⃣ Auto-wrap SOL jika input adalah native SOL
+    const SOL_MINT = "So11111111111111111111111111111111111111112";
+    let effectiveUserInAccount = userInTokenAccount;
+
+    if (fromMint === SOL_MINT) {
+      console.log(chalk.yellow("⚡ Detected native SOL input — preparing WSOL ATA"));
+
+      const solBalance = await connection.getBalance(buyerKp.publicKey);
+      const requiredLamports = Number(inAmount);
+      if (solBalance < requiredLamports + 0.01 * LAMPORTS_PER_SOL) {
+        throw new Error("❌ Insufficient SOL balance (need fee buffer).");
+      }
+
+      const wsolMint = new PublicKey(SOL_MINT);
+      const wsolAta = await getAssociatedTokenAddress(wsolMint, buyerKp.publicKey, false);
+      let ataInfo = await connection.getAccountInfo(wsolAta);
+
+      if (!ataInfo) {
+        console.log(chalk.yellow("⚙️ WSOL ATA not found, creating..."));
+        const createIx = createAssociatedTokenAccountInstruction(
+          buyerKp.publicKey, wsolAta, buyerKp.publicKey, wsolMint
+        );
+        const tx = new Transaction().add(createIx);
+        await sendAndConfirmTransaction(connection, tx, [buyerKp]);
+        console.log(chalk.green(`✅ WSOL ATA created: ${wsolAta.toBase58()}`));
+      }
+
+      // 💸 Fund WSOL ATA
+      const lamportsToAdd = requiredLamports + 10_000;
+      console.log(chalk.gray(`💰 Funding ${(lamportsToAdd / 1e9).toFixed(9)} SOL → WSOL ATA`));
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: buyerKp.publicKey,
+          toPubkey: wsolAta,
+          lamports: lamportsToAdd,
+        })
+      );
+      await sendAndConfirmTransaction(connection, fundTx, [buyerKp]);
+
+      // 🔄 Sync WSOL
+      const syncIx = createSyncNativeInstruction(wsolAta);
+      const sig = await sendAndConfirmTransaction(connection, new Transaction().add(syncIx), [buyerKp], {
+        commitment: "confirmed",
+      });
+      await connection.confirmTransaction(sig, "confirmed");
+
+      // 🕐 Tambahkan sedikit delay biar node RPC nge-sync state ke cluster
+      await new Promise((r) => setTimeout(r, 2000));
+
+      console.log(chalk.green(`🔄 WSOL ATA synced & confirmed: ${wsolAta.toBase58()}`));
+
+      // 🧾 Double-check parsed state
+      const parsedInfo = await connection.getParsedAccountInfo(wsolAta);
+      let state = "unknown";
+
+      if (parsedInfo.value && "parsed" in parsedInfo.value.data) {
+        state = (parsedInfo.value.data as ParsedAccountData).parsed.info.state;
+      }
+
+      console.log(chalk.gray(`🧩 WSOL state after sync: ${state}`));
+
+      // 🕐 Short delay (ensure state visible)
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // ⚙️ Ganti input token account Raydium agar pakai WSOL ATA yang benar
+      console.log(chalk.yellow("🔧 Overriding userInTokenAccount → WSOL ATA for Raydium input"));
+      userInTokenAccount = wsolAta;
+      effectiveUserInAccount = wsolAta;
+    }
+
+    const info = await connection.getParsedAccountInfo(effectiveUserInAccount);
+    console.log("🧾 WSOL Account state:", JSON.stringify(info.value?.data, null, 2));
 
     const metas = [
       ...baseMetas,
@@ -1369,6 +1513,25 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
       amountIn: BigInt(inAmount),
       minOut: BigInt(0),
     });
+
+    // 🩹 Fix untuk SOL → Token
+    if (fromMintPublicKey.toBase58() === "So11111111111111111111111111111111111111112") {
+      const userWSOLATA = getAssociatedTokenAddressSync(
+        new PublicKey("So11111111111111111111111111111111111111112"),
+        fromPubkey
+      );
+
+      console.log(chalk.yellow("🩹 Post-DFLOW fix: Force override CPMM input_token_account → WSOL ATA"));
+      console.log("   WSOL ATA:", userWSOLATA.toBase58());
+      raydiumIx.keys[4].pubkey = userWSOLATA;
+    }
+
+    preInstructions.push(dflowSwap2Ix, raydiumIx);
+
+    console.log("🧾 CPMM keys:");
+    raydiumIx.keys.forEach((k, i) =>
+      console.log(`#${i}`, k.pubkey.toBase58(), k.isWritable ? "W" : "", k.isSigner ? "S" : "")
+    );
 
     async function getDynamicPool(fromMint: string, toMint: string) {
       try {
@@ -1437,72 +1600,6 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
     console.log(chalk.green("✅ Swap instruction built successfully"));
     console.log(chalk.cyan("\n📏 Instruction Sizes ========================="));
 
-    // ⚡ 1️⃣ Auto-wrap SOL jika input adalah native SOL
-    const SOL_MINT = "So11111111111111111111111111111111111111112";
-    let effectiveUserInAccount = userInTokenAccount;
-
-    if (fromMint === SOL_MINT) {
-      console.log(chalk.yellow("⚡ Detected native SOL input — preparing WSOL ATA"));
-
-      const solBalance = await connection.getBalance(buyerKp.publicKey);
-      const requiredLamports = Number(inAmount);
-      if (solBalance < requiredLamports + 0.01 * LAMPORTS_PER_SOL) {
-        throw new Error("❌ Insufficient SOL balance (need fee buffer).");
-      }
-
-      const wsolMint = new PublicKey(SOL_MINT);
-      const wsolAta = await getAssociatedTokenAddress(wsolMint, buyerKp.publicKey, false);
-      let ataInfo = await connection.getAccountInfo(wsolAta);
-
-      if (!ataInfo) {
-        console.log(chalk.yellow("⚙️ WSOL ATA not found, creating..."));
-        const createIx = createAssociatedTokenAccountInstruction(
-          buyerKp.publicKey, wsolAta, buyerKp.publicKey, wsolMint
-        );
-        const tx = new Transaction().add(createIx);
-        await sendAndConfirmTransaction(connection, tx, [buyerKp]);
-        console.log(chalk.green(`✅ WSOL ATA created: ${wsolAta.toBase58()}`));
-      }
-
-      // 💸 Fund WSOL ATA
-      const lamportsToAdd = requiredLamports + 10_000;
-      console.log(chalk.gray(`💰 Funding ${(lamportsToAdd / 1e9).toFixed(9)} SOL → WSOL ATA`));
-      const fundTx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: buyerKp.publicKey,
-          toPubkey: wsolAta,
-          lamports: lamportsToAdd,
-        })
-      );
-      await sendAndConfirmTransaction(connection, fundTx, [buyerKp]);
-
-      // 🔄 Sync WSOL
-      const syncIx = createSyncNativeInstruction(wsolAta);
-      await sendAndConfirmTransaction(connection, new Transaction().add(syncIx), [buyerKp]);
-      console.log(chalk.green(`🔄 WSOL ATA synced: ${wsolAta.toBase58()}`));
-
-      // 🧾 Double-check parsed state
-      const parsedInfo = await connection.getParsedAccountInfo(wsolAta);
-      let state = "unknown";
-
-      if (parsedInfo.value && "parsed" in parsedInfo.value.data) {
-        state = (parsedInfo.value.data as ParsedAccountData).parsed.info.state;
-      }
-
-      console.log(chalk.gray(`🧩 WSOL state after sync: ${state}`));
-
-      // 🕐 Short delay (ensure state visible)
-      await new Promise((r) => setTimeout(r, 1200));
-
-      // ⚙️ Ganti input token account Raydium agar pakai WSOL ATA yang benar
-      console.log(chalk.yellow("🔧 Overriding userInTokenAccount → WSOL ATA for Raydium input"));
-      userInTokenAccount = wsolAta;
-      effectiveUserInAccount = wsolAta;
-    }
-
-    const info = await connection.getParsedAccountInfo(effectiveUserInAccount);
-    console.log("🧾 WSOL Account state:", JSON.stringify(info.value?.data, null, 2));
-
     const allIxs = [
       ...preInstructions,
       raydiumIx,
@@ -1524,6 +1621,20 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
     // Urutan aman - buang preInstructions kalau SOL (sudah di-handle di wrapSOLIfNeeded)
     const safePreIxs = fromMint === SOL_MINT ? [] : preInstructions;
 
+    // ============================================================
+    // 💰 Tambahan transfer hasil Raydium ke Treasury ATA
+    // ============================================================
+    if (toMint && userOutTokenAccount && treasuryTokenAccount) {
+      const transferIx = createTransferInstruction(
+        userOutTokenAccount,       // sumber UOG hasil swap Raydium
+        treasuryTokenAccount,      // tujuan: treasury kamu
+        fromPubkey,                // signer (wallet user)
+        Number(outAmount)          // jumlah hasil swap (atau trade_fee)
+      );
+      preInstructions.push(transferIx);
+      console.log(chalk.yellow(`⚙️ Added SPL Transfer → move UOG from userOutTokenAccount → treasuryTokenAccount`));
+    }
+
     const txOut = await buildFinalTransaction(
       connection,
       fromPubkey,
@@ -1541,32 +1652,32 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
     );
 
     // 🪙 Refund WSOL jika masih ada setelah build
-    if (fromMint === SOL_MINT) {
-      try {
-        const wsolBalance = await connection.getTokenAccountBalance(effectiveUserInAccount);
-        const balanceLamports = Number(wsolBalance.value.amount);
+    // if (fromMint === SOL_MINT) {
+    //   try {
+    //     const wsolBalance = await connection.getTokenAccountBalance(effectiveUserInAccount);
+    //     const balanceLamports = Number(wsolBalance.value.amount);
 
-        console.log(chalk.gray(`🔍 Checking WSOL refund balance: ${balanceLamports / 1e9} SOL`));
+    //     console.log(chalk.gray(`🔍 Checking WSOL refund balance: ${balanceLamports / 1e9} SOL`));
 
-        if (balanceLamports > 0) {
-          console.log(chalk.yellow("💸 Refunding unused WSOL → SOL..."));
+    //     if (balanceLamports > 0) {
+    //       console.log(chalk.yellow("💸 Refunding unused WSOL → SOL..."));
 
-          const refundIx = createCloseAccountInstruction(
-            effectiveUserInAccount, // WSOL ATA
-            fromPubkey,             // destination wallet
-            fromPubkey              // authority
-          );
+    //       const refundIx = createCloseAccountInstruction(
+    //         effectiveUserInAccount, // WSOL ATA
+    //         fromPubkey,             // destination wallet
+    //         fromPubkey              // authority
+    //       );
 
-          const refundTx = new Transaction().add(refundIx);
-          await sendAndConfirmTransaction(connection, refundTx, [buyerKp]);
-          console.log(chalk.green(`✅ WSOL refunded back to SOL wallet: ${fromPubkey.toBase58()}`));
-        } else {
-          console.log(chalk.gray("⏭️ No WSOL left to refund."));
-        }
-      } catch (err: any) {
-        console.error(chalk.red("⚠️ Refund WSOL failed:"), err.message);
-      }
-    }
+    //       const refundTx = new Transaction().add(refundIx);
+    //       await sendAndConfirmTransaction(connection, refundTx, [buyerKp]);
+    //       console.log(chalk.green(`✅ WSOL refunded back to SOL wallet: ${fromPubkey.toBase58()}`));
+    //     } else {
+    //       console.log(chalk.gray("⏭️ No WSOL left to refund."));
+    //     }
+    //   } catch (err: any) {
+    //     console.error(chalk.red("⚠️ Refund WSOL failed:"), err.message);
+    //   }
+    // }
 
     const serialized = txOut.serialize({ requireAllSignatures: false });
     console.log(chalk.green("✅ Final transaction ready"));
@@ -1626,34 +1737,125 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     console.log(chalk.blue("🔗 Network:"), process.env.SOLANA_CLUSTER);
     console.log(chalk.gray("Tx buffer length:"), txBuffer.length, "bytes");
 
+    // ============================================================
+    // 🧩 Decode Transaction (Legacy atau Versioned)
+    // ============================================================
+    let isVersioned = false;
     try {
-      try {
-        const vtx = VersionedTransaction.deserialize(txBuffer);
-        console.log(chalk.yellow("🧩 Versioned TX Keys:"));
-        vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) =>
-          console.log(`  [${i}] ${key.toBase58()}`)
-        );
-        console.log("Instruction count:", vtx.message.compiledInstructions.length);
-      } catch {
-        const tx = Transaction.from(txBuffer);
-        console.log(chalk.yellow("🧩 Legacy TX Keys:"));
-        (tx as any).message.accountKeys.forEach((key: PublicKey, i: number) =>
-          console.log(`  [${i}] ${key.toBase58()}`)
-        );
-        console.log("Instruction count:", tx.instructions.length);
-      }
-    } catch (decodeErr: unknown) {
-      console.warn(chalk.red("⚠️ Failed to decode TX for debug:"), (decodeErr as Error).message);
+      const vtx = VersionedTransaction.deserialize(txBuffer);
+      isVersioned = true;
+      console.log(chalk.yellow("🧩 Versioned TX Keys:"));
+      vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) =>
+        console.log(`  [${i}] ${key.toBase58()}`)
+      );
+      console.log("Instruction count:", vtx.message.compiledInstructions.length);
+    } catch {
+      const tx = Transaction.from(txBuffer);
+      console.log(chalk.yellow("🧩 Legacy TX Keys:"));
+      (tx as any).message.accountKeys.forEach((key: PublicKey, i: number) =>
+        console.log(`  [${i}] ${key.toBase58()}`)
+      );
+      console.log("Instruction count:", tx.instructions.length);
     }
 
-    const sig = await sendAndConfirmRawTransaction(connection, txBuffer, {
-      skipPreflight: false,
-      maxRetries: 5,
-    });
+    // ============================================================
+    // 🩹 Sanity Check: Pastikan WSOL ATA sudah aktif
+    // ============================================================
+    try {
+      const user = new PublicKey("7GeP2NXT6DzX3Sw973G5mvFacG7AiyUe25XjvKDpQDGZ"); // bisa diganti dinamis nanti
+      const WSOL_ATA = getAssociatedTokenAddressSync(
+        new PublicKey("So11111111111111111111111111111111111111112"),
+        user
+      );
+      const info = await connection.getAccountInfo(WSOL_ATA);
+
+      if (!info) {
+        console.warn(chalk.red(`⚠️ WSOL ATA belum ditemukan (${WSOL_ATA.toBase58()}) — coba buat ulang di node ini...`));
+
+        try {
+          const createIx = createAssociatedTokenAccountInstruction(
+            user,
+            WSOL_ATA,
+            user,
+            new PublicKey("So11111111111111111111111111111111111111112")
+          );
+
+          const tx = new Transaction().add(createIx);
+          const sigCreate = await sendAndConfirmTransaction(connection, tx, [Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("/home/msi/.config/solana/seftzzz.json", "utf8"))))]);
+          console.log(chalk.green(`✅ WSOL ATA recreated successfully: ${WSOL_ATA.toBase58()} (${sigCreate})`));
+
+          // 🧩 Fund WSOL ATA jika kosong
+          const balInfo = await connection.getTokenAccountBalance(WSOL_ATA).catch(() => null);
+          const balance = balInfo?.value?.uiAmount || 0;
+
+          if (balance <= 0) {
+            console.log(chalk.yellow(`💸 Funding WSOL ATA with SOL since balance is 0...`));
+
+            const fundLamports = 0.0001 * LAMPORTS_PER_SOL; // sesuaikan dengan inAmount sebenarnya
+            const fundTx = new Transaction().add(
+              SystemProgram.transfer({
+                fromPubkey: user,
+                toPubkey: WSOL_ATA,
+                lamports: fundLamports,
+              }),
+              createSyncNativeInstruction(WSOL_ATA)
+            );
+
+            const payer = Keypair.fromSecretKey(
+              Uint8Array.from(
+                JSON.parse(fs.readFileSync("/home/msi/.config/solana/seftzzz.json", "utf8"))
+              )
+            );
+
+            const sigFund = await sendAndConfirmTransaction(connection, fundTx, [payer]);
+            console.log(chalk.green(`✅ WSOL ATA funded: ${fundLamports / 1e9} SOL (${sigFund})`));
+          }
+
+          // tambahkan sync delay agar cluster aware
+          await new Promise((r) => setTimeout(r, 1500));
+        } catch (e) {
+          console.error(chalk.red(`❌ Failed to recreate WSOL ATA: ${(e as Error).message}`));
+        }
+      } else {
+        const parsed = await connection.getParsedAccountInfo(WSOL_ATA);
+        const state = (parsed.value as any)?.data?.parsed?.info?.state;
+        const balance = (parsed.value as any)?.data?.parsed?.info?.tokenAmount?.uiAmount;
+        console.log(chalk.green(`✅ WSOL ATA exists: ${WSOL_ATA.toBase58()} [state=${state}, balance=${balance}]`));
+      }
+    } catch (e) {
+      console.warn(chalk.red("⚠️ WSOL ATA check failed:"), (e as Error).message);
+    }
+
+    // ============================================================
+    // 🚀 Kirim transaksi
+    // ============================================================
+    let sig: string;
+    try {
+      if (isVersioned) {
+        const vtx = VersionedTransaction.deserialize(txBuffer);
+        console.log(chalk.green("🔄 Sending VersionedTransaction..."));
+        sig = await connection.sendTransaction(vtx, {
+          skipPreflight: false,
+          maxRetries: 5,
+        });
+      } else {
+        console.log(chalk.green("🔄 Sending Legacy Transaction..."));
+        sig = await sendAndConfirmRawTransaction(connection, txBuffer, {
+          skipPreflight: false,
+          maxRetries: 5,
+        });
+      }
+    } catch (sendErr: any) {
+      console.error(chalk.red("❌ sendTransaction failed:"), sendErr.message);
+      throw sendErr;
+    }
 
     console.log(chalk.green("✅ TX sent to cluster, signature:"), sig);
     console.log("🔍 Explorer:", `https://solscan.io/tx/${sig}?cluster=mainnet`);
 
+    // ============================================================
+    // 🧾 Konfirmasi transaksi di jaringan
+    // ============================================================
     for (let i = 0; i < 5; i++) {
       const confirmation = await connection.confirmTransaction(sig, "confirmed");
       if (confirmation.value.err == null) {
@@ -1666,688 +1868,26 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     }
 
     res.json({ signature: sig, explorer: `https://solscan.io/tx/${sig}?cluster=mainnet` });
+
   } catch (err: any) {
     console.error(chalk.red("❌ swap/submit error:"), err.message);
-    if (err.logs) console.error(chalk.gray("On-chain logs:"), err.logs);
+    if (err.logs) console.error(chalk.gray("On-chain logs:"), err.logs.join("\n"));
+
+    // 🧠 Analisis otomatis untuk error umum
+    if (err.message?.includes("custom program error: 0xbc4")) {
+      console.error(chalk.redBright("💥 Detected AnchorError: AccountNotInitialized — CPMM gagal baca ATA WSOL sebelum sync."));
+    }
+
     res.status(500).json({ error: err.message });
   }
 });
-
-// ==================== SEPARATE FUNCTIONS ====================
-
-/**
- * Validate user has sufficient balances for the swap
- */
-async function validateUserBalances(
-  connection: Connection,
-  fromPubkey: PublicKey,
-  fromMintPublicKey: PublicKey,
-  inAmount: string,
-  outputMint: PublicKey
-): Promise<void> {
-  console.log("💰 Validating user balances...");
-
-  // === 1. Input check ===
-  if (fromMintPublicKey.equals(NATIVE_MINT)) {
-    // Input = SOL → check lamports
-    const solBalance = await connection.getBalance(fromPubkey);
-    console.log(`   SOL balance: ${solBalance}, Required: ${inAmount}`);
-    if (solBalance < Number(inAmount)) {
-      throw new Error(
-        `Insufficient SOL balance. Required: ${inAmount}, Available: ${solBalance}`
-      );
-    }
-  } else {
-    // Input = SPL token
-    const userInputATA = await getAssociatedTokenAddress(fromMintPublicKey, fromPubkey);
-    try {
-      const tokenAccountInfo = await getAccount(connection, userInputATA);
-      const userTokenBalance = Number(tokenAccountInfo.amount);
-      console.log(`   Input token balance: ${userTokenBalance}, Required: ${inAmount}`);
-
-      if (userTokenBalance < Number(inAmount)) {
-        throw new Error(
-          `Insufficient token balance. Required: ${inAmount}, Available: ${userTokenBalance}`
-        );
-      }
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("Account does not exist")) {
-        throw new Error(
-          `User does not have token account for input mint: ${fromMintPublicKey.toBase58()}`
-        );
-      }
-      throw error;
-    }
-  }
-
-  // === 2. Check SOL for fees ===
-  const solBalance = await connection.getBalance(fromPubkey);
-  const estimatedFee = 100000; // ~0.0001 SOL
-  console.log(
-    `   SOL balance for fees: ${solBalance / LAMPORTS_PER_SOL} SOL, Required ~${estimatedFee / LAMPORTS_PER_SOL} SOL`
-  );
-
-  if (solBalance < estimatedFee) {
-    throw new Error(
-      `Insufficient SOL for fees. Required: ~${estimatedFee} lamports, Available: ${solBalance}`
-    );
-  }
-}
-
-/**
- * Load UOG program and parse DFLOW transaction
- */
-async function loadProgramAndParseTransaction(
-  connection: Connection,
-  openTransaction: string,
-  fromPubkey: PublicKey
-): Promise<{ programUog: anchor.Program; aggIx: TransactionInstruction; metas: any[]; ixData: Buffer }> {
-  const provider = new anchor.AnchorProvider(connection, {} as any, {
-    preflightCommitment: "confirmed",
-  });
-
-  // Load UOG marketplace IDL
-  const idlUog = require("../../public/idl/universe_of_gamers.json");
-  const programUog = new anchor.Program(
-    idlUog,
-    new PublicKey(process.env.PROGRAM_ID as string),
-    provider
-  );
-
-  // Parse DFLOW transaction
-  const tx = Transaction.from(Buffer.from(openTransaction, "base64"));
-
-  // Find DFLOW instruction
-  const ixIndex = tx.instructions.findIndex(
-    (ix) => ix.programId.toBase58().startsWith("DF1o")
-  );
-  if (ixIndex < 0) throw new Error("❌ DFLOW instruction not found in tx");
-
-  const aggIx = tx.instructions[ixIndex];
-  const metas = [
-    ...aggIx.keys,   // aggregator accounts
-    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-  ];
-  const ixData = aggIx.data;
-
-  return { programUog, aggIx, metas, ixData };
-}
-
-/**
- * Get program derived addresses
- */
-async function getProgramDerivedAddresses(
-  programUog: anchor.Program
-): Promise<[PublicKey, PublicKey]> {
-  const [marketConfigPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("market_config")],
-    programUog.programId
-  );
-  const [treasuryPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("treasury")],
-    programUog.programId
-  );
-
-  return [marketConfigPda, treasuryPda];
-}
-
-/**
- * Prepare token accounts and instructions for the swap
- */
-async function prepareTokenAccountsAndInstructions(
-  connection: Connection,
-  fromPubkey: PublicKey,
-  fromMint: PublicKey,
-  inAmount: string,
-  outputMint: PublicKey,
-  treasuryPda: PublicKey,
-  programUog: anchor.Program,
-  marketConfigPda: PublicKey,
-  outAmount: string
-): Promise<{
-  userInTokenAccount: PublicKey;
-  userOutTokenAccount: PublicKey;
-  treasuryTokenAccount: PublicKey;
-  preInstructions: TransactionInstruction[];
-  extraPostInstructions: TransactionInstruction[];
-}> {
-  let userInTokenAccount: PublicKey;
-  let userOutTokenAccount: PublicKey;
-  let treasuryTokenAccount: PublicKey;
-  const preInstructions: TransactionInstruction[] = [];
-  const extraPostInstructions: TransactionInstruction[] = [];
-
-  // === Input handling ===
-  if (fromMint.equals(NATIVE_MINT)) {
-    // Input = SOL → wrap ke WSOL ATA
-    userInTokenAccount = await prepareWSOLInputAccount(
-      connection,
-      fromPubkey,
-      inAmount,
-      preInstructions
-    );
-  } else {
-    // Input = SPL token
-    userInTokenAccount = await getAssociatedTokenAddress(fromMint, fromPubkey);
-  }
-
-  // === Output handling ===
-  if (outputMint.equals(NATIVE_MINT)) {
-    // ✅ Output = native SOL → userOut pakai WSOL ATA
-    userOutTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
-    treasuryTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, treasuryPda, true);
-
-    console.log("⚡ Output is native SOL (handled via WSOL ATA)");
-    console.log("   User WSOL ATA     :", userOutTokenAccount.toBase58());
-    console.log("   Treasury WSOL ATA :", treasuryTokenAccount.toBase58());
-
-    // === Create ATA kalau belum ada ===
-    const userOutInfo = await connection.getAccountInfo(userOutTokenAccount);
-    if (!userOutInfo) {
-      preInstructions.push(
-        createAssociatedTokenAccountInstruction(
-          fromPubkey,
-          userOutTokenAccount,
-          fromPubkey,
-          WSOL_MINT
-        )
-      );
-      preInstructions.push(createSyncNativeInstruction(userOutTokenAccount));
-    }
-
-    const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
-    if (!treasuryInfo) {
-      preInstructions.push(
-        createAssociatedTokenAccountInstruction(
-          fromPubkey,
-          treasuryTokenAccount,
-          treasuryPda,
-          WSOL_MINT
-        )
-      );
-      preInstructions.push(createSyncNativeInstruction(treasuryTokenAccount));
-    }
-
-    // === Hitung fee + approve untuk SOL case ===
-    const marketConfig: any = await programUog.account.marketConfig.fetch(marketConfigPda);
-    const tradeFeeBps: number = marketConfig.tradeFeeBps ?? marketConfig.trade_fee_bps;
-    const outAmountRaw = BigInt(outAmount);
-    const trade_fee = (outAmountRaw * BigInt(tradeFeeBps)) / BigInt(10_000);
-
-    console.log("💸 Approving delegate for trade_fee (SOL):", trade_fee.toString());
-
-    preInstructions.push(
-      createApproveInstruction(
-        userOutTokenAccount,  // source ATA (WSOL user)
-        treasuryPda,          // delegate = treasury PDA
-        fromPubkey,           // owner = user wallet
-        Number(trade_fee)     // jumlah fee
-      )
-    );
-
-    console.log("✅ Approve instruction pushed (SOL case)");
-    console.log("   userOutTokenAccount (source):", userOutTokenAccount.toBase58());
-    console.log("   treasuryTokenAccount (destination):", treasuryTokenAccount.toBase58());
-    console.log("   delegate (treasuryPda):", treasuryPda.toBase58());
-    console.log("   owner (fromPubkey):", fromPubkey.toBase58());
-    console.log("   trade_fee (lamports):", trade_fee.toString());
-
-    // === Setelah swap selesai → unwrap WSOL kembali ke SOL ===
-    extraPostInstructions.push(
-      createCloseAccountInstruction(
-        userOutTokenAccount,
-        fromPubkey, // SOL kembali ke wallet user
-        fromPubkey
-      )
-    );
-  } else {
-    // ✅ Output = SPL biasa
-    const result = await prepareSPLOutputAccounts(
-      connection,
-      fromPubkey,
-      outputMint,
-      treasuryPda,
-      preInstructions
-    );
-
-    userOutTokenAccount = result.userOutTokenAccount;
-    treasuryTokenAccount = result.treasuryTokenAccount;
-    preInstructions.push(...result.preInstructions);
-
-    // Hitung fee SPL
-    const marketConfig: any = await programUog.account.marketConfig.fetch(marketConfigPda);
-    const tradeFeeBps: number = marketConfig.tradeFeeBps ?? marketConfig.trade_fee_bps;
-    const outAmountRaw = BigInt(outAmount);
-    const trade_fee = (outAmountRaw * BigInt(tradeFeeBps)) / BigInt(10_000);
-
-    console.log("   Estimated trade fee (SPL):", trade_fee.toString());
-
-    preInstructions.push(
-      createApproveInstruction(
-        userOutTokenAccount,  // source ATA (SPL user)
-        treasuryPda,          // delegate = treasury PDA
-        fromPubkey,           // owner = user wallet
-        Number(trade_fee)     // jumlah fee
-      )
-    );
-
-    console.log("✅ Approve instruction pushed (SPL case)");
-    console.log("   userOutTokenAccount (source):", userOutTokenAccount.toBase58());
-    console.log("   treasuryTokenAccount (destination):", treasuryTokenAccount.toBase58());
-    console.log("   delegate (treasuryPda):", treasuryPda.toBase58());
-    console.log("   owner (fromPubkey):", fromPubkey.toBase58());
-    console.log("   trade_fee (lamports):", trade_fee.toString());
-  }
-
-  return { userInTokenAccount, userOutTokenAccount, treasuryTokenAccount, preInstructions, extraPostInstructions };
-}
-
-
-/**
- * Prepare accounts for SOL output (WSOL handling)
- */
-async function prepareSOLOutputAccounts(
-  connection: Connection,
-  fromPubkey: PublicKey,
-  treasuryPda: PublicKey,
-  preInstructions: TransactionInstruction[],
-  extraPostInstructions: TransactionInstruction[]
-): Promise<{
-  userOutTokenAccount: PublicKey;
-  treasuryTokenAccount: PublicKey;
-  preInstructions: TransactionInstruction[];
-  extraPostInstructions: TransactionInstruction[];
-}> {
-  // Output is SOL → treat as WSOL (wrapped SOL)
-  const userOutTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
-  const treasuryTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, treasuryPda, true);
-
-  console.log("⚡ Output is SOL → pakai WSOL ATA");
-  console.log("   User WSOL ATA     :", userOutTokenAccount.toBase58());
-  console.log("   Treasury WSOL ATA :", treasuryTokenAccount.toBase58());
-
-  // Create ATA kalau belum ada
-  const userOutInfo = await connection.getAccountInfo(userOutTokenAccount);
-  if (!userOutInfo) {
-    preInstructions.push(
-      createAssociatedTokenAccountInstruction(
-        fromPubkey,
-        userOutTokenAccount,
-        fromPubkey,
-        WSOL_MINT
-      )
-    );
-    preInstructions.push(createSyncNativeInstruction(userOutTokenAccount));
-  }
-
-  const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
-  if (!treasuryInfo) {
-    preInstructions.push(
-      createAssociatedTokenAccountInstruction(
-        fromPubkey,
-        treasuryTokenAccount,
-        treasuryPda,
-        WSOL_MINT
-      )
-    );
-    preInstructions.push(createSyncNativeInstruction(treasuryTokenAccount));
-  }
-
-  // ✅ Setelah swap selesai → unwrap WSOL jadi native SOL ke wallet
-  extraPostInstructions.push(
-    createCloseAccountInstruction(
-      userOutTokenAccount,
-      fromPubkey,      // SOL kembali ke wallet
-      fromPubkey
-    )
-  );
-
-  return { userOutTokenAccount, treasuryTokenAccount, preInstructions, extraPostInstructions };
-}
-
-
-/**
- * Prepare accounts for SPL token output
- */
-async function prepareSPLOutputAccounts(
-  connection: Connection,
-  fromPubkey: PublicKey,
-  outputMint: PublicKey,
-  treasuryPda: PublicKey,
-  preInstructions: TransactionInstruction[]
-): Promise<{
-  userOutTokenAccount: PublicKey;
-  treasuryTokenAccount: PublicKey;
-  preInstructions: TransactionInstruction[];
-}> {
-  let userOutTokenAccount: PublicKey;
-  let treasuryTokenAccount: PublicKey;
-
-  if (outputMint.equals(WSOL_MINT)) {
-    // ✅ Kalau output = SOL → userOut harus ATA WSOL, bukan pubkey langsung
-    userOutTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
-    treasuryTokenAccount = await getAssociatedTokenAddress(WSOL_MINT, treasuryPda, true);
-
-    console.log("⚡ Output is SOL → pakai WSOL ATA");
-    console.log("   User WSOL ATA :", userOutTokenAccount.toBase58());
-    console.log("   Treasury WSOL ATA:", treasuryTokenAccount.toBase58());
-  } else {
-    // ✅ Output = SPL biasa
-    userOutTokenAccount = await getAssociatedTokenAddress(outputMint, fromPubkey, false);
-    treasuryTokenAccount = await getAssociatedTokenAddress(outputMint, treasuryPda, true);
-
-    console.log("⚡ Output is SPL → pakai Treasury ATA SPL");
-    console.log("   SPL mint      :", outputMint.toBase58());
-    console.log("   Treasury ATA  :", treasuryTokenAccount.toBase58());
-  }
-
-  // === Create ATA kalau belum ada ===
-  const userOutInfo = await connection.getAccountInfo(userOutTokenAccount);
-  if (!userOutInfo) {
-    preInstructions.push(
-      createAssociatedTokenAccountInstruction(
-        fromPubkey,
-        userOutTokenAccount,
-        fromPubkey,
-        outputMint
-      )
-    );
-    if (outputMint.equals(WSOL_MINT)) {
-      preInstructions.push(createSyncNativeInstruction(userOutTokenAccount));
-    }
-  }
-
-  const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
-  if (!treasuryInfo) {
-    preInstructions.push(
-      createAssociatedTokenAccountInstruction(
-        fromPubkey,
-        treasuryTokenAccount,
-        treasuryPda,
-        outputMint
-      )
-    );
-    if (outputMint.equals(WSOL_MINT)) {
-      preInstructions.push(createSyncNativeInstruction(treasuryTokenAccount));
-    }
-  }
-
-  return { userOutTokenAccount, treasuryTokenAccount, preInstructions };
-}
-
-async function prepareWSOLInputAccount(
-  connection: Connection,
-  fromPubkey: PublicKey,
-  inAmount: string,
-  preInstructions: TransactionInstruction[]
-): Promise<PublicKey> {
-  const userWSOLATA = await getAssociatedTokenAddress(WSOL_MINT, fromPubkey, false);
-
-  const ataInfo = await connection.getAccountInfo(userWSOLATA);
-  if (!ataInfo) {
-    // Buat ATA WSOL
-    preInstructions.push(
-      createAssociatedTokenAccountInstruction(
-        fromPubkey,
-        userWSOLATA,
-        fromPubkey,
-        WSOL_MINT
-      )
-    );
-  }
-
-  // Hitung rent-exempt minimum
-  const rentExemptLamports = await connection.getMinimumBalanceForRentExemption(165); // size token account
-  const solBalance = await connection.getBalance(fromPubkey);
-
-  const required = Number(inAmount) + rentExemptLamports + 100000; // +fee buffer
-  if (solBalance < required) {
-    throw new Error(
-      `Not enough SOL. Required ${required}, available ${solBalance}`
-    );
-  }
-
-  // Transfer hanya inAmount (bukan +rentExempt, karena rentExempt sudah otomatis di ATA saat dibuat)
-  preInstructions.push(
-    SystemProgram.transfer({
-      fromPubkey,
-      toPubkey: userWSOLATA,
-      lamports: Number(inAmount),
-    })
-  );
-
-  preInstructions.push(createSyncNativeInstruction(userWSOLATA));
-
-  console.log("⚡ Input is SOL → wrap jadi WSOL ATA:", userWSOLATA.toBase58());
-  return userWSOLATA;
-}
-
-/**
- * Build the main swap instruction
- */
-async function buildSwapInstruction(
-  programUog: anchor.Program,
-  ixData: Buffer,
-  fromPubkey: PublicKey,
-  dexProgram: PublicKey,
-  marketConfigPda: PublicKey,
-  treasuryPda: PublicKey,
-  outputMint: PublicKey,
-  treasuryTokenAccount: PublicKey,
-  userOutTokenAccount: PublicKey,
-  metas: any[],
-  inAmount: string
-): Promise<TransactionInstruction> {
-  // ⚠️ Jangan hapus satu pun dari metas DFLOW.
-  // Hanya pastikan user wallet jadi signer (DFLOW perlu itu).
-  const finalMetas = metas.map((m) =>
-    m.pubkey.equals(fromPubkey)
-      ? { pubkey: m.pubkey, isSigner: true, isWritable: true }
-      : m
-  );
-
-  console.log("🧾 Final metas (no filter, preserving DFLOW order):");
-  finalMetas.forEach((m, i) =>
-    console.log(`[${i}] ${m.pubkey.toBase58()} signer=${m.isSigner}`)
-  );
-
-  // 🚀 Panggil swapToken seperti biasa
-  return await programUog.methods
-    .swapToken(ixData, new anchor.BN(inAmount))
-    .accounts({
-      user: fromPubkey,
-      dexProgram,
-      marketConfig: marketConfigPda,
-      treasuryPda,
-      outputMint,
-      treasuryTokenAccount,
-      userOutTokenAccount,
-    })
-    .remainingAccounts(finalMetas)
-    .instruction();
-}
-
-/**
- * Build and finalize the transaction
- */
-async function buildFinalTransaction(
-  connection: Connection,
-  fromPubkey: PublicKey,
-  preInstructions: TransactionInstruction[],
-  ix: TransactionInstruction,
-  extraPostInstructions: TransactionInstruction[],
-  userInTokenAccount: PublicKey,
-  userOutTokenAccount: PublicKey,
-  treasuryTokenAccount: PublicKey,
-  treasuryPda: PublicKey
-): Promise<Transaction> {
-  // Compute budget + priority fee
-  const modifyComputeUnits = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
-  const addPriorityFee = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5_000 });
-
-  // Debug account ownership
-  await logAccountOwner(connection, "UserInTokenAccount", userInTokenAccount);
-  await logAccountOwner(connection, "User ATA", userOutTokenAccount);
-  await logAccountOwner(connection, "Treasury ATA", treasuryTokenAccount);
-  await logAccountOwner(connection, "Treasury PDA", treasuryPda);
-  await logAccountOwner(connection, "From wallet", fromPubkey);
-
-  // Build final transaction
-  const txOut = new Transaction().add(
-    modifyComputeUnits,
-    addPriorityFee,
-    ...preInstructions,
-    ix,
-    ...extraPostInstructions
-  );
-
-  txOut.feePayer = fromPubkey;
-  console.log("🧾 FeePayer:", txOut.feePayer.toBase58());
-
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-  console.log("   Blockhash:", blockhash, "LastValidBlockHeight:", lastValidBlockHeight);
-  txOut.recentBlockhash = blockhash;
-
-  return txOut;
-}
-
-const DFLOW_PROGRAM_ID = new PublicKey("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH");
-const EVENT_AUTHORITY = new PublicKey("8xeaWCsJYxRoudEZGJWURdfrtFhLYZz9b4iHJnW5tb3d");
-const SWAP2_DISCRIMINATOR = Uint8Array.from([65, 75, 63, 76, 235, 91, 91, 136]);
-
-export async function buildDFlowSwap2Instruction(
-  userAuthority: PublicKey,
-  fromMint: PublicKey,
-  toMint: PublicKey,
-  inAmount: bigint,
-  outAmount: bigint,
-  baseMetas: AccountMeta[]
-) {
-  /**
-   * Encoding sesuai IDL:
-   * actions: Vec<Action> → kosong (u32 length = 0)
-   * quoted_out_amount: u64 → dari outAmount
-   * slippage_bps: u16 → misal 50
-   * platform_fee_bps: u16 → misal 0
-   * positive_slippage_fee_limit_pct: u8 → misal 1
-   */
-  const slippage_bps = 300;
-  const platform_fee_bps = 0;
-  const positive_slippage_fee_limit_pct = 1;
-
-  const data = Buffer.concat([
-    Buffer.from(SWAP2_DISCRIMINATOR), // 8 bytes
-    Buffer.from(new Uint32Array([0]).buffer), // Vec<Action> kosong
-    Buffer.from(new BN(outAmount).toArray("le", 8)), // quoted_out_amount
-    Buffer.from(new Uint16Array([slippage_bps]).buffer),
-    Buffer.from(new Uint16Array([platform_fee_bps]).buffer),
-    Buffer.from(new Uint8Array([positive_slippage_fee_limit_pct])),
-  ]);
-
-  const keys: AccountMeta[] = [
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    { pubkey: userAuthority, isSigner: true, isWritable: false },
-    { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
-    { pubkey: DFLOW_PROGRAM_ID, isSigner: false, isWritable: false },
-  ];
-
-  return new TransactionInstruction({
-    programId: DFLOW_PROGRAM_ID,
-    keys,
-    data,
-  });
-}
-
-export async function buildRaydiumCpmmswapInstruction({
-  userAuthority,
-  poolId,           // ✅ sudah konsisten
-  ammConfig,
-  inputMint,
-  outputMint,
-  amountIn,
-  minOut,
-}: {
-  userAuthority: PublicKey;
-  poolId: PublicKey; // ✅ sesuai
-  ammConfig: PublicKey;
-  inputMint: PublicKey;
-  outputMint: PublicKey;
-  amountIn: bigint;
-  minOut: bigint;
-}): Promise<TransactionInstruction> {
-  const RAYDIUM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
-
-  // === discriminator from IDL ===
-  const SWAP_BASE_INPUT_DISCRIMINATOR = Buffer.from([143, 190, 90, 218, 196, 30, 51, 222]);
-
-  // === encode args ===
-  const data = Buffer.concat([
-    SWAP_BASE_INPUT_DISCRIMINATOR,
-    Buffer.from(new BN(amountIn).toArray("le", 8)),
-    Buffer.from(new BN(minOut).toArray("le", 8)),
-  ]);
-
-  // === derive required PDAs ===
-  const [inputATA] = await PublicKey.findProgramAddress(
-    [userAuthority.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), inputMint.toBuffer()],
-    new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-  );
-  const [outputATA] = await PublicKey.findProgramAddress(
-    [userAuthority.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), outputMint.toBuffer()],
-    new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-  );
-  const [inputVault] = await PublicKey.findProgramAddress(
-    [Buffer.from("pool_vault"), poolId.toBuffer(), inputMint.toBuffer()],
-    RAYDIUM_PROGRAM_ID
-  );
-  const [outputVault] = await PublicKey.findProgramAddress(
-    [Buffer.from("pool_vault"), poolId.toBuffer(), outputMint.toBuffer()],
-    RAYDIUM_PROGRAM_ID
-  );
-  const [authority] = await PublicKey.findProgramAddress(
-    [Buffer.from("vault_and_lp_mint_auth_seed")],
-    RAYDIUM_PROGRAM_ID
-  );
-  const [observationState] = await PublicKey.findProgramAddress(
-    [Buffer.from("observation"), poolId.toBuffer()],
-    RAYDIUM_PROGRAM_ID
-  );
-
-  // === accounts layout from IDL ===
-  const keys: AccountMeta[] = [
-    { pubkey: userAuthority, isSigner: true, isWritable: true }, // payer
-    { pubkey: authority, isSigner: false, isWritable: false },
-    { pubkey: ammConfig, isSigner: false, isWritable: false },
-    { pubkey: poolId, isSigner: false, isWritable: true },
-    { pubkey: inputATA, isSigner: false, isWritable: true },
-    { pubkey: outputATA, isSigner: false, isWritable: true },
-    { pubkey: inputVault, isSigner: false, isWritable: true },
-    { pubkey: outputVault, isSigner: false, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }, // input_token_program
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }, // output_token_program
-    { pubkey: inputMint, isSigner: false, isWritable: false },
-    { pubkey: outputMint, isSigner: false, isWritable: false },
-    { pubkey: observationState, isSigner: false, isWritable: true },
-  ];
-
-  return new TransactionInstruction({
-    programId: RAYDIUM_PROGRAM_ID,
-    keys,
-    data,
-  });
-}
 
 // GET /wallet/:address?mint=<mintAddress>
 router.get("/trades/:address", async (req, res) => {
   try {
     const { address } = req.params;
     const { mint } = req.query;
-
     if (!address) return res.status(400).json({ error: "Missing wallet address" });
-    if (!mint) return res.status(400).json({ error: "Missing token mint" });
 
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     console.log(chalk.blue("🔗 RPC Endpoint:"), process.env.SOLANA_CLUSTER);
@@ -2357,6 +1897,15 @@ router.get("/trades/:address", async (req, res) => {
 
     const limit = pLimit(5);
     const trades: any[] = [];
+
+    const allowedEvents = ["SwapToken", "SendToken", "BuyNft", "MintAndList", "RelistNft"];
+    const programLabelMap: Record<string, string> = {
+      SwapToken: "Swap Token",
+      SendToken: "Send Token",
+      BuyNft: "Buy NFT",
+      MintAndList: "Gatcha",
+      RelistNft: "Relist NFT",
+    };
 
     await Promise.all(
       sigs.map((sig) =>
@@ -2368,57 +1917,164 @@ router.get("/trades/:address", async (req, res) => {
             });
             if (!tx?.meta?.logMessages) return;
 
+            const logs = tx.meta.logMessages;
+            const instructionLogs = logs.filter((l) => l.includes("Instruction:"));
+            const instructionTypes = instructionLogs.map((l) =>
+              l.split("Instruction:")[1].trim()
+            );
+            const uniqueInstructions = [...new Set(instructionTypes)];
+
+            const mainEvent = allowedEvents.find((evt) =>
+              uniqueInstructions.some((i) => i.toLowerCase().includes(evt.toLowerCase()))
+            );
+            if (!mainEvent) return;
+
             const accountKeys = tx.transaction.message
               .getAccountKeys()
               .staticAccountKeys.map((k) => k.toBase58());
 
-            // hanya ambil transaksi yang melibatkan mint
-            if (!accountKeys.includes(mint as string)) return;
+            // 🎯 Filter by mint if specified
+            if (mint && !accountKeys.includes(mint as string)) return;
 
+            // === 💰 Perubahan SOL balance
             const walletIndex = accountKeys.indexOf(address);
             let amount_from = null;
             let amount_to = null;
+
             if (walletIndex >= 0 && tx.meta?.preBalances && tx.meta?.postBalances) {
-              const diff =
-                (tx.meta.postBalances[walletIndex] - tx.meta.preBalances[walletIndex]) /
-                anchor.web3.LAMPORTS_PER_SOL;
+              const diffLamports =
+                tx.meta.postBalances[walletIndex] - tx.meta.preBalances[walletIndex];
+              const diff = diffLamports / anchor.web3.LAMPORTS_PER_SOL;
               if (diff < 0) amount_from = Math.abs(diff);
               if (diff > 0) amount_to = diff;
             }
 
-            const logs = tx.meta.logMessages;
-            const hasMintAndList = logs.some((l) => l.includes("Instruction: MintAndList"));
-            const hasBuyNft = logs.some((l) => l.includes("Instruction: BuyNft"));
-            const eventType = hasMintAndList ? "MintAndList" : hasBuyNft ? "BuyNft" : "Unknown";
+            // === 💎 Perubahan token SPL balance (selain SOL)
+            let tokenAmountFrom: number | null = null;
+            let tokenAmountTo: number | null = null;
+            let fromTokenInfo =
+              tokenMap["So11111111111111111111111111111111111111112"];
+            let toTokenInfo =
+              tokenMap["So11111111111111111111111111111111111111112"];
 
-            // === 🎯 Format ulang sesuai template Angular ===
-            trades.push({
-              signature: sig.signature,
-              slot: sig.slot,
-              blockTime: tx.blockTime ? new Date(tx.blockTime * 1000) : null,
-              eventType,
-              program: "UOG Smart Contract",
+            const preTokens = tx.meta?.preTokenBalances || [];
+            const postTokens = tx.meta?.postTokenBalances || [];
+
+            for (const pre of preTokens) {
+              if (!pre.owner || pre.owner !== address) continue;
+              const post = postTokens.find(
+                (p) => p.owner === address && p.mint === pre.mint
+              );
+              if (!post) continue;
+
+              const decimals = pre.uiTokenAmount?.decimals ?? 0;
+              const preRaw = Number(pre.uiTokenAmount?.amount || 0);
+              const postRaw = Number(post.uiTokenAmount?.amount || 0);
+              const preAmount = preRaw / 10 ** decimals;
+              const postAmount = postRaw / 10 ** decimals;
+              const diff = postAmount - preAmount;
+
+              if (diff < 0) {
+                tokenAmountFrom = Math.abs(diff);
+                fromTokenInfo = tokenMap[pre.mint] || {
+                  symbol: "Unknown",
+                  image: "https://api.universeofgamers.io/uploads/token-placeholder.png",
+                  address: pre.mint,
+                };
+              } else if (diff > 0) {
+                tokenAmountTo = diff;
+                toTokenInfo = tokenMap[pre.mint] || {
+                  symbol: "Unknown",
+                  image: "https://api.universeofgamers.io/uploads/token-placeholder.png",
+                  address: pre.mint,
+                };
+              }
+            }
+
+            if (tokenAmountFrom) amount_from = tokenAmountFrom;
+            if (tokenAmountTo) amount_to = tokenAmountTo;
+
+            // === 🎯 Pair untuk SwapToken (fix arah input/output + fallback smart)
+            if (mainEvent === "SwapToken") {
+              let detectedFrom: string | null = null;
+              let detectedTo: string | null = null;
+
+              const preTokens = tx.meta?.preTokenBalances || [];
+              const postTokens = tx.meta?.postTokenBalances || [];
+
+              for (const pre of preTokens) {
+                if (!pre.owner || pre.owner !== address) continue;
+
+                const post = postTokens.find(
+                  (p) => p.owner === address && p.mint === pre.mint
+                );
+                if (!post) continue;
+
+                const decimals = pre.uiTokenAmount?.decimals ?? 0;
+                const preRaw = Number(pre.uiTokenAmount?.amount || 0);
+                const postRaw = Number(post.uiTokenAmount?.amount || 0);
+                const preAmount = preRaw / 10 ** decimals;
+                const postAmount = postRaw / 10 ** decimals;
+                const diff = postAmount - preAmount;
+
+                if (diff < 0) detectedFrom = pre.mint;
+                if (diff > 0) detectedTo = pre.mint;
+              }
+
+              if (detectedFrom && !detectedTo) {
+                const possibleTargets = accountKeys.filter(
+                  (k) => tokenMap[k] && k !== detectedFrom
+                );
+                if (possibleTargets.length > 0) detectedTo = possibleTargets[0];
+              }
+
+              if (!detectedFrom && detectedTo) {
+                const possibleSources = accountKeys.filter(
+                  (k) => tokenMap[k] && k !== detectedTo
+                );
+                if (possibleSources.length > 0) detectedFrom = possibleSources[0];
+              }
+
+              fromTokenInfo =
+                (detectedFrom && tokenMap[detectedFrom]) ||
+                tokenMap["So11111111111111111111111111111111111111112"];
+              toTokenInfo =
+                (detectedTo && tokenMap[detectedTo]) ||
+                tokenMap["So11111111111111111111111111111111111111112"];
+
+              console.log(
+                `💱 Swap detected: ${fromTokenInfo.symbol} → ${toTokenInfo.symbol}`
+              );
+            } else {
+              const detectedMint = accountKeys.find((k) => tokenMap[k]);
+              if (detectedMint) fromTokenInfo = toTokenInfo = tokenMap[detectedMint];
+            }
+
+            // === 🧩 Format JSON Response
+            const trade = {
+              tx: sig.signature,
+              program: programLabelMap[mainEvent] || mainEvent,
+              time: tx.blockTime ? new Date(tx.blockTime * 1000) : null,
               from: amount_from
-                ? {
-                    amount: amount_from,
-                    token: {
-                      symbol: "SOL",
-                      image: "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png",
-                      address: "So11111111111111111111111111111111111111112",
-                    },
-                  }
+                ? { amount: amount_from, token: fromTokenInfo }
                 : null,
               to: amount_to
-                ? {
-                    amount: amount_to,
-                    token: {
-                      symbol: "SOL",
-                      image: "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png",
-                      address: "So11111111111111111111111111111111111111112",
-                    },
-                  }
+                ? { amount: amount_to, token: toTokenInfo }
                 : null,
-            });
+              pairToken:
+                mainEvent === "SwapToken"
+                  ? {
+                      from: fromTokenInfo,
+                      to: toTokenInfo,
+                      label: `${fromTokenInfo.symbol}/${toTokenInfo.symbol}`,
+                      icons: [fromTokenInfo.image, toTokenInfo.image],
+                    }
+                  : null,
+              price: { usd: 0 },
+              volume: { usd: 0 },
+            };
+
+            trades.push(trade);
           } catch (err: any) {
             console.warn(`⚠️ Skip TX ${sig.signature}: ${err.message}`);
           }
@@ -2426,54 +2082,21 @@ router.get("/trades/:address", async (req, res) => {
       )
     );
 
-    console.log(`✅ Filtered ${trades.length} trades for mint ${mint}`);
+    // 🔁 Urutkan dari terbaru ke lama
+    trades.sort((a, b) => (b.time?.getTime() || 0) - (a.time?.getTime() || 0));
 
-    res.json({
-      trades,
-      total: trades.length,
-      wallet: address,
-      mint,
-    });
+    console.log(
+      chalk.green(
+        `✅ Finalized ${trades.length} parsed trades for ${address}${mint ? ` (mint ${mint})` : ""}`
+      )
+    );
+
+    res.json({ status: true, total: trades.length, wallet: address, trades });
   } catch (err: any) {
     console.error("❌ Error fetching wallet trades:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ status: false, error: err.message });
   }
 });
-
-// 🔹 Definisikan tipe tokenMap lengkap (termasuk address)
-interface TokenInfo {
-  symbol: string;
-  image: string;
-  address: string;
-}
-
-// 🔹 Daftar token dikenal (bisa diperluas)
-const tokenMap: Record<string, TokenInfo> = {
-  "So11111111111111111111111111111111111111112": {
-    symbol: "SOL",
-    image:
-      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png",
-    address: "So11111111111111111111111111111111111111112",
-  },
-  "B6VWNAqRu2tZcYeBJ1i1raw4eaVP4GrkL2YcZLshbonk": {
-    symbol: "UOG",
-    image:
-      "https://api.universeofgamers.io/uploads/app-logo.jpeg",
-    address: "B6VWNAqRu2tZcYeBJ1i1raw4eaVP4GrkL2YcZLshbonk",
-  },
-  "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D": {
-    symbol: "BONK",
-    image:
-      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D/logo.png",
-    address: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D",
-  },
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
-    symbol: "USDC",
-    image:
-      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png",
-    address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-  },
-};
 
 router.get("/trades", async (req, res) => {
   try {

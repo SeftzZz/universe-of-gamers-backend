@@ -24,6 +24,8 @@ app.set("trust proxy", 1);
 
 /* 🌐 === CORS Configuration === */
 const allowedOrigins = [
+  "http://192.168.18.30:8100", // Dev Device
+  "http://172.19.48.1:8100", // Dev Device WSL
   "http://localhost", // Dev
   "http://localhost:8100", // Ionic
   "http://localhost:4200", // Angular
