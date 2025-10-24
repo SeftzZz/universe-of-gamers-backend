@@ -1729,7 +1729,10 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     console.log(chalk.cyan("\n📩 [SWAP SUBMIT] Request received ========================"));
     console.log(chalk.gray(JSON.stringify(req.body, null, 2)));
 
-    const { signedTx } = req.body;
+    const { signedTx, inAmount, fromMint, toMint } = req.body;
+    const fundLamports = parseInt(inAmount) + 5000; // buffer
+    console.log(`💰 Funding WSOL ATA with ${fundLamports / 1e9} SOL for ${fromMint}→${toMint}`);
+
     if (!signedTx) return res.status(400).json({ error: "signedTx required" });
 
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
@@ -1791,12 +1794,12 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
           if (balance <= 0) {
             console.log(chalk.yellow(`💸 Funding WSOL ATA with SOL since balance is 0...`));
 
-            const fundLamports = 0.0001 * LAMPORTS_PER_SOL; // sesuaikan dengan inAmount sebenarnya
+            const totalFund = fundLamports * LAMPORTS_PER_SOL; // sesuaikan dengan inAmount sebenarnya
             const fundTx = new Transaction().add(
               SystemProgram.transfer({
                 fromPubkey: user,
                 toPubkey: WSOL_ATA,
-                lamports: fundLamports,
+                lamports: totalFund,
               }),
               createSyncNativeInstruction(WSOL_ATA)
             );
@@ -1808,7 +1811,7 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
             );
 
             const sigFund = await sendAndConfirmTransaction(connection, fundTx, [payer]);
-            console.log(chalk.green(`✅ WSOL ATA funded: ${fundLamports / 1e9} SOL (${sigFund})`));
+            console.log(chalk.green(`✅ WSOL ATA funded: ${totalFund / 1e9} SOL (${sigFund})`));
           }
 
           // tambahkan sync delay agar cluster aware
