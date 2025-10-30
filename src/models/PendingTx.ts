@@ -1,14 +1,54 @@
 import mongoose from "mongoose";
 
+export interface IPendingTx extends mongoose.Document {
+  userId: string;
+  wallet: string;
+  to?: string;
+  mint?: string;
+  amount?: number;
+  txBase64: string;
+  signedTx?: string;
+  signature?: string;
+  status: "pending" | "signed" | "confirmed" | "failed";
+  createdAt: Date;
+  signedAt?: Date;
+  updatedAt?: Date;
+}
+
 const PendingTxSchema = new mongoose.Schema({
-  userId: String,
-  wallet: String,
-  txBase64: String,
-  signedTx: String, // 🆕 hasil tanda tangan base64 disimpan di sini
-  status: { type: String, enum: ["pending", "signed", "failed"], default: "pending" },
-  signature: String, // 🆗 signature blockchain (setelah submit)
+  // 🔹 User info
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "Auth", required: true },
+
+  // 🔹 Wallet pengirim (sender)
+  wallet: { type: String, required: true },
+
+  // 🔹 Tujuan (recipient)
+  to: { type: String },
+
+  // 🔹 Info token
+  mint: { type: String },    // mint address SPL token
+  amount: { type: Number },  // nominal transfer
+
+  // 🔹 Transaksi
+  txBase64: { type: String, required: true }, // unsigned transaction
+  signedTx: { type: String },                 // hasil tanda tangan base64
+  signature: { type: String },                // signature blockchain setelah submit
+
+  // 🔹 Status
+  status: {
+    type: String,
+    enum: ["pending", "signed", "confirmed", "failed"],
+    default: "pending"
+  },
+
+  // 🔹 Timestamp
   createdAt: { type: Date, default: Date.now },
-  signedAt: Date,
+  signedAt: { type: Date },
+  updatedAt: { type: Date, default: Date.now },
 });
 
-export const PendingTx = mongoose.model("PendingTx", PendingTxSchema);
+// 📌 Index untuk pencarian cepat
+PendingTxSchema.index({ wallet: 1, status: 1 });
+PendingTxSchema.index({ userId: 1, createdAt: -1 });
+
+export const PendingTx = mongoose.model<IPendingTx>("PendingTx", PendingTxSchema);

@@ -165,18 +165,28 @@ export async function buildMintTransaction(
 
   console.log("💰 price input:", metadata.price, "→ priceUnits:", priceUnits, "useSol:", useSol);
 
-  // === 🧩 PDAs ===
-  const [listingPda, listingBump] = PublicKey.findProgramAddressSync(
-    [Buffer.from("listing"), mintKp.publicKey.toBuffer()],
-    program.programId
-  );
+  // === Derive valid off-curve listing PDA ===
+  let listingPda: PublicKey | null = null;
+  let listingBump: number | null = null;
 
-  if (listingBump === 255) {
-    console.warn("⚠️ listing PDA on-curve, re-minting new NFT...");
-    // 🔁 Buat mint baru dan ulang seluruh proses mintAndList
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const [pda, bump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("listing"), mintKp.publicKey.toBuffer()],
+      program.programId
+    );
+
+    if (bump !== 255) {
+      listingPda = pda;
+      listingBump = bump;
+      break;
+    }
+
+    console.warn(`⚠️ [${attempt + 1}] Listing PDA on-curve, regenerating mint...`);
     mintKp = Keypair.generate();
-    // continue;
-    return { error: "Listing PDA on-curve, re-mint required" };
+  }
+
+  if (!listingPda || listingBump === null || listingBump === 255) {
+    throw new Error("Failed to generate off-curve listing PDA after retries");
   }
 
   const [escrowSignerPda] = PublicKey.findProgramAddressSync(
@@ -298,16 +308,40 @@ export async function buildMintTransaction(
   txMint.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
   txMint.partialSign(mintKp, userKp);
 
-  const sigMint = await connection.sendRawTransaction(txMint.serialize());
-  await connection.confirmTransaction(sigMint, "confirmed");
+  try {
+    console.log("🚀 Sending mint_and_list transaction...");
+    const txBuffer = txMint.serialize();
+    const simResult = await connection.simulateTransaction(txMint);
 
-  console.log("✅ mint_and_list confirmed:", sigMint);
+    // 🧠 Log hasil simulasi dulu sebelum dikirim
+    if (simResult.value.err) {
+      console.error("🧩 Simulation failed before sending TX:", simResult.value.err);
+      console.error("📜 Simulation Logs:", simResult.value.logs);
+      throw new Error(`Simulation failed: ${JSON.stringify(simResult.value.err)}`);
+    } else {
+      console.log("✅ Simulation success, logs:");
+      console.log(simResult.value.logs);
+    }
 
-  return {
-    mintSignature: sigMint,
-    mint: mintKp.publicKey.toBase58(),
-    listing: listingPda.toBase58(),
-    listingBump,
-  };
+    // 🛰️ Kirim transaksi ke jaringan
+    const sigMint = await connection.sendRawTransaction(txBuffer, { skipPreflight: false });
+    console.log("📡 Sent raw transaction:", sigMint);
+
+    const confirmation = await connection.confirmTransaction(sigMint, "confirmed");
+    console.log("✅ mint_and_list confirmed:", sigMint);
+    console.log("📊 Confirmation status:", confirmation);
+
+    return {
+      mintSignature: sigMint,
+      mint: mintKp.publicKey.toBase58(),
+      listing: listingPda.toBase58(),
+      listingBump,
+    };
+  } catch (err: any) {
+    console.error("🚨 Mint transaction failed!");
+    console.error("🧩 Error Message:", err.message || err);
+    if (err.logs) console.error("📜 On-chain Logs:", err.logs);
+    throw err; // lempar ke atas biar ketangkap oleh catch utama
+  }
 }
 

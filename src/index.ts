@@ -7,6 +7,7 @@ import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
 import { connectDB } from "./services/dbService";
+import { startWalletStream } from "./services/walletStreamService";
 import nftRoutes from "./routes/nft";
 import walletRoutes from "./routes/wallet";
 import authRoutes from "./routes/auth";
@@ -16,6 +17,8 @@ import gatchaRoutes from "./routes/gatcha";
 import battleRoutes from "./routes/battle";
 import battleSimulateRouter from "./routes/battleSimulate";
 import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
+
+import mongoose from "mongoose";
 
 dotenv.config();
 
@@ -38,6 +41,7 @@ const allowedOrigins = [
   "https://worldofmonsters.universeofgamers.io", // Game World Of Monsters
   "https://marketplace.universeofgamers.io", // Marketplace Website
   "https://solscan.io", // SolScan
+  "https://event.universeofgamers.io", // Event
 ];
 
 app.use(
@@ -99,6 +103,99 @@ app.get("/api/ping", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
+/* === FORM JOIN EVENT === */
+import multer from "multer";
+import fs from "fs";
+import { Request } from "express";
+
+interface MulterRequest extends Request {
+  files?: Express.Multer.File[];
+}
+
+// 🧱 Schema sederhana untuk form join (tambahkan attachments)
+const joinSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true },
+    email: { type: String, required: true },
+    phone: { type: String, required: true },
+    address: { type: String, required: true },
+    cryptoKnowledge: { type: String, required: true },
+    infoSource: { type: String, required: true },
+    attachments: [{ type: String }], // 🆕 file upload
+    createdAt: { type: Date, default: Date.now },
+  },
+  { collection: "event_joins" }
+);
+
+const EventJoin = mongoose.model("EventJoin", joinSchema);
+
+// 📂 Folder penyimpanan file upload
+const uploadPath = path.join(process.cwd(), "uploads/join_attachments");
+if (!fs.existsSync(uploadPath)) {
+  fs.mkdirSync(uploadPath, { recursive: true });
+}
+
+// ⚙️ Konfigurasi multer
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadPath),
+  filename: (req, file, cb) => {
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, unique + path.extname(file.originalname));
+  },
+});
+
+// Batasi format file agar aman
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB per file
+  fileFilter: (req, file, cb) => {
+    const allowed = [".png", ".jpg", ".jpeg", ".pdf"];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (!allowed.includes(ext)) {
+      return cb(new Error("Only .png, .jpg, .jpeg, .pdf files are allowed"));
+    }
+    cb(null, true);
+  },
+});
+
+// 📥 POST /api/join
+app.post("/api/join", upload.array("attachments", 5), async (req, res) => {
+  try {
+    const { name, email, phone, address, cryptoKnowledge, infoSource } = req.body;
+
+    if (!name || !email || !phone || !address) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // simpan path file jika ada
+    const files =
+    (req.files as Express.Multer.File[] | undefined)?.map(
+      (f) => `/uploads/join_attachments/${f.filename}`
+    ) || [];
+
+    const newJoin = await EventJoin.create({
+      name,
+      email,
+      phone,
+      address,
+      cryptoKnowledge,
+      infoSource,
+      attachments: files,
+    });
+
+    console.log("✅ New Join Event:", newJoin);
+    res.json({
+      success: true,
+      message: "Data saved successfully",
+      data: newJoin,
+    });
+  } catch (err) {
+    console.error("❌ Error saving join data:", err);
+    res.status(500).json({ success: false, error: "Internal server error" });
+  }
+});
+
+
 /* === SERVER + WEBSOCKET === */
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
@@ -150,6 +247,8 @@ export const broadcast = (data: any) => {
 // ✅ Start server
 (async () => {
   await connectDB();
+  startWalletStream();
+
   server.listen(PORT, () => {
     console.log(`🚀 NFT Backend running on http://localhost:${PORT}`);
     console.log(`📡 WebSocket active on ws://localhost:${PORT}`);

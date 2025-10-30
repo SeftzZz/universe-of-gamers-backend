@@ -39,6 +39,8 @@ import { BN } from "bn.js";
 import axios from "axios";
 import dotenv from "dotenv";
 import { getTokenInfo } from "../services/priceService";
+import { invalidateWalletCache, walletEvents } from "../services/walletStreamService";
+import { getWalletBalance, refreshWalletCache } from "../services/walletStreamService"; 
 import {
   validateUserBalances,
   loadProgramAndParseTransaction,
@@ -153,7 +155,7 @@ const makeAcc = (pubkey: string | null, isSigner = false, isWritable = false) =>
 const rpc = process.env.SOLANA_CLUSTER;
 console.log("⚙️ [wallet.ts] RPC   =", rpc);
 
-const MAX_CACHE_AGE = 5 * 60 * 1000; // 5 menit
+const MAX_CACHE_AGE = 10 * 1000; // 5 menit
 
 function formatError(err: any) {
   let logs: string[] = [];
@@ -366,6 +368,7 @@ async function ensureWSOLReady(connection: Connection, wallet: Keypair, amountLa
 // 🔹 Definisikan tipe tokenMap lengkap (termasuk address)
 interface TokenInfo {
   symbol: string;
+  name: string;
   image: string;
   address: string;
 }
@@ -373,27 +376,33 @@ interface TokenInfo {
 // 🔹 Daftar token dikenal (bisa diperluas)
 const tokenMap: Record<string, TokenInfo> = {
   "So11111111111111111111111111111111111111112": {
-    symbol: "SOL",
-    image:
-      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png",
+    symbol: "WSOL",
+    name: "Wrap SOL",
+    image: "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png",
     address: "So11111111111111111111111111111111111111112",
+  },
+  "So11111111111111111111111111111111111111111": {
+    symbol: "SOL",
+    name: "Native SOL",
+    image: "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png",
+    address: "So11111111111111111111111111111111111111111",
   },
   "B6VWNAqRu2tZcYeBJ1i1raw4eaVP4GrkL2YcZLshbonk": {
     symbol: "UOG",
-    image:
-      "https://api.universeofgamers.io/uploads/app-logo.jpeg",
+    name: "Universe Of Gamers",
+    image: "https://api.universeofgamers.io/uploads/app-logo.jpeg",
     address: "B6VWNAqRu2tZcYeBJ1i1raw4eaVP4GrkL2YcZLshbonk",
   },
   "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D": {
     symbol: "BONK",
-    image:
-      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D/logo.png",
+    name: "BONK",
+    image: "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D/logo.png",
     address: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xqvd8Y3bDbxYx7D",
   },
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
     symbol: "USDC",
-    image:
-      "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png",
+    name: "USDC",
+    image: "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/assets/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png",
     address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
   },
 };
@@ -499,7 +508,6 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
 //
 // GET /wallet/tokens/:address
 //
-
 router.get("/tokens/:address", async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
@@ -507,6 +515,7 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
 
     const now = Date.now();
     const redisKey = `tokens:${address}`;
+    const redisTTL = MAX_CACHE_AGE / 1000;
 
     // 1️⃣ Cek cache Redis
     const cached = await redis.get(redisKey);
@@ -515,36 +524,60 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       const age = now - new Date(parsed.timestamp).getTime();
       if (age < MAX_CACHE_AGE) {
         console.log(`⚡ [Redis] Returning cached tokens for ${address}`);
-        return res.json({ ...parsed.data, source: "redis-cache" });
+
+        const responseData = { ...parsed.data, source: "redis-cache" };
+
+        // 🔔 Broadcast realtime
+        broadcast({
+          type: "wallet-tokens-update",
+          address,
+          data: responseData,
+          timestamp: new Date().toISOString(),
+        });
+
+        return res.json(responseData);
       }
     }
 
     // 2️⃣ Cek MongoDB cache
     const dbTokens = await WalletToken.find({ address }).lean();
     const hasDb = dbTokens.length > 0;
-    const allFresh = hasDb && dbTokens.every(
-      (t: any) => now - new Date(t.lastUpdated).getTime() < MAX_CACHE_AGE
-    );
+    const allFresh =
+      hasDb &&
+      dbTokens.every(
+        (t: any) => now - new Date(t.lastUpdated).getTime() < MAX_CACHE_AGE
+      );
 
     if (allFresh) {
       console.log(`✅ [MongoDB] Returning cached tokens for ${address}`);
-      const response = {
+      const responseData = {
         address,
         tokens: dbTokens,
         total: dbTokens.reduce((s: any, t: any) => s + (t.usdValue ?? 0), 0),
-        totalSol: dbTokens.find((t: any) => t.mint === SOL_MINT)?.amount ?? 0,
+        totalSol: dbTokens.find((t: any) => t.symbol === "SOL")?.amount ?? 0,
         source: "db-cache",
       };
+
+      // 💾 Simpan ke Redis untuk cache cepat berikutnya
       await redis.set(
         redisKey,
-        JSON.stringify({ timestamp: new Date().toISOString(), data: response }),
+        JSON.stringify({ timestamp: new Date().toISOString(), data: responseData }),
         "EX",
-        MAX_CACHE_AGE / 1000
+        redisTTL
       );
-      return res.json(response);
+
+      // 🔔 Broadcast realtime
+      broadcast({
+        type: "wallet-tokens-update",
+        address,
+        data: responseData,
+        timestamp: new Date().toISOString(),
+      });
+
+      return res.json(responseData);
     }
 
-    // 3️⃣ Ambil dari Solana Tracker
+    // 3️⃣ Fetch dari Solana Tracker (onchain)
     let wallet: any = null;
     let attempt = 0;
     const maxRetries = 3;
@@ -559,83 +592,130 @@ router.get("/tokens/:address", async (req: Request, res: Response) => {
       }
     }
 
-    // 4️⃣ Jika gagal total, fallback ke cache lama
+    // 4️⃣ Fallback ke DB kalau gagal total
     if (!wallet) {
       if (hasDb) {
-        console.warn(`⚡ Using expired cache for ${address}`);
-        return res.json({
+        console.warn(`⚡ Using expired DB cache for ${address}`);
+        const responseData = {
           address,
           tokens: dbTokens,
           total: dbTokens.reduce((s, t) => s + (t.usdValue ?? 0), 0),
-          totalSol: dbTokens.find((t) => t.mint === SOL_MINT)?.amount ?? 0,
+          totalSol: dbTokens.find((t) => t.symbol === "SOL")?.amount ?? 0,
           source: "db-expired",
+        };
+
+        await redis.set(
+          redisKey,
+          JSON.stringify({ timestamp: new Date().toISOString(), data: responseData }),
+          "EX",
+          redisTTL
+        );
+
+        broadcast({
+          type: "wallet-tokens-update",
+          address,
+          data: responseData,
+          timestamp: new Date().toISOString(),
         });
+
+        return res.json(responseData);
       }
       return res.status(404).json({ error: "Wallet not found" });
     }
 
-    // 5️⃣ Map hasil wallet.tokens
-    const apiTokens = wallet.tokens.map((t: any) => {
-      const mint =
-        t.token.mint === "So11111111111111111111111111111111111111112"
-          ? SOL_MINT
-          : t.token.mint;
-      const priceUsd = t.pools?.[0]?.price?.usd ?? 0;
-      const liquidity = t.pools?.[0]?.liquidity?.usd ?? 0;
-      const marketCap = t.pools?.[0]?.marketCap?.usd ?? 0;
-      const percentChange = t.events?.["24h"]?.priceChangePercentage ?? 0;
-      const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
+    // 5️⃣ Parse token list
+    let apiTokens: any[] = [];
+    if (wallet.tokens?.length > 0) {
+      apiTokens = wallet.tokens.map((t: any) => {
+        const mint =
+          t.token.mint === "So11111111111111111111111111111111111111112"
+            ? "So11111111111111111111111111111111111111111"
+            : t.token.mint;
 
-      return {
-        mint,
-        name: mint === SOL_MINT ? "Solana" : t.token.name,
-        symbol: mint === SOL_MINT ? "SOL" : t.token.symbol,
-        logoURI:
-          mint === SOL_MINT
-            ? "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/solana/info/logo.png"
-            : t.token.image,
-        decimals: t.token.decimals,
-        amount: t.balance,
-        priceUsd: parseFloat(priceUsd.toFixed(6)),
-        usdValue: parseFloat(t.value?.toFixed(2) ?? "0"),
-        liquidity: parseFloat(liquidity.toFixed(2)),
-        marketCap: parseFloat(marketCap.toFixed(2)),
-        percentChange: parseFloat(percentChange.toFixed(2)),
-        trend,
-        holders: t.holders ?? 0,
+        const priceUsd = t.pools?.[0]?.price?.usd ?? 0;
+        const percentChange = t.events?.["24h"]?.priceChangePercentage ?? 0;
+        const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
+
+        return {
+          address,
+          owner: address,
+          mint,
+          name: t.token.name ?? "Unknown Token",
+          symbol: t.token.symbol ?? "???",
+          logoURI: t.token.image ?? null,
+          decimals: t.token.decimals ?? 9,
+          amount: t.balance ?? 0,
+          priceUsd: parseFloat(priceUsd.toFixed(6)),
+          usdValue: parseFloat(t.value?.toFixed(2) ?? "0"),
+          percentChange: parseFloat(percentChange.toFixed(2)),
+          trend,
+          lastUpdated: new Date(),
+        };
+      });
+    }
+
+    // 6️⃣ Jika kosong → gunakan tokenMap default
+    if (!apiTokens.length) {
+      console.warn(`⚠️ No tokens found from Solana Tracker. Using tokenMap defaults.`);
+      apiTokens = Object.values(tokenMap).map((info: any) => ({
+        address,
+        owner: address,
+        mint: info.address,
+        name: info.name,
+        symbol: info.symbol,
+        logoURI: info.image ?? null,
+        decimals: 9,
+        amount: 0,
+        priceUsd: 0,
+        usdValue: 0,
+        percentChange: 0,
+        trend: 0,
         lastUpdated: new Date(),
-      };
-    });
+      }));
+    }
 
-    // 6️⃣ Simpan ke MongoDB
+    // 7️⃣ Simpan ke MongoDB (upsert)
     await Promise.all(
-      apiTokens.map((t: any) =>
+      apiTokens.map((t) =>
         WalletToken.findOneAndUpdate(
           { address, mint: t.mint },
-          { ...t, address, lastUpdated: new Date() },
+          { ...t, lastUpdated: new Date() },
           { upsert: true }
         )
       )
     );
 
-    // 7️⃣ Simpan ke Redis
-    const response = {
+    // 8️⃣ Cache baru di Redis
+    const responseData = {
       address,
       tokens: apiTokens,
       total: apiTokens.reduce((s: any, t: any) => s + (t.usdValue ?? 0), 0),
-      totalSol: apiTokens.find((t: any) => t.mint === SOL_MINT)?.amount ?? 0,
-      source: "onchain",
+      totalSol: apiTokens.find((t: any) => t.symbol === "SOL")?.amount ?? 0,
+      source: wallet.tokens?.length ? "onchain" : "tokenmap-default",
     };
 
     await redis.set(
       redisKey,
-      JSON.stringify({ timestamp: new Date().toISOString(), data: response }),
+      JSON.stringify({ timestamp: new Date().toISOString(), data: responseData }),
       "EX",
-      MAX_CACHE_AGE / 1000
+      redisTTL
     );
 
-    console.log(`✅ [Onchain] Cached ${apiTokens.length} tokens for ${address}`);
-    return res.json(response);
+    console.log(
+      `✅ [${wallet.tokens?.length ? "Onchain" : "Default"}] Cached ${
+        apiTokens.length
+      } tokens for ${address}`
+    );
+
+    // 9️⃣ Broadcast realtime
+    broadcast({
+      type: "wallet-tokens-update",
+      address,
+      data: responseData,
+      timestamp: new Date().toISOString(),
+    });
+
+    return res.json(responseData);
   } catch (err: any) {
     console.error("❌ Error fetching wallet tokens:", err);
     return res.status(500).json({ error: err.message });
@@ -996,11 +1076,7 @@ router.post("/send/sign", authenticateJWT, async (req: AuthRequest, res) => {
     const authUser = await Auth.findById(userId);
     if (!authUser) return res.status(404).json({ error: "User not found" });
 
-    // 🔍 Log debug custodial wallets
-    // console.log("🔍 Custodial wallets for user:", JSON.stringify(authUser.custodialWallets, null, 2));
-    console.log("🔍 Searching wallet:", wallet);
-
-    // 🔎 Cari wallet secara case-insensitive dan normalisasi provider
+    // 🔎 Cek apakah wallet benar milik user
     const walletEntry = authUser.custodialWallets.find(
       (w: any) =>
         (w.provider?.toLowerCase?.() ?? "") === "solana" &&
@@ -1009,20 +1085,70 @@ router.post("/send/sign", authenticateJWT, async (req: AuthRequest, res) => {
 
     if (!walletEntry) {
       console.warn("❌ No matching custodial wallet found for:", wallet);
-      console.log(
-        "📜 Available wallets:",
-        authUser.custodialWallets.map((w: any) => ({
-          provider: w.provider,
-          address: w.address,
-        }))
-      );
       return res.status(400).json({ error: "No matching custodial wallet found" });
     }
+
+    // 🧩 Decode transaksi base64 untuk ambil "to" & "mint"
+    let recipient = null;
+    let mint = null;
+    try {
+      const txBuffer = Buffer.from(tx, "base64");
+      const decodedTx = Transaction.from(txBuffer);
+
+      console.log("🧩 Decoded transaction structure:");
+      console.log("  🧱 Instruction count:", decodedTx.instructions.length);
+      console.log("  🔑 Fee payer:", decodedTx.feePayer?.toBase58?.() || "(none)");
+
+      if (decodedTx.instructions?.length > 0) {
+        const ix = decodedTx.instructions[0];
+
+        console.log("📜 Instruction[0] programId:", ix.programId.toBase58());
+        console.log(
+          "📎 Instruction[0] keys:",
+          ix.keys.map((k, i) => ({
+            index: i,
+            pubkey: k.pubkey.toBase58(),
+            isSigner: k.isSigner,
+            isWritable: k.isWritable,
+          }))
+        );
+
+        // kadang mint address ada di key[0] atau key[3] tergantung jenis token transfer
+        const possibleMintKeys = ix.keys.map((k) => k.pubkey.toBase58());
+        console.log("🪙 Possible mint keys:", possibleMintKeys);
+
+        // lihat isi data instruksi dalam hex (SPL token transfer punya pola khas)
+        if (ix.data?.length > 0) {
+          console.log("📦 Raw instruction data (hex):", ix.data.toString("hex"));
+        }
+
+        // Ambil penerima dari key[1] (biasanya recipient ATA)
+        recipient = ix.keys?.[1]?.pubkey?.toBase58?.() ?? null;
+
+        // Ambil mint dari data kalau ada (SPL token mint biasanya key[3])
+        mint = ix.keys?.[3]?.pubkey?.toBase58?.() ?? null;
+
+        console.log("🎯 Parsed recipient:", recipient || "(none)");
+        console.log("🪙 Parsed mint:", mint || "(none)");
+      } else {
+        console.warn("⚠️ No instructions found in transaction!");
+      }
+    } catch (err: any) {
+      console.warn("⚠️ Failed to decode transaction for metadata:", err.message);
+    }
+
+    console.log("📨 Parsed TX Metadata:", {
+      sender: wallet,
+      recipient,
+      mint,
+    });
 
     // 🧾 Simpan transaksi pending
     const pendingTx = await PendingTx.create({
       userId,
       wallet,
+      to: recipient,
+      mint: mint,
       txBase64: tx,
       status: "pending",
       createdAt: new Date(),
@@ -1031,17 +1157,17 @@ router.post("/send/sign", authenticateJWT, async (req: AuthRequest, res) => {
     console.log("=== 📨 REQUEST SIGN TRANSACTION ===");
     console.log("👤 User:", userId);
     console.log("💼 Wallet:", wallet);
+    console.log("🎯 To:", recipient || "(unknown)");
+    console.log("🪙 Mint:", mint || "(unknown)");
     console.log("📦 TX length:", tx.length);
     console.log("📬 Saved pending transaction:", pendingTx._id);
     console.log("📅 Created at:", pendingTx.createdAt);
 
-    // ✅ Kembalikan txId ke frontend
     res.json({
       message: "Transaction waiting for manual sign",
-      txId: pendingTx._id.toString(),
+      txId: String(pendingTx._id),
       status: "pending",
     });
-
   } catch (err: any) {
     console.error("❌ /send/sign error:", err);
     res.status(500).json({ error: err.message });
@@ -1132,45 +1258,81 @@ router.post("/send/manual-sign", authenticateJWT, async (req: AuthRequest, res) 
 // POST /wallet/send/submit
 //
 router.post("/send/submit", async (req: Request, res: Response) => {
-  // bikin connection global di scope function
   const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
-
   try {
     const { signedTx, blockhash, lastValidBlockHeight } = req.body;
     if (!signedTx) {
       return res.status(400).json({ error: "signedTx is required" });
     }
 
-    // ✅ Cek apakah blockhash masih valid
-    if (blockhash && lastValidBlockHeight) {
-      const stillValid = await connection.isBlockhashValid(blockhash, lastValidBlockHeight);
-      if (!stillValid) {
-        console.warn("⚠️ Blockhash expired before submit");
-        const { blockhash: newHash, lastValidBlockHeight: newHeight } =
-          await connection.getLatestBlockhash("confirmed");
-        return res.status(409).json({
-          error: "Blockhash expired, please rebuild transaction",
-          blockhash: newHash,
-          lastValidBlockHeight: newHeight,
-        });
+    // 🧾 Coba temukan PendingTx dari database tanpa txId
+    let pendingTx: any = await PendingTx.findOne({ signedTx }).lean();
+
+    if (!pendingTx) {
+      // fallback — cari yang belum confirmed & paling baru
+      pendingTx = await PendingTx.findOne({ status: "signed" })
+        .sort({ signedAt: -1 })
+        .lean();
+      if (pendingTx) {
+        console.warn("⚠️ PendingTx matched by latest signed record (fallback).");
+      } else {
+        console.warn("⚠️ No PendingTx found (using fully decoded TX).");
       }
     }
 
-    const txBuffer = Buffer.from(signedTx, "base64");
+    if (pendingTx) {
+      console.log("📦 Loaded PendingTx from DB:", {
+        id: pendingTx._id,
+        wallet: pendingTx.wallet,
+        to: pendingTx.to,
+        status: pendingTx.status,
+      });
+    }
 
-    // ✅ Kirim + auto confirm TX
-    const signature = await sendAndConfirmRawTransaction(
-      connection,
-      txBuffer,
-      {
-        skipPreflight: false,
-        commitment: "confirmed",
-        maxRetries: 3,
+    // Ambil sender & recipient
+    let senderAddress = pendingTx?.wallet ?? null;
+    let recipientAddress = pendingTx?.to ?? null;
+    let mint: string | null = null;
+
+    // Kalau tetap tidak ada, decode manual dari signedTx
+    if (!senderAddress) {
+      console.warn("⚠️ Missing senderAddress (fallback decode TX)");
+      try {
+        const txBuffer = Buffer.from(signedTx, "base64");
+        const decodedTx = Transaction.from(txBuffer);
+
+        if (decodedTx.instructions?.length > 0) {
+          const ix = decodedTx.instructions[0];
+          senderAddress =
+            decodedTx.feePayer?.toBase58?.() ??
+            ix.keys?.[0]?.pubkey?.toBase58?.() ??
+            null;
+          recipientAddress = ix.keys?.[1]?.pubkey?.toBase58?.() ?? null;
+          mint =
+            ix.keys?.[3]?.pubkey?.toBase58?.() ??
+            ix.keys?.[2]?.pubkey?.toBase58?.() ??
+            null;
+
+          console.log("🎯 Parsed sender:", senderAddress);
+          console.log("🎯 Parsed recipient:", recipientAddress);
+          console.log("🪙 Parsed mint:", mint);
+        }
+      } catch (err: any) {
+        console.warn("⚠️ Failed to decode transaction metadata:", err.message);
       }
-    );
+    }
+
+    // ✅ Kirim transaksi
+    const txBuffer = Buffer.from(signedTx, "base64");
+    const signature = await sendAndConfirmRawTransaction(connection, txBuffer, {
+      skipPreflight: false,
+      commitment: "confirmed",
+      maxRetries: 3,
+    });
+
     console.log("✅ Sent + Confirmed:", signature);
 
-    // ✅ Extra confirm pakai getSignatureStatuses
+    // ✅ Extra confirm
     let status = null;
     for (let i = 0; i < 15; i++) {
       const st = await connection.getSignatureStatuses([signature]);
@@ -1179,23 +1341,38 @@ router.post("/send/submit", async (req: Request, res: Response) => {
       await new Promise((r) => setTimeout(r, 2000));
     }
 
-    if (!status) {
-      throw new Error("Transaction not confirmed within retries");
+    if (!status) throw new Error("Transaction not confirmed within retries");
+    console.log("✅ Confirmed transaction:", signature);
+
+    // ✅ Update PendingTx
+    if (pendingTx) {
+      await PendingTx.updateOne(
+        { _id: pendingTx._id },
+        {
+          $set: {
+            status: "confirmed",
+            signature,
+            signedAt: pendingTx.signedAt ?? new Date(),
+          },
+        }
+      );
+      console.log(`🧾 PendingTx updated to confirmed (${pendingTx._id})`);
     }
 
-    console.log("✅ Confirmed transaction:", signature);
+    // ✅ Invalidate cache
+    if (senderAddress) await invalidateWalletCache(senderAddress);
+    if (recipientAddress) await invalidateWalletCache(recipientAddress);
+
+    // ✅ Refresh cache (langsung rebuild dari chain)
+    if (senderAddress) await refreshWalletCache(senderAddress);
+    if (recipientAddress) await refreshWalletCache(recipientAddress);
+
+    // ✅ Broadcast realtime event
+    if (senderAddress) walletEvents.emit("forceUpdate", senderAddress);
+    if (recipientAddress) walletEvents.emit("forceUpdate", recipientAddress);
+
     res.json({ signature });
   } catch (err: any) {
-    if (err.message?.includes("Blockhash not found")) {
-      const { blockhash: newHash, lastValidBlockHeight: newHeight } =
-        await connection.getLatestBlockhash("finalized");
-      return res.status(409).json({
-        error: "Blockhash expired, please rebuild transaction",
-        blockhash: newHash,
-        lastValidBlockHeight: newHeight,
-      });
-    }
-
     console.error("❌ submit sendToken error:", err);
     res.status(500).json({ error: err.message });
   }
@@ -1725,25 +1902,29 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
 // POST /wallet/swap/submit
 //
 router.post("/swap/submit", async (req: Request, res: Response) => {
+  const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+
   try {
     console.log(chalk.cyan("\n📩 [SWAP SUBMIT] Request received ========================"));
     console.log(chalk.gray(JSON.stringify(req.body, null, 2)));
 
     const { signedTx, inAmount, fromMint, toMint } = req.body;
-    const fundLamports = parseInt(inAmount) + 5000; // buffer
-    console.log(`💰 Funding WSOL ATA with ${fundLamports / 1e9} SOL for ${fromMint}→${toMint}`);
-
     if (!signedTx) return res.status(400).json({ error: "signedTx required" });
 
-    const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
-    const txBuffer = Buffer.from(signedTx, "base64");
+    const fundLamports = parseInt(inAmount) + 5000;
+    console.log(`💰 Funding WSOL ATA with ${fundLamports / 1e9} SOL for ${fromMint} → ${toMint}`);
     console.log(chalk.blue("🔗 Network:"), process.env.SOLANA_CLUSTER);
+
+    const txBuffer = Buffer.from(signedTx, "base64");
     console.log(chalk.gray("Tx buffer length:"), txBuffer.length, "bytes");
 
     // ============================================================
-    // 🧩 Decode Transaction (Legacy atau Versioned)
+    // 🧩 Decode Transaction — cari sender & recipient
     // ============================================================
     let isVersioned = false;
+    let senderAddress: string | null = null;
+    let recipientAddress: string | null = null;
+
     try {
       const vtx = VersionedTransaction.deserialize(txBuffer);
       isVersioned = true;
@@ -1751,79 +1932,57 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
       vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) =>
         console.log(`  [${i}] ${key.toBase58()}`)
       );
-      console.log("Instruction count:", vtx.message.compiledInstructions.length);
+
+      senderAddress = vtx.message.staticAccountKeys[0]?.toBase58?.() ?? null;
+      recipientAddress = vtx.message.staticAccountKeys[1]?.toBase58?.() ?? null;
     } catch {
       const tx = Transaction.from(txBuffer);
       console.log(chalk.yellow("🧩 Legacy TX Keys:"));
       (tx as any).message.accountKeys.forEach((key: PublicKey, i: number) =>
         console.log(`  [${i}] ${key.toBase58()}`)
       );
-      console.log("Instruction count:", tx.instructions.length);
+
+      senderAddress = tx.feePayer?.toBase58?.() ?? tx.instructions?.[0]?.keys?.[0]?.pubkey?.toBase58?.() ?? null;
+      recipientAddress = tx.instructions?.[0]?.keys?.[1]?.pubkey?.toBase58?.() ?? null;
     }
 
+    console.log("🎯 Parsed sender:", senderAddress);
+    console.log("🎯 Parsed recipient:", recipientAddress);
+
     // ============================================================
-    // 🩹 Sanity Check: Pastikan WSOL ATA sudah aktif
+    // 🩹 Sanity Check: Pastikan WSOL ATA aktif
     // ============================================================
     try {
-      const user = new PublicKey("7GeP2NXT6DzX3Sw973G5mvFacG7AiyUe25XjvKDpQDGZ"); // bisa diganti dinamis nanti
+      const user = new PublicKey(senderAddress ?? "7GeP2NXT6DzX3Sw973G5mvFacG7AiyUe25XjvKDpQDGZ");
       const WSOL_ATA = getAssociatedTokenAddressSync(
         new PublicKey("So11111111111111111111111111111111111111112"),
         user
       );
+
       const info = await connection.getAccountInfo(WSOL_ATA);
-
       if (!info) {
-        console.warn(chalk.red(`⚠️ WSOL ATA belum ditemukan (${WSOL_ATA.toBase58()}) — coba buat ulang di node ini...`));
+        console.warn(chalk.red(`⚠️ WSOL ATA belum ditemukan (${WSOL_ATA.toBase58()})`));
 
-        try {
-          const createIx = createAssociatedTokenAccountInstruction(
-            user,
-            WSOL_ATA,
-            user,
-            new PublicKey("So11111111111111111111111111111111111111112")
-          );
+        const createIx = createAssociatedTokenAccountInstruction(
+          user,
+          WSOL_ATA,
+          user,
+          new PublicKey("So11111111111111111111111111111111111111112")
+        );
 
-          const tx = new Transaction().add(createIx);
-          const sigCreate = await sendAndConfirmTransaction(connection, tx, [Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("/home/msi/.config/solana/seftzzz.json", "utf8"))))]);
-          console.log(chalk.green(`✅ WSOL ATA recreated successfully: ${WSOL_ATA.toBase58()} (${sigCreate})`));
+        const payer = Keypair.fromSecretKey(
+          Uint8Array.from(JSON.parse(fs.readFileSync("/home/msi/.config/solana/seftzzz.json", "utf8")))
+        );
 
-          // 🧩 Fund WSOL ATA jika kosong
-          const balInfo = await connection.getTokenAccountBalance(WSOL_ATA).catch(() => null);
-          const balance = balInfo?.value?.uiAmount || 0;
+        const tx = new Transaction().add(createIx);
+        const sigCreate = await sendAndConfirmTransaction(connection, tx, [payer]);
+        console.log(chalk.green(`✅ WSOL ATA recreated: ${WSOL_ATA.toBase58()} (${sigCreate})`));
 
-          if (balance <= 0) {
-            console.log(chalk.yellow(`💸 Funding WSOL ATA with SOL since balance is 0...`));
-
-            const totalFund = fundLamports * LAMPORTS_PER_SOL; // sesuaikan dengan inAmount sebenarnya
-            const fundTx = new Transaction().add(
-              SystemProgram.transfer({
-                fromPubkey: user,
-                toPubkey: WSOL_ATA,
-                lamports: totalFund,
-              }),
-              createSyncNativeInstruction(WSOL_ATA)
-            );
-
-            const payer = Keypair.fromSecretKey(
-              Uint8Array.from(
-                JSON.parse(fs.readFileSync("/home/msi/.config/solana/seftzzz.json", "utf8"))
-              )
-            );
-
-            const sigFund = await sendAndConfirmTransaction(connection, fundTx, [payer]);
-            console.log(chalk.green(`✅ WSOL ATA funded: ${totalFund / 1e9} SOL (${sigFund})`));
-          }
-
-          // tambahkan sync delay agar cluster aware
-          await new Promise((r) => setTimeout(r, 1500));
-        } catch (e) {
-          console.error(chalk.red(`❌ Failed to recreate WSOL ATA: ${(e as Error).message}`));
-        }
+        await new Promise((r) => setTimeout(r, 2000)); // biar cluster sync
       } else {
         const parsed = await connection.getParsedAccountInfo(WSOL_ATA);
-        const state = (parsed.value as any)?.data?.parsed?.info?.state;
         const balance = (parsed.value as any)?.data?.parsed?.info?.tokenAmount?.uiAmount;
-        console.log(chalk.green(`✅ WSOL ATA exists: ${WSOL_ATA.toBase58()} [state=${state}, balance=${balance}]`));
+        console.log(chalk.green(`✅ WSOL ATA exists [balance=${balance}]`));
       }
     } catch (e) {
       console.warn(chalk.red("⚠️ WSOL ATA check failed:"), (e as Error).message);
@@ -1835,12 +1994,9 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     let sig: string;
     try {
       if (isVersioned) {
-        const vtx = VersionedTransaction.deserialize(txBuffer);
         console.log(chalk.green("🔄 Sending VersionedTransaction..."));
-        sig = await connection.sendTransaction(vtx, {
-          skipPreflight: false,
-          maxRetries: 5,
-        });
+        const vtx = VersionedTransaction.deserialize(txBuffer);
+        sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 5 });
       } else {
         console.log(chalk.green("🔄 Sending Legacy Transaction..."));
         sig = await sendAndConfirmRawTransaction(connection, txBuffer, {
@@ -1859,26 +2015,42 @@ router.post("/swap/submit", async (req: Request, res: Response) => {
     // ============================================================
     // 🧾 Konfirmasi transaksi di jaringan
     // ============================================================
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 10; i++) {
       const confirmation = await connection.confirmTransaction(sig, "confirmed");
       if (confirmation.value.err == null) {
         console.log(chalk.green("✅ Confirmed on-chain"));
-        res.json({ signature: sig, explorer: `https://solscan.io/tx/${sig}?cluster=mainnet` });
-        return;
+        break;
       }
       console.warn(chalk.yellow(`⚠️ Retry confirm [${i + 1}]...`));
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 4000));
     }
 
-    res.json({ signature: sig, explorer: `https://solscan.io/tx/${sig}?cluster=mainnet` });
+    // ============================================================
+    // 🧹 Cache Sync setelah Confirmed
+    // ============================================================
+    if (senderAddress) await invalidateWalletCache(senderAddress);
+    if (recipientAddress) await invalidateWalletCache(recipientAddress);
 
+    if (senderAddress) await refreshWalletCache(senderAddress);
+    if (recipientAddress) await refreshWalletCache(recipientAddress);
+
+    if (senderAddress) walletEvents.emit("forceUpdate", senderAddress);
+    if (recipientAddress) walletEvents.emit("forceUpdate", recipientAddress);
+
+    console.log("✅ Cache updated and broadcasted for swap participants.");
+
+    res.json({
+      signature: sig,
+      explorer: `https://solscan.io/tx/${sig}?cluster=mainnet`,
+    });
   } catch (err: any) {
     console.error(chalk.red("❌ swap/submit error:"), err.message);
     if (err.logs) console.error(chalk.gray("On-chain logs:"), err.logs.join("\n"));
 
-    // 🧠 Analisis otomatis untuk error umum
     if (err.message?.includes("custom program error: 0xbc4")) {
-      console.error(chalk.redBright("💥 Detected AnchorError: AccountNotInitialized — CPMM gagal baca ATA WSOL sebelum sync."));
+      console.error(
+        chalk.redBright("💥 Detected AnchorError: AccountNotInitialized — CPMM gagal baca ATA WSOL sebelum sync.")
+      );
     }
 
     res.status(500).json({ error: err.message });

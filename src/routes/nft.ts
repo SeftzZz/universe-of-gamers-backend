@@ -778,7 +778,7 @@ router.get("/my-nfts", authenticateJWT, async (req: AuthRequest, res) => {
     console.time("⏱ DB-find");
     const nfts = await Nft.find({
       owner: { $in: walletAddresses },
-      txSignature: { $exists: true, $ne: "" },
+      // txSignature: { $exists: true, $ne: "" },
     })
       .populate("character", "name rarity element")
       .populate("rune", "name rarity")
@@ -1234,21 +1234,42 @@ router.put("/team/:id", async (req, res) => {
   try {
     const { name, members } = req.body;
 
-    // ✅ Validasi baru: minimal 0, maksimal 3 anggota
+    // ✅ Validasi: minimal 0, maksimal 3 anggota
     if (members && (members.length < 0 || members.length > 3)) {
-      return res.status(400).json({ error: "A team must have between 0 and 3 NFTs" });
+      return res
+        .status(400)
+        .json({ error: "A team must have between 0 and 3 NFTs" });
     }
 
-    let updateData: any = {};
+    // ✅ Siapkan data update
+    const updateData: Record<string, any> = {};
     if (name) updateData.name = name;
     if (members) updateData.members = members;
 
+    // ✅ Update dan populate anggota tim
     const team = await Team.findByIdAndUpdate(req.params.id, updateData, {
-      new: true
+      new: true,
     }).populate("members");
 
-    if (!team) return res.status(404).json({ error: "Team not found" });
-    res.json(team);
+    if (!team) {
+      console.warn(`⚠️ [TEAM] Update failed — Team not found.`);
+      return res.status(404).json({ error: "Team not found" });
+    }
+
+    // ✅ Log perubahan ke console
+    console.log("========================================");
+    console.log(`🛠️ [TEAM UPDATED]`);
+    console.log(`🆔 Team ID   : ${team._id}`);
+    console.log(`🏷️ Name      : ${team.name}`);
+    console.log(`👥 Members   : ${team.members?.length || 0}`);
+    console.log(`🕓 Timestamp : ${new Date().toISOString()}`);
+    console.log("========================================");
+
+    res.json({
+      success: true,
+      message: "✅ Team updated successfully",
+      team,
+    });
   } catch (err: any) {
     console.error("❌ Error updating team:", err.message);
     res.status(500).json({ error: "Failed to update team" });
@@ -1262,30 +1283,52 @@ router.post("/team/:id/activate", authenticateJWT, async (req: AuthRequest, res)
   try {
     const teamId = req.params.id;
 
-    // Ambil user
-    const user = await Auth.findById(req.user.id).select("wallets custodialWallets");
+    // 1️⃣ Ambil user login
+    const user = await Auth.findById(req.user.id).select("wallets custodialWallets name email");
     if (!user) return res.status(401).json({ error: "User not found" });
 
     const walletAddresses = [
-      ...user.wallets.map((w) => w.address),
-      ...user.custodialWallets.map((c) => c.address),
+      ...(user.wallets?.map((w) => w.address) || []),
+      ...(user.custodialWallets?.map((c) => c.address) || []),
     ];
 
-    // Nonaktifkan semua team milik user
-    await Team.updateMany({ owner: { $in: walletAddresses } }, { $set: { isActive: false } });
+    // 2️⃣ Nonaktifkan semua tim milik user
+    await Team.updateMany(
+      { owner: { $in: walletAddresses } },
+      { $set: { isActive: false } }
+    );
 
-    // Aktifkan tim yang dipilih
+    // 3️⃣ Aktifkan tim yang dipilih
     const team = await Team.findOneAndUpdate(
       { _id: teamId, owner: { $in: walletAddresses } },
       { $set: { isActive: true } },
       { new: true }
     ).populate("members");
 
-    if (!team) return res.status(404).json({ error: "Team not found or not owned" });
+    if (!team) {
+      console.warn(`⚠️ [TEAM] Activation failed — not found or not owned by user.`);
+      return res.status(404).json({ error: "Team not found or not owned" });
+    }
 
-    res.json({ message: "✅ Team activated", team });
+    // 4️⃣ Catat log ke console
+    console.log("========================================");
+    console.log(`✅ [TEAM ACTIVATED]`);
+    console.log(`👤 User       : ${user.name || user._id}`);
+    console.log(`📬 Wallets    : ${walletAddresses.join(", ")}`);
+    console.log(`🆔 Team ID    : ${team._id}`);
+    console.log(`🏷️ Team Name  : ${team.name}`);
+    console.log(`👥 Members    : ${team.members?.length || 0}`);
+    console.log(`🕓 Timestamp  : ${new Date().toISOString()}`);
+    console.log("========================================");
+
+    // 5️⃣ (opsional) Kirim response ke client
+    res.json({
+      success: true,
+      message: "✅ Team activated successfully",
+      team,
+    });
   } catch (err: any) {
-    console.error("❌ Error activating team:", err);
+    console.error("❌ Error activating team:", err.message);
     res.status(500).json({ error: "Failed to activate team" });
   }
 });

@@ -203,7 +203,7 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
       ...r,
       tx: {
         mintAddress: r.mintAddress,
-        signature: `DUMMY_${Date.now()}_${r.mintAddress.slice(0, 6)}`
+        txSignature: `DUMMY_${Date.now()}_${r.mintAddress.slice(0, 6)}`
       }
     }));
 
@@ -246,27 +246,90 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     const pack = await GatchaPack.findById(packId);
     if (!pack) return res.status(404).json({ error: "Pack not found" });
 
+    // 🧾 Log detail pack
+    console.log("🎁 Gatcha Pack Selected ===============================");
+    console.log(`📦 Pack ID       : ${pack._id}`);
+    console.log(`🏷️  Name          : ${pack.name}`);
+    console.log(`📝 Description   : ${pack.description || "-"}`);
+    console.log(`💰 Price (SOL)   : ${pack.priceSOL || 0}`);
+    console.log(`🪙 Price (UOG)   : ${pack.priceUOG || 0}`);
+    console.log(`📅 Created At    : ${pack.createdAt}`);
+    console.log(`📅 Updated At    : ${pack.updatedAt}`);
+
+    if (pack.rewards && pack.rewards.length > 0) {
+      console.log("🎯 Rewards Table:");
+      console.log("─────────────────────────────────────────────");
+      pack.rewards.forEach((r, i) => {
+        console.log(
+          `  #${i + 1}. Type: ${r.type.padEnd(10)} | Rarity: ${r.rarity.padEnd(10)} | Chance: ${r.chance}%`
+        );
+      });
+      console.log("─────────────────────────────────────────────");
+    } else {
+      console.log("⚠️  No rewards configured for this pack.");
+    }
+    console.log("========================================================");
+
     let priceAmount = 0;
 
     if (paymentMint === "So11111111111111111111111111111111111111111") {
       const balanceLamports = await conn.getBalance(userKp.publicKey);
       const balanceSol = balanceLamports / anchorLib.web3.LAMPORTS_PER_SOL;
       priceAmount = pack.priceSOL || 0;
+
+      const MIN_SOL_RENT = 0.005; // realistic buffer
+      const totalNeeded = priceAmount + MIN_SOL_RENT;
+
+      if (balanceSol < totalNeeded) {
+        const deficit = (totalNeeded - balanceSol).toFixed(6);
+        return res.status(400).json({
+          error: "Insufficient SOL balance to perform gatcha.",
+          suggestion: `You need at least ${totalNeeded.toFixed(6)} SOL but currently have ${balanceSol.toFixed(6)} SOL.`,
+          details: `Add ${deficit} SOL more to cover mint account rent and network fees.`,
+        });
+      }
+
+      console.log("💰 [BALANCE CHECK - SOL]");
+      console.log(`👤 Wallet: ${userKp.publicKey.toBase58()}`);
+      console.log(`🔹 Current SOL Balance : ${balanceSol.toFixed(4)} SOL`);
+      console.log(`🔸 Pack Price (SOL)    : ${priceAmount} SOL`);
+      console.log(`📊 Remaining After Buy : ${(balanceSol - priceAmount).toFixed(4)} SOL`);
+      console.log("──────────────────────────────────────────────");
+
       if (balanceSol < priceAmount) {
-        return res.status(400).json({ error: "Insufficient SOL balance", balance: balanceSol, required: priceAmount });
+        return res.status(400).json({
+          error: "Insufficient SOL balance",
+          balance: balanceSol,
+          required: priceAmount,
+        });
       }
     } else if (paymentMint === process.env.UOG_MINT) {
       const UOG_MINT = new PublicKey(process.env.UOG_MINT!);
       const tokenAccounts = await conn.getTokenAccountsByOwner(userKp.publicKey, { mint: UOG_MINT });
+
       if (tokenAccounts.value.length === 0) {
         return res.status(400).json({ error: "User has no UOG account" });
       }
+
       const accountInfo = await conn.getTokenAccountBalance(tokenAccounts.value[0].pubkey);
       const balanceUOG = parseFloat(accountInfo.value.uiAmountString || "0");
       priceAmount = pack.priceUOG || 0;
+
+      console.log("💰 [BALANCE CHECK - UOG]");
+      console.log(`👤 Wallet: ${userKp.publicKey.toBase58()}`);
+      console.log(`🔹 Current UOG Balance : ${balanceUOG.toFixed(2)} UOG`);
+      console.log(`🔸 Pack Price (UOG)    : ${priceAmount} UOG`);
+      console.log(`📊 Remaining After Buy : ${(balanceUOG - priceAmount).toFixed(2)} UOG`);
+      console.log("──────────────────────────────────────────────");
+
       if (balanceUOG < priceAmount) {
-        return res.status(400).json({ error: "Insufficient UOG balance", balance: balanceUOG, required: priceAmount });
+        return res.status(400).json({
+          error: "Insufficient UOG balance",
+          balance: balanceUOG,
+          required: priceAmount,
+        });
       }
+
     } else {
       return res.status(400).json({ error: "Invalid paymentMint" });
     }
@@ -367,24 +430,73 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
           paymentMint,
         },
       });
-
     } catch (err: any) {
-      console.error("❌ Gatcha failed:", err);
+      console.error("❌ Gatcha failed!");
+      console.error("───────────────────────────────");
+      console.error("🧩 Error Message :", err.message || "Unknown error");
+      if (err.stack) console.error("📜 Stack Trace   :", err.stack);
+      console.error("───────────────────────────────");
 
-      // === Rollback otomatis
+      // 📦 Contextual details
+      console.error("🎮 Gatcha Context:");
+      console.error(`👤 User Wallet   : ${userKp?.publicKey?.toBase58?.() || "N/A"}`);
+      console.error(`💼 Custodian Addr: ${custodian?.address || "N/A"}`);
+      console.error(`📦 Pack Name     : ${pack?.name || "N/A"}`);
+      console.error(`💰 Price Amount  : ${priceAmount || 0}`);
+      console.error(`🪙 Payment Mint  : ${paymentMint}`);
+      console.error(`🔑 Mint Address  : ${mintKp?.publicKey?.toBase58?.() || "N/A"}`);
+      console.error(`🧱 NFT ID (DB)   : ${nft?._id || "N/A"}`);
+      console.error("───────────────────────────────");
+
+      // 🧠 Intelligent error detection
+      const logString = JSON.stringify(err.message || "") + JSON.stringify(err.logs || "");
+      let userFriendlyMessage = "Payment or mint transaction failed.";
+      let suggestedAction = "";
+
+      if (/insufficient lamports/i.test(err.message) || /Custom:1/i.test(err.message)) {
+        return res.status(400).json({
+          error: "Insufficient SOL balance during transaction.",
+          suggestion: "Please top up at least 0.01 SOL to your wallet and try again.",
+        });
+      } else if (/Simulation failed.*Custom:1/i.test(logString)) {
+        userFriendlyMessage = "Transaction simulation failed due to low SOL balance.";
+        suggestedAction = "Top up your SOL wallet to ensure enough rent and fee balance for minting.";
+      } else if (/blockhash not found/i.test(logString)) {
+        userFriendlyMessage = "Transaction expired or was not confirmed in time.";
+        suggestedAction = "Please retry your gatcha after a few seconds.";
+      } else if (/Listing PDA on-curve/i.test(logString)) {
+        userFriendlyMessage = "Internal PDA derivation error.";
+        suggestedAction = "Please retry the gatcha — a new mint will be generated automatically.";
+      } else if (/custom program error/i.test(logString)) {
+        userFriendlyMessage = "On-chain program error occurred during minting.";
+        suggestedAction = "Please retry later or contact support if the issue persists.";
+      }
+
+      // === Rollback
       try {
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-        if (nft && nft._id) await Nft.findByIdAndDelete(nft._id);
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          console.warn(`🗑️  Deleted metadata file: ${filePath}`);
+        }
+        if (nft && nft._id) {
+          await Nft.findByIdAndDelete(nft._id);
+          console.warn(`🗑️  Deleted NFT record ID: ${nft._id}`);
+        }
       } catch (rollbackErr: any) {
         console.warn("⚠️ Rollback warning:", rollbackErr.message);
       }
 
+      console.error("───────────────────────────────");
+      console.error("❗ End of Gatcha Failure Log");
+      console.error("───────────────────────────────");
+
+      // === Send detailed JSON response to user
       res.status(500).json({
-        error: "Payment or mint transaction failed",
+        error: userFriendlyMessage,
+        suggestion: suggestedAction,
         details: err.message,
       });
     }
-
   } catch (err: any) {
     console.error("❌ Gatcha error:", err);
     res.status(500).json({ error: err.message });
