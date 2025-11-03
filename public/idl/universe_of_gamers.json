@@ -102,6 +102,11 @@
           "isSigner": false
         },
         {
+          "name": "splMint",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
           "name": "treasuryTokenAccount",
           "isMut": true,
           "isSigner": false
@@ -160,6 +165,10 @@
         {
           "name": "useSol",
           "type": "bool"
+        },
+        {
+          "name": "mintFeeSpl",
+          "type": "u64"
         },
         {
           "name": "name",
@@ -590,6 +599,16 @@
       "code": 6004,
       "name": "InvalidNFT",
       "msg": "Invalid NFT"
+    },
+    {
+      "code": 6005,
+      "name": "InsufficientFunds",
+      "msg": "Insufficient Funds"
+    },
+    {
+      "code": 6006,
+      "name": "MathOverflow",
+      "msg": "Math Over flow"
     }
   ]
 }

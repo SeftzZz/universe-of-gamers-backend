@@ -1,10 +1,9 @@
 import fetch from "node-fetch";
-import dotenv from "dotenv";
+
 import { broadcast } from "../index";
 import WalletToken from "../models/WalletToken";
 import Redis from "ioredis";
 import { Client } from "@solana-tracker/data-api";
-dotenv.config();
 
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 

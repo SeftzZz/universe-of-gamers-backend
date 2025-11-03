@@ -29,9 +29,11 @@ export async function generateNftMetadata(
     const nft: INft | null = byMint
       ? await Nft.findOne({ mintAddress: idOrMint })
           .populate("character")
+          .populate("rune")
           .populate("equipped")
       : await Nft.findById(idOrMint)
           .populate("character")
+          .populate("rune")
           .populate("equipped");
 
     if (!nft) throw new Error("NFT not found");
@@ -42,26 +44,35 @@ export async function generateNftMetadata(
     // === 2. Handle equipped runes ===
     let runeAttributes: any[] = [];
     if (Array.isArray(nft.equipped) && nft.equipped.length > 0) {
-      const runeNfts = await Nft.find({ _id: { $in: nft.equipped } }).populate(
-        "rune"
-      );
-
+      const runeNfts = await Nft.find({ _id: { $in: nft.equipped } }).populate("rune");
       runeAttributes = runeNfts.map((runeNft: any, idx: number) => ({
         trait_type: `Equipped Rune #${idx + 1}`,
         value: runeNft.rune?.name || runeNft.name,
       }));
     }
 
-    // === 2b. Final name langsung dari DB ===
-    // ⚡ Tidak perlu hitung ulang numbering lagi
-    const finalName = nft.name || character?.name || rune?.name || "Unknown NFT";
+    // === 3. Tentukan image ===
+    let finalImage = nft.image || "";
+    if (!finalImage) {
+      if (character?.image) finalImage = character.image;
+      else if (rune?.image) finalImage = rune.image;
+      else finalImage = "https://api.universeofgamers.io/assets/placeholder.png";
+    }
 
-    // === 3. Build metadata JSON ===
+    // === 4. Tentukan description ===
+    const finalDescription =
+      nft.description ||
+      character?.description ||
+      rune?.description ||
+      `${nft.name || character?.name || rune?.name || "Unknown NFT"} — a digital collectible from Universe of Gamers.`;
+
+    // === 5. Build metadata JSON ===
+    const finalName = nft.name || character?.name || rune?.name || "Unknown NFT";
     const metadata = {
       name: finalName,
       symbol: "UOGNFT",
-      description: nft.description || `An NFT character from Universe of Gamers`,
-      image: nft.image,
+      description: finalDescription,
+      image: finalImage,
       seller_fee_basis_points: 500,
       external_url: `https://marketplace.universeofgamers.io/nft/${nft.mintAddress}`,
 
@@ -76,36 +87,45 @@ export async function generateNftMetadata(
         { trait_type: "SPD", value: nft.spd },
         { trait_type: "Crit Rate", value: nft.critRate + "%" },
         { trait_type: "Crit Dmg", value: nft.critDmg + "%" },
+        ...(character?.rarity ? [{ trait_type: "Rarity", value: character.rarity }] : []),
         ...runeAttributes,
       ].filter(Boolean),
 
       properties: {
-        files: [{ uri: nft.image, type: "image/jpg" }],
+        files: [{ uri: finalImage, type: "image/jpg" }],
         category: "image",
         creators: [
           {
             address: nft.owner,
-            verified: true, // 🔥 sudah verified
+            verified: true,
             share: 100,
           },
         ],
       },
     };
 
-    // === 4. Ensure output dir exists ===
+    // === 6. Ensure output dir exists ===
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    // === 5. Save metadata JSON pakai mintAddress.json ===
+    // === 7. Save metadata JSON pakai mintAddress.json ===
     const filePath = path.join(outputDir, `${nft.mintAddress}.json`);
     fs.writeFileSync(filePath, JSON.stringify(metadata, null, 2));
 
-    console.log(`✅ Metadata for NFT ${nft.mintAddress} saved to ${filePath}`);
+    console.log(
+      `✅ Metadata for NFT ${nft.mintAddress} saved to ${filePath}`
+    );
+    console.log("📦 Metadata snapshot:", {
+      name: metadata.name,
+      image: metadata.image,
+      rarity: character?.rarity,
+      element: character?.element,
+    });
+
     return { success: true, path: filePath, metadata };
   } catch (err: any) {
     console.error("❌ Failed to generate metadata:", err.message);
     return { success: false, error: err.message };
   }
 }
-

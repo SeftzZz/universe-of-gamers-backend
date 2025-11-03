@@ -29,8 +29,7 @@ import {
 
 import * as metadataPkg from "@metaplex-foundation/mpl-token-metadata";
 
-import dotenv from "dotenv";
-dotenv.config();
+import fetch from "node-fetch";
 
 const programIdStr = process.env.PROGRAM_ID;
 if (!programIdStr) throw new Error("❌ PROGRAM_ID is missing in .env");
@@ -133,7 +132,7 @@ export async function buildMintTransaction(
     name: string;
     symbol?: string;
     uri: string;
-    price: number;
+    price: number; // harga mint NFT dalam SOL
     royalty?: number;
   },
   paymentMint: string,
@@ -153,42 +152,41 @@ export async function buildMintTransaction(
   const sellerPk = new PublicKey(owner);
   const useSol = paymentMint === "So11111111111111111111111111111111111111111";
 
-  let decimals = 0;
-  if (!useSol) {
-    const mintInfo = await getMint(connection, new PublicKey(paymentMint));
-    decimals = mintInfo.decimals;
-  }
+  const priceUnits = Math.ceil(metadata.price * LAMPORTS_PER_SOL);
+  console.log("💰 price input:", metadata.price, "→", priceUnits, "lamports");
 
-  const priceUnits = useSol
-    ? Math.ceil(metadata.price * anchor.web3.LAMPORTS_PER_SOL)
-    : Math.ceil(metadata.price * 10 ** decimals);
+  // === Ambil harga SOL dan UOG dari CoinGecko ===
+  console.log("🌐 Fetching SOL↔UOG price from CoinGecko...");
+  const cgRes = await fetch(
+    "https://api.coingecko.com/api/v3/simple/price?ids=solana,universe-of-gamers&vs_currencies=usd"
+  );
+  const cgData = await cgRes.json();
 
-  console.log("💰 price input:", metadata.price, "→ priceUnits:", priceUnits, "useSol:", useSol);
+  const solPriceUsd = cgData.solana?.usd || 0;
+  const uogPriceUsd = cgData["universe-of-gamers"]?.usd || 0;
 
-  // === Derive valid off-curve listing PDA ===
-  let listingPda: PublicKey | null = null;
-  let listingBump: number | null = null;
+  if (!solPriceUsd || !uogPriceUsd) throw new Error("❌ Failed to fetch SOL/UOG prices from CoinGecko");
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const [pda, bump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("listing"), mintKp.publicKey.toBuffer()],
-      program.programId
-    );
+  const uogPerSol = solPriceUsd / uogPriceUsd;
+  console.log(`💹 Rate: 1 SOL ≈ ${uogPerSol.toLocaleString()} UOG`);
 
-    if (bump !== 255) {
-      listingPda = pda;
-      listingBump = bump;
-      break;
-    }
+  // === Hitung mint fee SPL (UOG) dari 5% harga SOL ===
+  const mintFeeBps = 1000; // 10%
+  const feeSol = metadata.price * (mintFeeBps / 10_000);
+  const mintFeeUog = feeSol * uogPerSol;
 
-    console.warn(`⚠️ [${attempt + 1}] Listing PDA on-curve, regenerating mint...`);
-    mintKp = Keypair.generate();
-  }
+  // UOG memiliki 6 desimal → konversi ke smallest unit
+  const mintFeeSpl = Math.ceil(mintFeeUog * 10 ** 6);
 
-  if (!listingPda || listingBump === null || listingBump === 255) {
-    throw new Error("Failed to generate off-curve listing PDA after retries");
-  }
+  console.log(
+    `💸 Fee 10% dari ${metadata.price} SOL = ${feeSol} SOL ≈ ${mintFeeUog.toFixed(2)} UOG (${mintFeeSpl} microUOG)`
+  );
 
+  // === Derive PDA ===
+  const [listingPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("listing"), mintKp.publicKey.toBuffer()],
+    program.programId
+  );
   const [escrowSignerPda] = PublicKey.findProgramAddressSync(
     [Buffer.from("escrow_signer"), mintKp.publicKey.toBuffer()],
     program.programId
@@ -206,7 +204,6 @@ export async function buildMintTransaction(
     program.programId
   );
 
-  // === Market Config debug ===
   const mc: any = await program.account.marketConfig.fetch(marketConfigPda);
   console.log("market_config:", {
     mintFeeBps: mc.mintFeeBps.toString(),
@@ -222,31 +219,28 @@ export async function buildMintTransaction(
   );
   const royaltyBps = Math.floor((metadata.royalty || 0) * 100);
 
-  // === ATAs ===
+  // === SPL mint untuk fee (UOG) ===
+  const splMint = new PublicKey(process.env.UOG_MINT!);
+
   const sellerNftAta = getAssociatedTokenAddressSync(mintKp.publicKey, sellerPk);
+  const sellerPaymentAta = getAssociatedTokenAddressSync(splMint, sellerPk);
+  const treasuryTokenAta = getAssociatedTokenAddressSync(splMint, treasuryPda, true);
+
   const ataIxs: TransactionInstruction[] = [];
-  let treasuryPaymentAta = SystemProgram.programId;
-  let sellerPaymentAta = sellerPk;
 
-  if (!useSol) {
-    const sellerRes = await ensureAtaExists(connection, new PublicKey(paymentMint), sellerPk, userKp.publicKey);
-    sellerPaymentAta = sellerRes.ata;
-    if (sellerRes.ix) ataIxs.push(sellerRes.ix);
-
-    const treasuryRes = await ensureTreasuryAtaExists(connection, new PublicKey(paymentMint), treasuryPda, userKp.publicKey);
-    treasuryPaymentAta = treasuryRes.ata;
-    if (treasuryRes.ix) ataIxs.push(treasuryRes.ix);
-
-    console.log("📌 ATAs (SPL):", {
-      sellerPaymentAta: sellerPaymentAta.toBase58(),
-      treasuryPaymentAta: treasuryPaymentAta.toBase58(),
-    });
-  } else {
-    sellerPaymentAta = sellerPk;
-    treasuryPaymentAta = treasuryPda;
+  if (!(await connection.getAccountInfo(sellerPaymentAta))) {
+    ataIxs.push(
+      createAssociatedTokenAccountInstruction(userKp.publicKey, sellerPaymentAta, sellerPk, splMint)
+    );
   }
 
-  // === Create Mint Account + Init ===
+  if (!(await connection.getAccountInfo(treasuryTokenAta))) {
+    ataIxs.push(
+      createAssociatedTokenAccountInstruction(userKp.publicKey, treasuryTokenAta, treasuryPda, splMint)
+    );
+  }
+
+  // === Create mint account ===
   const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
   const createMintIx = SystemProgram.createAccount({
     fromPubkey: userKp.publicKey,
@@ -255,6 +249,7 @@ export async function buildMintTransaction(
     lamports,
     programId: TOKEN_PROGRAM_ID,
   });
+
   const initMintIx = createInitializeMintInstruction(mintKp.publicKey, 0, mintAuthPda, null);
   const createSellerNftAtaIx = createAssociatedTokenAccountInstruction(
     userKp.publicKey,
@@ -263,11 +258,200 @@ export async function buildMintTransaction(
     mintKp.publicKey
   );
 
-  // === Anchor Instruction: mint_and_list ===
+  // === mint_and_list ===
   const txMintList = await program.methods
     .mintAndList(
       new anchor.BN(priceUnits),
       useSol,
+      new anchor.BN(mintFeeSpl),
+      metadata.name,
+      metadata.symbol || "UOGNFT",
+      metadata.uri,
+      royaltyBps
+    )
+    .accountsStrict({
+      listing: listingPda,
+      escrowSigner: escrowSignerPda,
+      seller: sellerPk,
+      mint: mintKp.publicKey,
+      sellerNftAta,
+      mintAuthority: mintAuthPda,
+      treasuryPda,
+      paymentMint: new PublicKey(paymentMint), // So111...
+      splMint,
+      treasuryTokenAccount: treasuryTokenAta,
+      sellerPaymentAta,
+      marketConfig: marketConfigPda,
+      metadata: metadataPda,
+      tokenMetadataProgram: METADATA_PROGRAM_ID,
+      payer: userKp.publicKey,
+      updateAuthority: userKp.publicKey,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+    })
+    .transaction();
+
+  const txMint = new Transaction().add(
+    createMintIx,
+    initMintIx,
+    createSellerNftAtaIx,
+    ...ataIxs,
+    ...txMintList.instructions
+  );
+
+  txMint.feePayer = userKp.publicKey;
+  txMint.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  txMint.partialSign(mintKp, userKp);
+
+  console.log("🚀 Simulating...");
+  const sim = await connection.simulateTransaction(txMint);
+  if (sim.value.err) {
+    console.error("❌ Simulation failed:", sim.value.err);
+    console.error(sim.value.logs);
+    throw new Error("Simulation failed");
+  }
+
+  const sig = await connection.sendRawTransaction(txMint.serialize());
+  await connection.confirmTransaction(sig, "confirmed");
+  console.log("✅ mint_and_list confirmed:", sig);
+
+  return {
+    mintSignature: sig,
+    mint: mintKp.publicKey.toBase58(),
+    listing: listingPda.toBase58(),
+    mintFeeSpl,
+    solToUogRate: uogPerSol,
+  };
+}
+
+export async function buildMintTransactionPhantom(
+  owner: string,
+  metadata: {
+    name: string;
+    symbol?: string;
+    uri: string;
+    price: number;
+    royalty?: number;
+  },
+  paymentMint: string,
+  mintKp: anchor.web3.Keypair
+) {
+  console.log("=== 🏗️ BUILD MINT TRANSACTION (Phantom version) ===");
+
+  const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
+  const provider = new anchor.AnchorProvider(connection, {} as any, {
+    preflightCommitment: "confirmed",
+  });
+  const program = new anchor.Program(
+    require("../../public/idl/universe_of_gamers.json"),
+    new PublicKey(process.env.PROGRAM_ID!),
+    provider
+  );
+
+  const sellerPk = new PublicKey(owner);
+  const useSol = paymentMint === "So11111111111111111111111111111111111111111";
+  const priceUnits = Math.ceil(metadata.price * LAMPORTS_PER_SOL);
+  console.log("💰 Price:", metadata.price, "→", priceUnits, "lamports");
+
+  // === Fetch SOL↔UOG rate ===
+  console.log("🌐 Fetching SOL↔UOG price...");
+  const cgRes = await fetch(
+    "https://api.coingecko.com/api/v3/simple/price?ids=solana,universe-of-gamers&vs_currencies=usd"
+  );
+  const cgData = await cgRes.json();
+  const solUsd = cgData.solana?.usd;
+  const uogUsd = cgData["universe-of-gamers"]?.usd;
+  if (!solUsd || !uogUsd) throw new Error("❌ Failed to fetch CoinGecko rates");
+
+  const uogPerSol = solUsd / uogUsd;
+  const mintFeeBps = 1000; // 10%
+  const feeSol = metadata.price * (mintFeeBps / 10_000);
+  const mintFeeUog = feeSol * uogPerSol;
+  const mintFeeSpl = Math.ceil(mintFeeUog * 10 ** 6);
+
+  console.log(
+    `💸 Fee 10% dari ${metadata.price} SOL = ${feeSol.toFixed(3)} SOL ≈ ${mintFeeUog.toFixed(
+      2
+    )} UOG (${mintFeeSpl} microUOG)`
+  );
+
+  // === PDAs ===
+  const [listingPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("listing"), mintKp.publicKey.toBuffer()],
+    program.programId
+  );
+  const [escrowSignerPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("escrow_signer"), mintKp.publicKey.toBuffer()],
+    program.programId
+  );
+  const [marketConfigPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("market_config")],
+    program.programId
+  );
+  const [treasuryPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("treasury")],
+    program.programId
+  );
+  const [mintAuthPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("mint_auth"), mintKp.publicKey.toBuffer()],
+    program.programId
+  );
+
+  const mc: any = await program.account.marketConfig.fetch(marketConfigPda);
+  console.log("market_config:", {
+    mintFeeBps: mc.mintFeeBps.toString(),
+    tradeFeeBps: mc.tradeFeeBps.toString(),
+    treasuryBump: mc.treasuryBump,
+    admin: mc.admin.toBase58(),
+  });
+
+  const [metadataPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("metadata"), METADATA_PROGRAM_ID.toBuffer(), mintKp.publicKey.toBuffer()],
+    METADATA_PROGRAM_ID
+  );
+  const royaltyBps = Math.floor((metadata.royalty || 0) * 100);
+
+  const splMint = new PublicKey(process.env.UOG_MINT!);
+  const sellerNftAta = getAssociatedTokenAddressSync(mintKp.publicKey, sellerPk);
+  const sellerPaymentAta = getAssociatedTokenAddressSync(splMint, sellerPk);
+  const treasuryTokenAta = getAssociatedTokenAddressSync(splMint, treasuryPda, true);
+
+  const ataIxs: TransactionInstruction[] = [];
+  if (!(await connection.getAccountInfo(sellerPaymentAta))) {
+    ataIxs.push(
+      createAssociatedTokenAccountInstruction(sellerPk, sellerPaymentAta, sellerPk, splMint)
+    );
+  }
+  if (!(await connection.getAccountInfo(treasuryTokenAta))) {
+    ataIxs.push(
+      createAssociatedTokenAccountInstruction(sellerPk, treasuryTokenAta, treasuryPda, splMint)
+    );
+  }
+
+  // === Create Mint Account ===
+  const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
+  const createMintIx = SystemProgram.createAccount({
+    fromPubkey: sellerPk, // Phantom sebagai payer
+    newAccountPubkey: mintKp.publicKey,
+    space: MINT_SIZE,
+    lamports,
+    programId: TOKEN_PROGRAM_ID,
+  });
+  const initMintIx = createInitializeMintInstruction(mintKp.publicKey, 0, mintAuthPda, null);
+  const createSellerNftAtaIx = createAssociatedTokenAccountInstruction(
+    sellerPk,
+    sellerNftAta,
+    sellerPk,
+    mintKp.publicKey
+  );
+
+  // === Mint and List ===
+  const txMintList = await program.methods
+    .mintAndList(
+      new anchor.BN(priceUnits),
+      useSol,
+      new anchor.BN(mintFeeSpl),
       metadata.name,
       metadata.symbol || "UOGNFT",
       metadata.uri,
@@ -282,21 +466,22 @@ export async function buildMintTransaction(
       mintAuthority: mintAuthPda,
       treasuryPda,
       paymentMint: new PublicKey(paymentMint),
-      treasuryTokenAccount: treasuryPaymentAta,
+      splMint,
+      treasuryTokenAccount: treasuryTokenAta,
       sellerPaymentAta,
       marketConfig: marketConfigPda,
       metadata: metadataPda,
       tokenMetadataProgram: METADATA_PROGRAM_ID,
-      payer: userKp.publicKey,
-      updateAuthority: userKp.publicKey,
+      payer: sellerPk,
+      updateAuthority: sellerPk,
       tokenProgram: TOKEN_PROGRAM_ID,
       systemProgram: SystemProgram.programId,
       rent: anchor.web3.SYSVAR_RENT_PUBKEY,
     })
     .transaction();
 
-  // === Combine All Instructions ===
-  const txMint = new Transaction().add(
+  // === Build full transaction ===
+  const tx = new Transaction().add(
     createMintIx,
     initMintIx,
     createSellerNftAtaIx,
@@ -304,44 +489,26 @@ export async function buildMintTransaction(
     ...txMintList.instructions
   );
 
-  txMint.feePayer = userKp.publicKey;
-  txMint.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  txMint.partialSign(mintKp, userKp);
+  const { blockhash } = await connection.getLatestBlockhash();
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = sellerPk;
 
-  try {
-    console.log("🚀 Sending mint_and_list transaction...");
-    const txBuffer = txMint.serialize();
-    const simResult = await connection.simulateTransaction(txMint);
+  // 🔹 Partial sign oleh backend hanya untuk mintKp
+  tx.partialSign(mintKp);
 
-    // 🧠 Log hasil simulasi dulu sebelum dikirim
-    if (simResult.value.err) {
-      console.error("🧩 Simulation failed before sending TX:", simResult.value.err);
-      console.error("📜 Simulation Logs:", simResult.value.logs);
-      throw new Error(`Simulation failed: ${JSON.stringify(simResult.value.err)}`);
-    } else {
-      console.log("✅ Simulation success, logs:");
-      console.log(simResult.value.logs);
-    }
+  const serialized = tx.serialize({
+    requireAllSignatures: false,
+    verifySignatures: false,
+  });
+  const base64Tx = serialized.toString("base64");
 
-    // 🛰️ Kirim transaksi ke jaringan
-    const sigMint = await connection.sendRawTransaction(txBuffer, { skipPreflight: false });
-    console.log("📡 Sent raw transaction:", sigMint);
+  console.log("📦 Unsigned transaction built for Phantom");
 
-    const confirmation = await connection.confirmTransaction(sigMint, "confirmed");
-    console.log("✅ mint_and_list confirmed:", sigMint);
-    console.log("📊 Confirmation status:", confirmation);
-
-    return {
-      mintSignature: sigMint,
-      mint: mintKp.publicKey.toBase58(),
-      listing: listingPda.toBase58(),
-      listingBump,
-    };
-  } catch (err: any) {
-    console.error("🚨 Mint transaction failed!");
-    console.error("🧩 Error Message:", err.message || err);
-    if (err.logs) console.error("📜 On-chain Logs:", err.logs);
-    throw err; // lempar ke atas biar ketangkap oleh catch utama
-  }
+  return {
+    transaction: base64Tx, // kirim ke frontend
+    mint: mintKp.publicKey.toBase58(),
+    listing: listingPda.toBase58(),
+    solToUogRate: uogPerSol,
+    mintFeeSpl,
+  };
 }
-

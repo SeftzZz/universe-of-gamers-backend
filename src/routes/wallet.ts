@@ -37,7 +37,7 @@ import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
 import { BN } from "bn.js";
 import axios from "axios";
-import dotenv from "dotenv";
+
 import { getTokenInfo } from "../services/priceService";
 import { invalidateWalletCache, walletEvents } from "../services/walletStreamService";
 import { getWalletBalance, refreshWalletCache } from "../services/walletStreamService"; 
@@ -76,7 +76,6 @@ import pLimit from "p-limit";
 
 import Redis from "ioredis";
 
-dotenv.config();
 const router = Router();
 const limit = pLimit(5);
 

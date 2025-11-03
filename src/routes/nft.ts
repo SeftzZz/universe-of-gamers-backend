@@ -58,9 +58,6 @@ import Redis from "ioredis";
 import pLimit from "p-limit";
 import { broadcast } from "../index";
 
-import dotenv from "dotenv";
-dotenv.config();
-
 interface MulterRequest extends Request {
   file?: Express.Multer.File;
 }

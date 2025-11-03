@@ -8,7 +8,10 @@ import { HeroConfig } from "../models/HeroConfig";
 import { Team } from "../models/Team";
 import { Player } from "../models/Player";
 import { PlayerHero } from "../models/PlayerHero"; // ✅ wajib
+import { Nft } from "../models/Nft";               // ✅ untuk verifikasi NFT
+import { ICharacter } from "../models/Character";
 import { startOfDay, endOfDay } from "date-fns";
+import { broadcast } from "../index";
 
 const router = express.Router();
 
@@ -26,8 +29,109 @@ async function getRankModifier(rank: string): Promise<number> {
   return rankDoc ? rankDoc.modifier : 0;
 }
 
-// Hitung total economic fragment berdasarkan rarity & level anggota tim
-export async function calculateEconomicFragment(
+// =====================================================
+// 🛡️ Helper: Verifikasi Integritas NFT
+// =====================================================
+async function verifyNftIntegrity(nft: any): Promise<void> {
+  console.log("──────────────────────────────────────────────");
+  console.log(`🔍 Verifying NFT Integrity: ${nft.name}`);
+  console.log(`🔑 Mint Address: ${nft.mintAddress}`);
+  console.log("──────────────────────────────────────────────");
+
+  // === 1️⃣ Ambil data NFT original dari DB
+  const original = await Nft.findOne({ mintAddress: nft.mintAddress })
+    .populate({ path: "character", model: "Character" })
+    .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } });
+
+  if (!original) {
+    console.error("❌ NFT tidak ditemukan di database!");
+    throw new Error(`NFT ${nft.name} not found or invalid mintAddress`);
+  }
+
+  // === 2️⃣ Validasi karakter
+  const char = original.character as any;
+  if (!char || typeof char !== "object" || !("baseHp" in char)) {
+    console.error("❌ Character blueprint hilang atau tidak valid:", char);
+    throw new Error(`NFT ${nft.name} missing or invalid character blueprint`);
+  }
+
+  console.log("🧬 Character Blueprint Loaded:");
+  console.table({
+    Name: char.name || "-",
+    baseHp: char.baseHp,
+    baseAtk: char.baseAtk,
+    baseDef: char.baseDef,
+    baseSpd: char.baseSpd,
+    baseCritRate: char.baseCritRate,
+    baseCritDmg: char.baseCritDmg,
+  });
+
+  // === 3️⃣ Hitung bonus dari rune
+  const equipped = (original.equipped || []) as any[];
+  const bonus = { hp: 0, atk: 0, def: 0, spd: 0, critRate: 0, critDmg: 0 };
+
+  if (equipped.length > 0) {
+    console.log(`💎 Equipped Runes (${equipped.length}):`);
+    for (const [i, e] of equipped.entries()) {
+      const rune = e?.rune as any;
+      if (!rune) continue;
+      console.log(`   #${i + 1}: ${rune.name || "Unknown Rune"}`);
+      console.table({
+        hpBonus: rune.hpBonus ?? 0,
+        atkBonus: rune.atkBonus ?? 0,
+        defBonus: rune.defBonus ?? 0,
+        spdBonus: rune.spdBonus ?? 0,
+        critRateBonus: rune.critRateBonus ?? 0,
+        critDmgBonus: rune.critDmgBonus ?? 0,
+      });
+
+      bonus.hp += rune.hpBonus ?? 0;
+      bonus.atk += rune.atkBonus ?? 0;
+      bonus.def += rune.defBonus ?? 0;
+      bonus.spd += rune.spdBonus ?? 0;
+      bonus.critRate += rune.critRateBonus ?? 0;
+      bonus.critDmg += rune.critDmgBonus ?? 0;
+    }
+  } else {
+    console.log("💤 Tidak ada rune yang terpasang.");
+  }
+
+  console.log("📊 Total Rune Bonus:");
+  console.table(bonus);
+
+  // === 4️⃣ Fungsi bantu
+  const safe = (v: number) => (Number.isFinite(v) ? v : 0);
+  const check = (label: string, base: number, actual: number, bonusVal = 0) => {
+    const allowed = base + bonusVal + Math.max(5, base * 0.05);
+    console.log(
+      `🔹 Check [${label.toUpperCase()}]: base=${base}, bonus=${bonusVal}, actual=${actual}, allowed≤${allowed}`
+    );
+    if (actual > allowed) {
+      console.error(
+        `🚨 Cheat detected → ${label}=${actual} > allowed=${allowed} (base=${base}, bonus=${bonusVal})`
+      );
+      throw new Error(
+        `Cheat detected on ${nft.name}: ${label}=${actual} > allowed=${allowed}`
+      );
+    }
+  };
+
+  // === 5️⃣ Jalankan semua pengecekan
+  check("hp", safe(char.baseHp), safe(nft.hp), safe(bonus.hp));
+  check("atk", safe(char.baseAtk), safe(nft.atk), safe(bonus.atk));
+  check("def", safe(char.baseDef), safe(nft.def), safe(bonus.def));
+  check("spd", safe(char.baseSpd), safe(nft.spd), safe(bonus.spd));
+  check("critRate", safe(char.baseCritRate), safe(nft.critRate), safe(bonus.critRate));
+  check("critDmg", safe(char.baseCritDmg), safe(nft.critDmg), safe(bonus.critDmg));
+
+  // === 6️⃣ Hasil akhir
+  console.log(`✅ NFT integrity OK: ${nft.name}`);
+  console.log("──────────────────────────────────────────────");
+}
+// =====================================================
+// 💰 Economic Fragment Calculation
+// =====================================================
+async function calculateEconomicFragment(
   teamId: Types.ObjectId | string
 ): Promise<number> {
   const team = await Team.findById(teamId).populate("members");
@@ -40,7 +144,6 @@ export async function calculateEconomicFragment(
   const rarityOrder = ["common", "rare", "epic", "legendary"];
 
   for (const h of team.members as any[]) {
-    // Pastikan tiap NFT punya rarity & level
     const rarity = h.rarity ?? "common";
     const level = h.level ?? 1;
 
@@ -57,10 +160,7 @@ export async function calculateEconomicFragment(
   const rarityCfg = await HeroConfig.findOne({ rarity: lowestRarity });
   const teamModifier = rarityCfg ? rarityCfg.teamModifier : 0.15;
 
-  const economicFragment =
-    totalNormalized * (1 - teamModifier) + teamModifier;
-
-  return economicFragment;
+  return totalNormalized * (1 - teamModifier) + teamModifier;
 }
 
 async function saveDailyEarning(
@@ -68,11 +168,9 @@ async function saveDailyEarning(
   playerId: string
 ) {
   try {
-    // 🎯 Tentukan rentang waktu hari ini
     const todayStart = startOfDay(new Date());
     const todayEnd = endOfDay(new Date());
 
-    // 🧮 Update atau insert jika belum ada
     await DailyEarning.findOneAndUpdate(
       {
         playerId,
@@ -85,8 +183,8 @@ async function saveDailyEarning(
           heroesUsed: result.heroes,
         },
         $inc: {
-          totalFragment: result.totalFragment, // tambah akumulasi
-          totalDailyEarning: result.totalDaily, // tambah total harian
+          totalFragment: result.totalFragment,
+          totalDailyEarning: result.totalDaily,
         },
       },
       { upsert: true, new: true }
@@ -96,21 +194,23 @@ async function saveDailyEarning(
   }
 }
 
+
+// =====================================================
+// 🎮 API ROUTES
+// =====================================================
+
 /**
  * CREATE new battle
- * Body: { players: [{user, team}], mode: "pvp"|"pve"|"raid" }
  */
 router.post("/battle", async (req, res) => {
   try {
     const { players, mode } = req.body;
-
     if (!players || players.length < 2) {
       return res.status(400).json({ error: "At least 2 players required" });
     }
 
     const battle = new Battle({ players, mode, result: "init_battle", log: [] });
     await battle.save();
-
     res.status(201).json(battle);
   } catch (err: any) {
     console.error("❌ Error creating battle:", err.message);
@@ -120,18 +220,12 @@ router.post("/battle", async (req, res) => {
 
 /**
  * GET all battles
- * Optional query: ?user=WalletAddress&mode=pvp
  */
 router.get("/battle", async (req, res) => {
   try {
     const filter: any = {};
-    if (req.query.user) {
-      filter["players.user"] = req.query.user;
-    }
-    if (req.query.mode) {
-      filter.mode = req.query.mode;
-    }
-
+    if (req.query.user) filter["players.user"] = req.query.user;
+    if (req.query.mode) filter.mode = req.query.mode;
     const battles = await Battle.find(filter).populate("players.team");
     res.json(battles);
   } catch (err: any) {
@@ -156,147 +250,266 @@ router.get("/battle/:id", async (req, res) => {
 
 /**
  * UPDATE battle (status, result, winner)
- * Body: { result?, players? (update isWinner) }
+ * ✅ Tambahkan verifikasi integritas NFT
  */
-// ✅ PUT: update battle result & sync earnings
-// ✅ Endpoint update battle + hitung earning otomatis
 router.put("/battle/:id", async (req, res) => {
   try {
-    const { result, players } = req.body;
+    const { result, players, attacker, defender, skill, damage, isCrit } = req.body;
+    const battleId = req.params.id;
 
-    // 1️⃣ Update battle result
-    const updateData: Record<string, any> = {};
-    if (result) updateData.result = result;
-    if (players) updateData.players = players;
+    // ======================================================
+    // ⚔️ UPDATE BATTLE RESULT
+    // ======================================================
+    if (result || players) {
+      console.log("──────────────────────────────────────────────");
+      console.log(`⚔️ [PUT /battle/${battleId}] Starting update...`);
+      console.log(`🧩 Result: ${result || "N/A"}`);
+      console.log(`👥 Players in request: ${players ? players.length : 0}`);
 
-    const battle = await Battle.findByIdAndUpdate(req.params.id, updateData, {
-      new: true,
-    })
-      .populate({
-        path: "players.team",
-        model: "Team",
-        populate: {
-          path: "members",
-          model: "Nft",
+      const updateData: Record<string, any> = {};
+      if (result) updateData.result = result;
+      if (players) updateData.players = players;
+
+      const battle = await Battle.findByIdAndUpdate(battleId, updateData, { new: true })
+        .populate({
+          path: "players.team",
+          model: "Team",
           populate: {
-            path: "character",
-            model: "Character",
-            select:
-              "name baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg basicAttack skillAttack ultimateAttack",
+            path: "members",
+            model: "Nft",
+            populate: {
+              path: "character",
+              model: "Character",
+              select:
+                "name baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg basicAttack skillAttack ultimateAttack",
+            },
           },
-        },
-      });
+        });
 
-    if (!battle) return res.status(404).json({ error: "Battle not found" });
+      if (!battle) {
+        console.error("❌ Battle not found:", battleId);
+        return res.status(404).json({ error: "Battle not found" });
+      }
 
-    // ===============================================
-    // 2️⃣ Jika Battle Selesai → Proses Earning
-    // ===============================================
-    if (result === "end_battle") {
+      console.log(`✅ Battle found → ${battle._id}`);
+      console.log(`📊 Players count: ${battle.players.length}`);
+      console.log("──────────────────────────────────────────────");
+
+      // ✅ Anti-cheat verification
       for (const p of battle.players) {
         const playerId = p.user;
-        const isWinner = p.isWinner;
+        console.log(`🔎 Verifying team integrity for player: ${playerId}`);
 
-        // === Ambil Data Tim ===
-        const teamId = p.team?._id || p.team;
-        const economicFragment = await calculateEconomicFragment(teamId);
+        const team: any =
+          p.team && typeof p.team === "object" && "members" in p.team
+            ? p.team
+            : await Team.findById(p.team).populate({
+                path: "members",
+                model: "Nft",
+                populate: { path: "character", model: "Character" },
+              });
 
-        // === Rank Modifier ===
-        const lastEarning = await DailyEarning.findOne({ playerId }).sort({
-          createdAt: -1,
-        });
-        const playerRank = lastEarning?.rank || "sentinel";
-        const rankModifier = await getRankModifier(playerRank);
+        if (team?.members && Array.isArray(team.members)) {
+          for (const nft of team.members) {
+            console.log(`🧬 Verifying NFT integrity → ${nft.name}`);
+            await verifyNftIntegrity(nft);
+          }
+        }
+      }
 
-        // === Win Streak ===
-        const winStreak = isWinner ? (lastEarning?.winStreak || 0) + 1 : 0;
+      console.log("✅ All NFT integrity checks passed");
+      console.log("──────────────────────────────────────────────");
 
-        // === Skill Fragment Berdasarkan Winrate ===
-        const WINRATE_MODIFIER: Record<number, number> = {
-          1: 0.01,
-          2: 0.05,
-          3: 0.07,
-          4: 0.09,
-          5: 0.11,
-          6: 0.13,
-          7: 0.15,
-          8: 0.17,
-          9: 0.21,
-        };
-        const skillFragment =
-          (WINRATE_MODIFIER[Math.min(winStreak, 9)] || 0.21) * 100;
+      // ===================================================
+      // Jika Battle selesai → Proses reward/earning
+      // ===================================================
+      if (result === "end_battle") {
+        console.log("🎯 Battle marked as END — processing rewards...");
+        for (const p of battle.players) {
+          const playerId = p.user;
+          const isWinner = p.isWinner;
+          console.log(`🏁 Processing player: ${playerId} (${isWinner ? "WINNER" : "LOSER"})`);
 
-        // === Booster ===
-        const booster = winStreak >= 3 ? 2 : 1;
+          const teamId = p.team?._id || p.team;
+          const economicFragment = await calculateEconomicFragment(teamId);
+          console.log(`💰 Economic Fragment: ${economicFragment.toFixed(4)}`);
 
-        // === Total Fragment ===
-        const totalFragment =
-          (economicFragment * skillFragment) * booster * rankModifier;
+          const lastEarning = await DailyEarning.findOne({ playerId }).sort({ createdAt: -1 });
+          const playerRank = lastEarning?.rank || "sentinel";
+          const rankModifier = await getRankModifier(playerRank);
+          console.log(`🎖️ Rank: ${playerRank} | Rank Modifier: ${rankModifier}`);
 
-        const totalDaily = totalFragment * 10;
+          const winStreak = isWinner ? (lastEarning?.winStreak || 0) + 1 : 0;
+          const WINRATE_MODIFIER: Record<number, number> = {
+            1: 0.01, 2: 0.05, 3: 0.07, 4: 0.09, 5: 0.11,
+            6: 0.13, 7: 0.15, 8: 0.17, 9: 0.21,
+          };
+          const skillFragment = (WINRATE_MODIFIER[Math.min(winStreak, 9)] || 0.21) * 100;
+          const booster = winStreak >= 3 ? 2 : 1;
 
-        // === Tentukan Game Number Harian ===
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+          const totalFragment = economicFragment * skillFragment * booster * rankModifier;
+          const totalDaily = totalFragment * 10;
 
-        const lastGame = await MatchEarning.findOne({
-          playerId,
-          createdAt: { $gte: today },
-        })
-          .sort({ createdAt: -1 });
+          console.log(`📈 Win Streak: ${winStreak}`);
+          console.log(`⚙️  Skill Fragment: ${skillFragment}`);
+          console.log(`⚙️  Booster: ${booster}`);
+          console.log(`💎 Total Fragment: ${totalFragment.toFixed(2)}`);
+          console.log(`💰 Total Daily: ${totalDaily.toFixed(2)}`);
 
-        const nextGameNumber = lastGame ? lastGame.gameNumber + 1 : 1;
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          const lastGame = await MatchEarning.findOne({
+            playerId,
+            createdAt: { $gte: today },
+          }).sort({ createdAt: -1 });
+          const nextGameNumber = lastGame ? lastGame.gameNumber + 1 : 1;
 
-        // === Simpan ke MatchEarning ===
-        await MatchEarning.create({
-          playerId,
-          gameNumber: nextGameNumber,
-          winCount: isWinner ? 1 : 0,
-          skillFragment,
-          economicFragment,
-          booster,
-          rankModifier,
-          totalFragment,
-        });
+          const matchResult = await MatchEarning.updateOne(
+            { playerId, gameNumber: nextGameNumber },
+            {
+              $setOnInsert: {
+                winCount: isWinner ? 1 : 0,
+                skillFragment,
+                economicFragment,
+                booster,
+                rankModifier,
+                totalFragment,
+                createdAt: new Date(),
+              },
+            },
+            { upsert: true }
+          );
 
-        // === Update Player ===
-        await Player.findOneAndUpdate(
-          { walletAddress: playerId },
-          {
-            $inc: { totalEarning: totalFragment },
-            $set: { lastActive: new Date() },
-          },
-          { upsert: false }
-        );
+          if (matchResult.upsertedCount > 0) {
+            console.log(`✅ MatchEarning created: ${playerId} | Game #${nextGameNumber}`);
+          } else {
+            console.log(`⚠️ Skipped duplicate MatchEarning for ${playerId} | Game #${nextGameNumber}`);
+          }
 
-        // === Simpan / Update DailyEarning ===
-        await saveDailyEarning(
-          {
+          await Player.findOneAndUpdate(
+            { walletAddress: playerId },
+            {
+              $inc: { totalEarning: totalFragment },
+              $set: { lastActive: new Date() },
+            },
+            { upsert: false }
+          );
+
+          console.log(`🧾 Player updated: ${playerId} | +${totalFragment.toFixed(2)} fragments`);
+
+          await saveDailyEarning(
+            {
+              rank: playerRank,
+              winStreak,
+              totalFragment,
+              totalDaily,
+              heroes:
+                p.team && typeof p.team === "object" && "members" in p.team
+                  ? (p.team.members as any[])
+                  : [],
+            },
+            playerId
+          );
+
+          console.log(`📅 DailyEarning updated for ${playerId}`);
+
+          // 🟢 Broadcast ke semua client
+          broadcast({
+            type: "battle_reward",
+            playerId,
             rank: playerRank,
-            winStreak,
             totalFragment,
             totalDaily,
-            heroes:
-              p.team && "members" in p.team
-                ? (p.team.members as any[])
-                : [],
-          },
-          playerId
-        );
+            winStreak,
+            booster,
+            isWinner,
+            battleId: battle._id,
+            time: new Date().toISOString(),
+          });
+
+          console.log(`📢 Broadcasted battle_reward for ${playerId}`);
+          console.log("-----------------------------------");
+        }
       }
+
+      // 🔊 Broadcast update battle ke semua client
+      broadcast({
+        type: "battle_updated",
+        battleId,
+        result,
+        battle,
+        time: new Date().toISOString(),
+      });
+      console.log(`✅ Battle ${battleId} updated and broadcasted.`);
+      console.log("──────────────────────────────────────────────");
+
+      return res.status(200).json({
+        success: true,
+        message: "Battle updated and earnings processed (NFT verified)",
+        battle,
+      });
     }
 
-    // ===============================================
-    // 3️⃣ Response ke Client
-    // ===============================================
-    res.status(200).json({
-      success: true,
-      message: "Battle updated and earnings processed",
-      battle,
-    });
+    // ======================================================
+    // 🧩 APPEND VERIFIED BATTLE LOG
+    // ======================================================
+    if (attacker && defender && skill && damage !== undefined) {
+      const battle = await Battle.findById(battleId);
+      if (!battle) return res.status(404).json({ error: "Battle not found" });
+
+      const [attackerNft, defenderNft] = await Promise.all([
+        Nft.findOne({ name: attacker })
+          .populate({ path: "character", model: "Character" })
+          .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } }),
+        Nft.findOne({ name: defender })
+          .populate({ path: "character", model: "Character" })
+          .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } }),
+      ]);
+
+      if (!attackerNft || !defenderNft)
+        return res.status(404).json({ error: "Attacker or defender NFT not found" });
+
+      await verifyNftIntegrity(attackerNft);
+      await verifyNftIntegrity(defenderNft);
+
+      const baseDefenderHp = defenderNft.hp ?? (defenderNft.character as ICharacter)?.baseHp ?? 100;
+      const prevLogs = battle.log.filter(l => l.defender === defender);
+      const lastHp = prevLogs.length > 0 ? prevLogs[prevLogs.length - 1].remainingHp : baseDefenderHp;
+      const remainingHp = Math.max(0, lastHp - damage);
+
+      const newLog = {
+        attacker,
+        defender,
+        skill,
+        damage,
+        isCrit: !!isCrit,
+        remainingHp,
+        timestamp: new Date(),
+      };
+
+      battle.log.push(newLog);
+      battle.updatedAt = new Date();
+      await battle.save();
+
+      broadcast({
+        type: "battle_log_broadcast",
+        battleId,
+        log: newLog,
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: "Battle log appended (HP computed server-side)",
+        log: newLog,
+      });
+    }
+
+    // Jika tidak ada parameter relevan
+    res.status(400).json({ error: "Invalid battle update or log payload" });
+
   } catch (err: any) {
-    console.error("❌ Error updating battle:", err.message);
-    res.status(500).json({ error: "Failed to update battle" });
+    console.error("🚫 Error in PUT /battle/:id:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -315,28 +528,54 @@ router.delete("/battle/:id", async (req, res) => {
 });
 
 /**
- * APPEND log turn
- * Body: { turn, attacker, defender, skill, damage, remainingHp }
+ * APPEND battle log
  */
 router.post("/battle/:id/log", async (req, res) => {
   try {
-    const { turn, attacker, defender, skill, damage, isCrit, remainingHp } = req.body;
+    const { attacker, defender, skill, damage, isCrit } = req.body;
 
-    // 1️⃣ Validasi input
-    if (!turn || !attacker || !defender || !skill || damage === undefined || remainingHp === undefined) {
+    // 1️⃣ Validasi input dasar
+    if (!attacker || !defender || !skill || damage === undefined) {
       return res.status(400).json({ error: "Missing required log fields" });
     }
 
-    // 2️⃣ Cek apakah battle ada
+    // 2️⃣ Cek battle
     const battle = await Battle.findById(req.params.id);
-    if (!battle) {
-      console.warn(`⚠️ Battle not found: ${req.params.id}`);
-      return res.status(404).json({ error: "Battle not found" });
+    if (!battle) return res.status(404).json({ error: "Battle not found" });
+
+    // 3️⃣ Ambil NFT attacker & defender dari DB
+    const [attackerNft, defenderNft] = await Promise.all([
+      Nft.findOne({ name: attacker })
+        .populate("character")
+        .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } }),
+      Nft.findOne({ name: defender })
+        .populate("character")
+        .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } }),
+    ]);
+
+    if (!attackerNft || !defenderNft) {
+      return res.status(404).json({ error: "Attacker or defender NFT not found" });
     }
 
-    // 3️⃣ Siapkan log baru
+    // 4️⃣ Verifikasi integritas attacker & defender
+    await verifyNftIntegrity(attackerNft);
+    await verifyNftIntegrity(defenderNft);
+
+    // 5️⃣ Hitung HP dasar defender
+    const baseDefenderHp = defenderNft.hp ?? (defenderNft.character as ICharacter)?.baseHp ?? 100;
+
+    // 6️⃣ Ambil HP terakhir defender dari log sebelumnya
+    const prevLogs = battle.log.filter(l => l.defender === defender);
+    const lastHp =
+      prevLogs.length > 0
+        ? prevLogs[prevLogs.length - 1].remainingHp
+        : baseDefenderHp;
+
+    // 7️⃣ Hitung HP baru (server-side, fair)
+    const remainingHp = Math.max(0, lastHp - damage);
+
+    // 8️⃣ Buat log baru
     const newLog = {
-      turn,
       attacker,
       defender,
       skill,
@@ -346,47 +585,52 @@ router.post("/battle/:id/log", async (req, res) => {
       timestamp: new Date(),
     };
 
-    // 4️⃣ Tambahkan log ke array battle.log
+    // 9️⃣ Simpan log ke battle
     battle.log.push(newLog);
     battle.updatedAt = new Date();
     await battle.save();
 
-    // 5️⃣ Logging ke console (monitor real-time)
-    console.log(`🧩 [BATTLE LOG] BattleID=${battle._id}`);
-    console.log(`🕹️ Turn ${turn}: ${attacker} ➜ ${defender}`);
-    console.log(`⚔️ Skill=${skill} | Damage=${damage} | Crit=${!!isCrit}`);
-    console.log(`❤️ Remaining HP: ${remainingHp}`);
+    // 🔟 Logging server
+    console.log("🧩 [BATTLE LOG VERIFIED]");
+    console.log(`BattleID=${battle._id}`);
+    console.log(`🕹️ ${attacker} ➜ ${defender} | ${skill} | ${damage}${isCrit ? " (CRIT!)" : ""}`);
+    console.log(`❤️ HP: ${lastHp} → ${remainingHp}`);
     console.log("-----------------------------------");
 
-    // 6️⃣ (opsional) kirim log balik ke client
+    // ✅ Response
     res.status(201).json({
       success: true,
-      message: "Battle log appended successfully",
+      message: "Battle log verified and appended (HP computed server-side)",
       log: newLog,
     });
   } catch (err: any) {
-    console.error("❌ Error appending battle log:", err.message);
-    res.status(500).json({ error: "Failed to append log" });
+    console.error("🚫 Error appending verified battle log:", err.message);
+    res.status(403).json({
+      error: "NFT integrity failed or invalid log data",
+      details: err.message,
+    });
   }
 });
 
 /**
  * GET battle logs only
- * GET /battle/:id/log
  */
 router.get("/battle/:id/log", async (req, res) => {
   try {
     const battle = await Battle.findById(req.params.id, { log: 1, _id: 0 });
-
-    if (!battle) {
-      return res.status(404).json({ error: "Battle not found" });
-    }
-
+    if (!battle) return res.status(404).json({ error: "Battle not found" });
     res.status(200).json(battle.log);
   } catch (err: any) {
     console.error("❌ Error fetching battle logs:", err.message);
     res.status(500).json({ error: "Failed to fetch battle logs" });
   }
 });
+
+export {
+  getRankModifier,
+  saveDailyEarning,
+  verifyNftIntegrity,
+  calculateEconomicFragment
+};
 
 export default router;

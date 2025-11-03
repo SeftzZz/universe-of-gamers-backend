@@ -8,7 +8,9 @@ import { HeroConfig } from "../models/HeroConfig";
 import { Team } from "../models/Team";
 import { Player } from "../models/Player";
 import { PlayerHero } from "../models/PlayerHero"; // ✅ wajib
+import { Nft } from "../models/Nft";               // ✅ untuk verifikasi
 import { startOfDay, endOfDay } from "date-fns";
+import { broadcast } from "../index";
 
 const router = express.Router();
 
@@ -20,13 +22,17 @@ interface IDailyEarningPayload {
   heroes: { rarity: string; level: number }[];
 }
 
-// ✅ Helper: cari rank modifier dari DB
+// ============================================================
+// 🔧 Rank Modifier
+// ============================================================
 async function getRankModifier(rank: string): Promise<number> {
   const rankDoc = await RankConfig.findOne({ rank: rank.toLowerCase() });
   return rankDoc ? rankDoc.modifier : 0;
 }
 
-// Hitung total economic fragment berdasarkan rarity & level anggota tim
+// ============================================================
+// 💰 Economic Fragment Calculator
+// ============================================================
 export async function calculateEconomicFragment(
   teamId: Types.ObjectId | string
 ): Promise<number> {
@@ -36,20 +42,16 @@ export async function calculateEconomicFragment(
   const MAX_NORMALIZED = 37500 * 3;
   let totalValue = 0;
   let lowestRarity: "common" | "rare" | "epic" | "legendary" = "legendary";
-
   const rarityOrder = ["common", "rare", "epic", "legendary"];
 
   for (const h of team.members as any[]) {
-    // Pastikan tiap NFT punya rarity & level
     const rarity = h.rarity ?? "common";
     const level = h.level ?? 1;
-
     const config = await HeroConfig.findOne({ rarity });
     if (config) {
       totalValue += (config.teamValue as Record<number, number>)[level] || 0;
-      if (rarityOrder.indexOf(rarity) < rarityOrder.indexOf(lowestRarity)) {
+      if (rarityOrder.indexOf(rarity) < rarityOrder.indexOf(lowestRarity))
         lowestRarity = rarity;
-      }
     }
   }
 
@@ -57,160 +59,218 @@ export async function calculateEconomicFragment(
   const rarityCfg = await HeroConfig.findOne({ rarity: lowestRarity });
   const teamModifier = rarityCfg ? rarityCfg.teamModifier : 0.15;
 
-  const economicFragment =
-    totalNormalized * (1 - teamModifier) + teamModifier;
-
-  return economicFragment;
+  return totalNormalized * (1 - teamModifier) + teamModifier;
 }
 
-async function saveDailyEarning(
-  result: IDailyEarningPayload,
-  playerId: string
-) {
-  try {
-    // 🎯 Tentukan rentang waktu hari ini
-    const todayStart = startOfDay(new Date());
-    const todayEnd = endOfDay(new Date());
+// ============================================================
+// 💾 Save DailyEarning
+// ============================================================
+async function saveDailyEarning(result: IDailyEarningPayload, playerId: string) {
+  const todayStart = startOfDay(new Date());
+  const todayEnd = endOfDay(new Date());
 
-    // 🧮 Update atau insert jika belum ada
-    await DailyEarning.findOneAndUpdate(
-      {
-        playerId,
-        date: { $gte: todayStart, $lte: todayEnd },
+  await DailyEarning.findOneAndUpdate(
+    {
+      playerId,
+      date: { $gte: todayStart, $lte: todayEnd },
+    },
+    {
+      $set: {
+        rank: result.rank,
+        winStreak: result.winStreak,
+        heroesUsed: result.heroes,
       },
-      {
-        $set: {
-          rank: result.rank,
-          winStreak: result.winStreak,
-          heroesUsed: result.heroes,
-        },
-        $inc: {
-          totalFragment: result.totalFragment, // tambah akumulasi
-          totalDailyEarning: result.totalDaily, // tambah total harian
-        },
+      $inc: {
+        totalFragment: result.totalFragment,
+        totalDailyEarning: result.totalDaily,
       },
-      { upsert: true, new: true }
-    );
-  } catch (err: any) {
-    console.error("❌ Error saving daily earning:", err.message);
+    },
+    { upsert: true, new: true }
+  );
+}
+
+// ============================================================
+// 🛡️ NFT Integrity Check
+// ============================================================
+async function verifyNftIntegrity(nft: any): Promise<void> {
+  console.log("──────────────────────────────────────────────");
+  console.log(`🔍 Verifying NFT Integrity: ${nft.name}`);
+  console.log(`🔑 Mint Address: ${nft.mintAddress}`);
+  console.log("──────────────────────────────────────────────");
+
+  // === 1️⃣ Ambil data NFT original dari DB
+  const original = await Nft.findOne({ mintAddress: nft.mintAddress })
+    .populate({ path: "character", model: "Character" })
+    .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } });
+
+  if (!original) {
+    console.error("❌ NFT tidak ditemukan di database!");
+    throw new Error(`NFT ${nft.name} not found or invalid mintAddress`);
   }
+
+  // === 2️⃣ Validasi karakter
+  const char = original.character as any;
+  if (!char || typeof char !== "object" || !("baseHp" in char)) {
+    console.error("❌ Character blueprint hilang atau tidak valid:", char);
+    throw new Error(`NFT ${nft.name} missing or invalid character blueprint`);
+  }
+
+  console.log("🧬 Character Blueprint Loaded:");
+  console.table({
+    Name: char.name || "-",
+    baseHp: char.baseHp,
+    baseAtk: char.baseAtk,
+    baseDef: char.baseDef,
+    baseSpd: char.baseSpd,
+    baseCritRate: char.baseCritRate,
+    baseCritDmg: char.baseCritDmg,
+  });
+
+  // === 3️⃣ Hitung bonus dari rune
+  const equipped = (original.equipped || []) as any[];
+  const bonus = { hp: 0, atk: 0, def: 0, spd: 0, critRate: 0, critDmg: 0 };
+
+  if (equipped.length > 0) {
+    console.log(`💎 Equipped Runes (${equipped.length}):`);
+    for (const [i, e] of equipped.entries()) {
+      const rune = e?.rune as any;
+      if (!rune) continue;
+      console.log(`   #${i + 1}: ${rune.name || "Unknown Rune"}`);
+      console.table({
+        hpBonus: rune.hpBonus ?? 0,
+        atkBonus: rune.atkBonus ?? 0,
+        defBonus: rune.defBonus ?? 0,
+        spdBonus: rune.spdBonus ?? 0,
+        critRateBonus: rune.critRateBonus ?? 0,
+        critDmgBonus: rune.critDmgBonus ?? 0,
+      });
+
+      bonus.hp += rune.hpBonus ?? 0;
+      bonus.atk += rune.atkBonus ?? 0;
+      bonus.def += rune.defBonus ?? 0;
+      bonus.spd += rune.spdBonus ?? 0;
+      bonus.critRate += rune.critRateBonus ?? 0;
+      bonus.critDmg += rune.critDmgBonus ?? 0;
+    }
+  } else {
+    console.log("💤 Tidak ada rune yang terpasang.");
+  }
+
+  console.log("📊 Total Rune Bonus:");
+  console.table(bonus);
+
+  // === 4️⃣ Fungsi bantu
+  const safe = (v: number) => (Number.isFinite(v) ? v : 0);
+  const check = (label: string, base: number, actual: number, bonusVal = 0) => {
+    const allowed = base + bonusVal + Math.max(5, base * 0.05);
+    console.log(
+      `🔹 Check [${label.toUpperCase()}]: base=${base}, bonus=${bonusVal}, actual=${actual}, allowed≤${allowed}`
+    );
+    if (actual > allowed) {
+      console.error(
+        `🚨 Cheat detected → ${label}=${actual} > allowed=${allowed} (base=${base}, bonus=${bonusVal})`
+      );
+      throw new Error(
+        `Cheat detected on ${nft.name}: ${label}=${actual} > allowed=${allowed}`
+      );
+    }
+  };
+
+  // === 5️⃣ Jalankan semua pengecekan
+  check("hp", safe(char.baseHp), safe(nft.hp), safe(bonus.hp));
+  check("atk", safe(char.baseAtk), safe(nft.atk), safe(bonus.atk));
+  check("def", safe(char.baseDef), safe(nft.def), safe(bonus.def));
+  check("spd", safe(char.baseSpd), safe(nft.spd), safe(bonus.spd));
+  check("critRate", safe(char.baseCritRate), safe(nft.critRate), safe(bonus.critRate));
+  check("critDmg", safe(char.baseCritDmg), safe(nft.critDmg), safe(bonus.critDmg));
+
+  // === 6️⃣ Hasil akhir
+  console.log(`✅ NFT integrity OK: ${nft.name}`);
+  console.log("──────────────────────────────────────────────");
 }
 
-
-function isAlive(member: any) {
-  return member.hp > 0;
-}
-function getAliveTeam(team: any[]) {
-  return team.filter(isAlive);
-}
+// ============================================================
+// ⚔️ Battle Core
+// ============================================================
+function isAlive(m: any) { return m.hp > 0; }
+function getAliveTeam(t: any[]) { return t.filter(isAlive); }
 function chooseTarget(team: any[], attacker?: any) {
   const alive = getAliveTeam(team);
   const candidates = attacker ? alive.filter(m => m.id !== attacker.id) : alive;
   return candidates[Math.floor(Math.random() * candidates.length)];
 }
-function calcDamage(attacker: any, defender: any, skill: any) {
-  // 1. Hitung raw damage dari ATK, DEF, HP attacker dengan multiplier skill
+
+function calcDamage(a: any, d: any, skill: any) {
   let rawDamage =
-    (attacker.atk * (skill.atkMultiplier || 0)) +
-    (attacker.def * (skill.defMultiplier || 0)) +
-    (attacker.hp * (skill.hpMultiplier || 0));
-
-  // 2. Damage reduction berdasarkan DEF target
-  let defenseMultiplier = 100 / (100 + defender.def);
-  let reducedDamage = rawDamage * defenseMultiplier;
-
-  // 3. Minimum damage
-  if (reducedDamage < 10) reducedDamage = 10;
-
-  // 4. Critical hit check
-  let isCrit = Math.random() < attacker.critRate;
-  if (isCrit) {
-    reducedDamage *= (1 + attacker.critDmg);
-  }
-
-  return {
-    damage: Math.round(reducedDamage),
-    isCrit: isCrit,
-  };
+    (a.atk * (skill.atkMultiplier || 0)) +
+    (a.def * (skill.defMultiplier || 0)) +
+    (a.hp * (skill.hpMultiplier || 0));
+  let defenseMultiplier = 100 / (100 + d.def);
+  let reduced = rawDamage * defenseMultiplier;
+  if (reduced < 10) reduced = 10;
+  const isCrit = Math.random() < a.critRate;
+  if (isCrit) reduced *= (1 + a.critDmg);
+  return { damage: Math.round(reduced), isCrit };
 }
-function chooseSkill(attacker: any) {
-  if (attacker.cdUlt === 0 && Math.random() < 0.2) {
-    attacker.cdUlt = 5;
-    return "ultimate";
-  }
-  if (attacker.cdSkill === 0 && Math.random() < 0.4) {
-    attacker.cdSkill = 2;
-    return "skill";
-  }
+
+function chooseSkill(a: any) {
+  if (a.cdUlt === 0 && Math.random() < 0.2) { a.cdUlt = 5; return "ultimate"; }
+  if (a.cdSkill === 0 && Math.random() < 0.4) { a.cdSkill = 2; return "skill"; }
   return "basic";
 }
 
 async function simulateBattle(teamA: any[], teamB: any[]) {
   let turn = 1;
   const log: any[] = [];
+  [...teamA, ...teamB].forEach(m => { m.cdSkill = 0; m.cdUlt = 0; });
 
-  [...teamA, ...teamB].forEach(m => {
-    m.cdSkill = 0;
-    m.cdUlt = 0;
-  });
+  while (getAliveTeam(teamA).length && getAliveTeam(teamB).length) {
+    const all = [...getAliveTeam(teamA), ...getAliveTeam(teamB)]
+      .sort((a, b) => b.spd - a.spd);
 
-  while (getAliveTeam(teamA).length > 0 && getAliveTeam(teamB).length > 0) {
-    const allMembers = [...getAliveTeam(teamA), ...getAliveTeam(teamB)];
-    allMembers.sort((a, b) => (b.spd || 0) - (a.spd || 0));
-
-    for (const attacker of allMembers) {
-      const attackerTeam = teamA.includes(attacker) ? teamA : teamB;
-      const enemyTeam = attackerTeam === teamA ? teamB : teamA;
-      if (!isAlive(attacker) || getAliveTeam(enemyTeam).length === 0) continue;
+    for (const attacker of all) {
+      const atkTeam = teamA.includes(attacker) ? teamA : teamB;
+      const defTeam = atkTeam === teamA ? teamB : teamA;
+      if (!isAlive(attacker) || !getAliveTeam(defTeam).length) continue;
 
       if (attacker.cdSkill > 0) attacker.cdSkill--;
       if (attacker.cdUlt > 0) attacker.cdUlt--;
 
       const skillType = chooseSkill(attacker);
+      const skill =
+        skillType === "skill" ? attacker.skillAttack :
+        skillType === "ultimate" ? attacker.ultimateAttack :
+        attacker.basicAttack;
+      const defender = chooseTarget(defTeam, attacker);
+      const result = calcDamage(attacker, defender, skill);
 
-      let skillObj;
-      switch (skillType) {
-        case "skill":
-          skillObj = attacker.skillAttack || attacker.basicAttack;
-          break;
-        case "ultimate":
-          skillObj = attacker.ultimateAttack || attacker.basicAttack;
-          break;
-        default:
-          skillObj = attacker.basicAttack;
-          break;
+      defender.hp = Math.max(0, defender.hp - result.damage);
+      // log.push({
+      //   turn, attacker: attacker.name, defender: defender.name,
+      //   skill: skill.name, damage: result.damage, isCrit: result.isCrit,
+      //   remainingHp: defender.hp, timestamp: new Date(),
+      // });
+
+      // console.log(
+      //   `Turn ${turn}: ${attacker.name} → ${defender.name} | ${skill.name} | ${result.damage}${result.isCrit ? " (CRIT!)" : ""}`
+      // );
+      if (defender && typeof defender.hp === "number") {
+        log.push({
+          attacker: attacker.name,
+          defender: defender.name,
+          skill: skill.name,
+          damage: result.damage,
+          isCrit: result.isCrit,
+          remainingHp: defender.hp, // ✅ hanya kalau valid
+          timestamp: new Date(),
+        });
+
+        console.log(
+          `Attacker: ${attacker.name} → ${defender.name} | ${skill.name} | ${result.damage}${result.isCrit ? " (CRIT!)" : ""}`
+        );
+        console.log("🔥 Log count:", log.length);
+        console.log("🚨 Missing HP:", log.filter(l => l.remainingHp === undefined));
       }
-
-      if (!skillObj) {
-        throw new Error(`No skill data found for ${attacker.name} (${skillType})`);
-      }
-
-      const defender = chooseTarget(enemyTeam, attacker);
-      const damageResult = calcDamage(attacker, defender, skillObj);
-
-      defender.hp -= damageResult.damage;
-      if (defender.hp < 0) defender.hp = 0;
-
-      const entry = {
-        turn,
-        attacker: attacker.name,
-        defender: defender.name,
-        skill: skillObj.name,
-        damage: damageResult.damage,
-        isCrit: damageResult.isCrit,
-        remainingHp: defender.hp,
-        timestamp: new Date(),
-      };
-
-      log.push(entry);
-
-      // 🔎 Print langsung ke console
-      console.log(
-        `Turn ${turn}: ${entry.attacker} used ${entry.skill} on ${entry.defender} ` +
-        `→ Damage: ${entry.damage}${entry.isCrit ? " (CRIT!)" : ""}, ` +
-        `Remaining HP: ${entry.remainingHp}`
-      );
-
       turn++;
     }
   }
@@ -220,80 +280,147 @@ async function simulateBattle(teamA: any[], teamB: any[]) {
   return { winner, log };
 }
 
-// === API Endpoint ===
+// ============================================================
+// 🚀 API Endpoint /battle/simulate
+// ============================================================
 router.post("/battle/simulate", async (req, res) => {
   try {
     const { teamAId, teamBId, mode = "pvp" } = req.body;
 
-    // Populate bertingkat: Team → members (NFT) → character
-    const teamA = await Team.findById(teamAId).populate({
-      path: "members",
-      model: "Nft",
-      populate: {
-        path: "character",
-        model: "Character",
-        select:
-          "name baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg basicAttack skillAttack ultimateAttack",
-      },
-    });
+    console.log("──────────────────────────────────────────────");
+    console.log(`🎮 [POST /battle/simulate] Starting battle simulation...`);
+    console.log(`🆚 TeamA: ${teamAId} | TeamB: ${teamBId}`);
+    console.log(`⚙️ Mode: ${mode}`);
+    console.log("──────────────────────────────────────────────");
 
-    const teamB = await Team.findById(teamBId).populate({
-      path: "members",
-      model: "Nft",
-      populate: {
-        path: "character",
-        model: "Character",
-        select:
-          "name baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg basicAttack skillAttack ultimateAttack",
-      },
-    });
+    // ======================================================
+    // 🧩 Load Teams & Verify Integrity (Battle-Safe Version)
+    // ======================================================
+    console.log("──────────────────────────────────────────────");
+    console.log("🧩 Loading teams and verifying NFT integrity...");
+    console.log(`🆚 TeamA: ${teamAId} | TeamB: ${teamBId}`);
+    console.log("──────────────────────────────────────────────");
+
+    const teamA = await Team.findById(teamAId)
+      .populate({
+        path: "members",
+        model: "Nft",
+        populate: {
+          path: "character",
+          model: "Character",
+          select:
+            "name baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg basicAttack skillAttack ultimateAttack",
+        },
+      });
+    const teamB = await Team.findById(teamBId)
+      .populate({
+        path: "members",
+        model: "Nft",
+        populate: {
+          path: "character",
+          model: "Character",
+          select:
+            "name baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg basicAttack skillAttack ultimateAttack",
+        },
+      });
 
     if (!teamA || !teamB) {
+      console.error("❌ One or both teams not found!");
       return res.status(404).json({ error: "Team not found" });
     }
 
-    // Map NFT + Character blueprint ke anggota battle
-    const membersA = (teamA.members as any[]).map((nft) => {
-      const char = nft.character as any;
+    console.log(`✅ TeamA loaded (${teamA.members.length} members)`);
+    console.log(`✅ TeamB loaded (${teamB.members.length} members)`);
+    console.log("──────────────────────────────────────────────");
+
+    // ✅ Anti-cheat verification (TypeScript + runtime safe)
+    for (const [idx, team] of [teamA, teamB].entries()) {
+      const teamName = idx === 0 ? "Team A" : "Team B";
+      console.log(`🔎 Verifying team integrity for ${teamName}...`);
+
+      if (!team?.members || !Array.isArray(team.members) || team.members.length === 0) {
+        console.log(`⚠️ No members found in ${teamName}`);
+        continue;
+      }
+
+      for (const nftRaw of team.members) {
+        try {
+          // 🧩 Pastikan nft sudah berupa objek lengkap
+          let nft: any;
+
+          if (typeof nftRaw === "object" && "name" in nftRaw) {
+            nft = nftRaw;
+          } else {
+            // Jika belum populate, ambil manual dari DB
+            nft = await Nft.findById(nftRaw)
+              .populate({
+                path: "character",
+                model: "Character",
+                select:
+                  "name baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg basicAttack skillAttack ultimateAttack",
+              })
+              .populate({
+                path: "equipped",
+                populate: { path: "rune", model: "Rune" },
+              });
+          }
+
+          if (!nft) {
+            console.log(`⚠️ Skipping null NFT reference in ${teamName}`);
+            continue;
+          }
+
+          const nftName = nft?.name || `(unknown NFT ${nft?._id})`;
+          console.log(`🧬 Verifying NFT integrity → ${nftName}`);
+
+          await verifyNftIntegrity(nft);
+        } catch (err: any) {
+          console.error(`❌ Failed verifying NFT in ${teamName}:`, err.message);
+          throw err;
+        }
+      }
+    }
+
+    console.log("✅ All NFT integrity checks passed");
+    console.log("──────────────────────────────────────────────");
+
+    // ======================================================
+    // 🧠 Setup teams for simulation
+    // ======================================================
+    const mapMember = (nft: any) => {
+      const c = nft.character || {};
       return {
         id: nft._id.toString(),
-        name: nft.name || (char?.name ?? "Unknown"),
-        hp: nft.hp ?? char?.baseHp ?? 100,
-        atk: nft.atk ?? char?.baseAtk ?? 50,
-        def: nft.def ?? char?.baseDef ?? 30,
-        spd: nft.spd ?? char?.baseSpd ?? 10,
-        critRate: (nft.critRate ?? char?.baseCritRate ?? 0) / 100,
-        critDmg: (nft.critDmg ?? char?.baseCritDmg ?? 0) / 100,
-        basicAttack: char?.basicAttack,
-        skillAttack: char?.skillAttack,
-        ultimateAttack: char?.ultimateAttack,
+        mintAddress: nft.mintAddress,
+        name: nft.name || c.name,
+        hp: nft.hp ?? c.baseHp ?? 100,
+        atk: nft.atk ?? c.baseAtk ?? 50,
+        def: nft.def ?? c.baseDef ?? 30,
+        spd: nft.spd ?? c.baseSpd ?? 10,
+        critRate: (nft.critRate ?? c.baseCritRate ?? 0) / 100,
+        critDmg: (nft.critDmg ?? c.baseCritDmg ?? 0) / 100,
+        basicAttack: c.basicAttack,
+        skillAttack: c.skillAttack,
+        ultimateAttack: c.ultimateAttack,
       };
-    });
+    };
 
-    const membersB = (teamB.members as any[]).map((nft) => {
-      const char = nft.character as any;
-      return {
-        id: nft._id.toString(),
-        name: nft.name || (char?.name ?? "Unknown"),
-        hp: nft.hp ?? char?.baseHp ?? 100,
-        atk: nft.atk ?? char?.baseAtk ?? 50,
-        def: nft.def ?? char?.baseDef ?? 30,
-        spd: nft.spd ?? char?.baseSpd ?? 10,
-        critRate: (nft.critRate ?? char?.baseCritRate ?? 0) / 100,
-        critDmg: (nft.critDmg ?? char?.baseCritDmg ?? 0) / 100,
-        basicAttack: char?.basicAttack,
-        skillAttack: char?.skillAttack,
-        ultimateAttack: char?.ultimateAttack,
-      };
-    });
+    const membersA = (teamA.members as any[]).map(mapMember);
+    const membersB = (teamB.members as any[]).map(mapMember);
 
-    // 🔎 Debug
-    console.log("=== Team A Members ===", JSON.stringify(membersA, null, 2));
-    console.log("=== Team B Members ===", JSON.stringify(membersB, null, 2));
+    console.log(`⚔️ Starting battle simulation between ${teamAId} and ${teamBId}...`);
 
+    // ======================================================
+    // 🎲 Run simulation logic
+    // ======================================================
     const { winner, log } = await simulateBattle(membersA, membersB);
+    console.log(`🏁 Simulation complete → Winner: ${winner}`);
+    console.log("──────────────────────────────────────────────");
 
-    const battle = new Battle({
+    // ======================================================
+    // 💾 Save Battle Record
+    // ======================================================
+    const battle = await Battle.create({
       players: [
         { user: teamA.owner, team: teamA._id, isWinner: winner === "teamA" },
         { user: teamB.owner, team: teamB._id, isWinner: winner === "teamB" },
@@ -302,77 +429,83 @@ router.post("/battle/simulate", async (req, res) => {
       result: "end_battle",
       log,
     });
-    await battle.save();
 
-    // ===============================================
-    // 4️⃣ Jika Battle Selesai → Proses Earning
-    // ===============================================
+    console.log(`✅ Battle created with ID: ${battle._id}`);
+
+    // ======================================================
+    // 💰 Process Earnings
+    // ======================================================
     if (battle.result === "end_battle") {
+      console.log("🎯 Processing battle rewards...");
       for (const p of battle.players) {
         const playerId = p.user;
         const isWinner = p.isWinner;
+        console.log(`🏁 Player ${playerId} → ${isWinner ? "WINNER" : "LOSER"}`);
 
-        // === Ambil Data Tim ===
         const teamId = p.team?._id || p.team;
         const economicFragment = await calculateEconomicFragment(teamId);
+        console.log(`💰 Economic Fragment: ${economicFragment.toFixed(4)}`);
 
-        // === Rank Modifier ===
         const lastEarning = await DailyEarning.findOne({ playerId }).sort({ createdAt: -1 });
         const playerRank = lastEarning?.rank || "sentinel";
         const rankModifier = await getRankModifier(playerRank);
-
-        // === Win Streak ===
         const winStreak = isWinner ? (lastEarning?.winStreak || 0) + 1 : 0;
 
-        // === Skill Fragment ===
         const WINRATE_MODIFIER: Record<number, number> = {
           1: 0.01, 2: 0.05, 3: 0.07, 4: 0.09, 5: 0.11,
           6: 0.13, 7: 0.15, 8: 0.17, 9: 0.21,
         };
+
         const skillFragment =
           (WINRATE_MODIFIER[Math.min(winStreak, 9)] || 0.21) * 100;
-
-        // === Booster ===
         const booster = winStreak >= 3 ? 2 : 1;
-
-        // === Total Fragment ===
-        const totalFragment =
-          (economicFragment * skillFragment) * booster * rankModifier;
+        const totalFragment = economicFragment * skillFragment * booster * rankModifier;
         const totalDaily = totalFragment * 10;
+
+        console.log(`📈 WinStreak=${winStreak} | Booster=${booster}`);
+        console.log(`⚙️  SkillFrag=${skillFragment} | RankMod=${rankModifier}`);
+        console.log(`💎 TotalFragment=${totalFragment.toFixed(2)} | TotalDaily=${totalDaily.toFixed(2)}`);
 
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-
         const lastGame = await MatchEarning.findOne({
           playerId,
           createdAt: { $gte: today },
-        })
-          .sort({ createdAt: -1 });
-
+        }).sort({ createdAt: -1 });
         const nextGameNumber = lastGame ? lastGame.gameNumber + 1 : 1;
 
-        await MatchEarning.create({
-          playerId,
-          gameNumber: nextGameNumber,
-          winCount: isWinner ? 1 : 0,
-          skillFragment,
-          economicFragment,
-          booster,
-          rankModifier,
-          totalFragment,
-        });
+        const matchResult = await MatchEarning.updateOne(
+          { playerId, gameNumber: nextGameNumber },
+          {
+            $setOnInsert: {
+              winCount: isWinner ? 1 : 0,
+              skillFragment,
+              economicFragment,
+              booster,
+              rankModifier,
+              totalFragment,
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
 
-        // === Update Player ===
+        if (matchResult.upsertedCount > 0) {
+          console.log(`✅ MatchEarning created: ${playerId} | Game #${nextGameNumber}`);
+        } else {
+          console.log(`⚠️ Skipped duplicate MatchEarning for ${playerId} | Game #${nextGameNumber}`);
+        }
+
         await Player.findOneAndUpdate(
-          { walletAddress: playerId }, // ✅ cari berdasarkan wallet
+          { walletAddress: playerId },
           {
             $inc: { totalEarning: totalFragment },
             $set: { lastActive: new Date() },
           },
           { upsert: false }
         );
+        console.log(`🧾 Player updated: ${playerId} (+${totalFragment.toFixed(2)} fragments)`);
 
-        // === Simpan / Update DailyEarning ===
         await saveDailyEarning(
           {
             rank: playerRank,
@@ -380,26 +513,48 @@ router.post("/battle/simulate", async (req, res) => {
             totalFragment,
             totalDaily,
             heroes:
-              p.team && "members" in p.team
+              p.team && typeof p.team === "object" && "members" in p.team
                 ? (p.team.members as any[])
                 : [],
           },
           playerId
         );
+        console.log(`📅 DailyEarning updated for ${playerId}`);
+
+        // 🟢 Broadcast ke semua client
+        broadcast({
+          type: "battle_reward",
+          playerId,
+          rank: playerRank,
+          totalFragment,
+          totalDaily,
+          winStreak,
+          booster,
+          isWinner,
+          battleId: battle._id,
+          time: new Date().toISOString(),
+        });
+
+        console.log(`📢 Broadcasted battle_reward for ${playerId}`);
+        console.log("-----------------------------------");
       }
     }
 
-    // ===============================================
-    // 5️⃣ Response ke Client
-    // ===============================================
+    console.log(`✅ Simulation finished and saved as Battle: ${battle._id}`);
+    console.log("──────────────────────────────────────────────");
+
     res.status(201).json({
       success: true,
-      message: "Battle simulated and earnings calculated",
+      message: "Battle simulated securely (NFT verified)",
       battle,
     });
   } catch (err: any) {
-    console.error("❌ Error simulate battle:", err.message);
-    res.status(500).json({ error: "Failed to simulate battle" });
+    console.error("🚫 Error simulate battle:", err.message);
+    console.log("──────────────────────────────────────────────");
+    res.status(403).json({
+      error: "NFT integrity failed or simulation error",
+      details: err.message,
+    });
   }
 });
 
