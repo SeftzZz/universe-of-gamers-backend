@@ -1,7 +1,7 @@
 import mongoose, { Schema, Document } from "mongoose";
 
 export interface IMatchEarning extends Document {
-  playerId: string; // ✅ ganti dari ObjectId
+  walletAddress: string; // ✅ ganti dari ObjectId
   gameNumber: number;
   winCount: number;
   skillFragment: number;
@@ -15,7 +15,7 @@ export interface IMatchEarning extends Document {
 
 const MatchEarningSchema = new Schema<IMatchEarning>(
   {
-    playerId: {
+    walletAddress: {
       type: String, // ✅ ubah dari ObjectId
       required: true,
     },

@@ -65,13 +65,13 @@ export async function calculateEconomicFragment(
 // ============================================================
 // 💾 Save DailyEarning
 // ============================================================
-async function saveDailyEarning(result: IDailyEarningPayload, playerId: string) {
+async function saveDailyEarning(result: IDailyEarningPayload, walletAddress: string) {
   const todayStart = startOfDay(new Date());
   const todayEnd = endOfDay(new Date());
 
   await DailyEarning.findOneAndUpdate(
     {
-      playerId,
+      walletAddress,
       date: { $gte: todayStart, $lte: todayEnd },
     },
     {
@@ -438,15 +438,15 @@ router.post("/battle/simulate", async (req, res) => {
     if (battle.result === "end_battle") {
       console.log("🎯 Processing battle rewards...");
       for (const p of battle.players) {
-        const playerId = p.user;
+        const walletAddress = p.user;
         const isWinner = p.isWinner;
-        console.log(`🏁 Player ${playerId} → ${isWinner ? "WINNER" : "LOSER"}`);
+        console.log(`🏁 Player ${walletAddress} → ${isWinner ? "WINNER" : "LOSER"}`);
 
         const teamId = p.team?._id || p.team;
         const economicFragment = await calculateEconomicFragment(teamId);
         console.log(`💰 Economic Fragment: ${economicFragment.toFixed(4)}`);
 
-        const lastEarning = await DailyEarning.findOne({ playerId }).sort({ createdAt: -1 });
+        const lastEarning = await DailyEarning.findOne({ walletAddress }).sort({ createdAt: -1 });
         const playerRank = lastEarning?.rank || "sentinel";
         const rankModifier = await getRankModifier(playerRank);
         const winStreak = isWinner ? (lastEarning?.winStreak || 0) + 1 : 0;
@@ -469,13 +469,13 @@ router.post("/battle/simulate", async (req, res) => {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const lastGame = await MatchEarning.findOne({
-          playerId,
+          walletAddress,
           createdAt: { $gte: today },
         }).sort({ createdAt: -1 });
         const nextGameNumber = lastGame ? lastGame.gameNumber + 1 : 1;
 
         const matchResult = await MatchEarning.updateOne(
-          { playerId, gameNumber: nextGameNumber },
+          { walletAddress, gameNumber: nextGameNumber },
           {
             $setOnInsert: {
               winCount: isWinner ? 1 : 0,
@@ -491,20 +491,20 @@ router.post("/battle/simulate", async (req, res) => {
         );
 
         if (matchResult.upsertedCount > 0) {
-          console.log(`✅ MatchEarning created: ${playerId} | Game #${nextGameNumber}`);
+          console.log(`✅ MatchEarning created: ${walletAddress} | Game #${nextGameNumber}`);
         } else {
-          console.log(`⚠️ Skipped duplicate MatchEarning for ${playerId} | Game #${nextGameNumber}`);
+          console.log(`⚠️ Skipped duplicate MatchEarning for ${walletAddress} | Game #${nextGameNumber}`);
         }
 
         await Player.findOneAndUpdate(
-          { walletAddress: playerId },
+          { walletAddress: walletAddress },
           {
             $inc: { totalEarning: totalFragment },
             $set: { lastActive: new Date() },
           },
           { upsert: false }
         );
-        console.log(`🧾 Player updated: ${playerId} (+${totalFragment.toFixed(2)} fragments)`);
+        console.log(`🧾 Player updated: ${walletAddress} (+${totalFragment.toFixed(2)} fragments)`);
 
         await saveDailyEarning(
           {
@@ -517,14 +517,14 @@ router.post("/battle/simulate", async (req, res) => {
                 ? (p.team.members as any[])
                 : [],
           },
-          playerId
+          walletAddress
         );
-        console.log(`📅 DailyEarning updated for ${playerId}`);
+        console.log(`📅 DailyEarning updated for ${walletAddress}`);
 
         // 🟢 Broadcast ke semua client
         broadcast({
           type: "battle_reward",
-          playerId,
+          walletAddress,
           rank: playerRank,
           totalFragment,
           totalDaily,
@@ -535,7 +535,7 @@ router.post("/battle/simulate", async (req, res) => {
           time: new Date().toISOString(),
         });
 
-        console.log(`📢 Broadcasted battle_reward for ${playerId}`);
+        console.log(`📢 Broadcasted battle_reward for ${walletAddress}`);
         console.log("-----------------------------------");
       }
     }

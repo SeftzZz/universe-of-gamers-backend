@@ -6,7 +6,7 @@ export interface IHeroUsed {
 }
 
 export interface IDailyEarning extends Document {
-  playerId: String;
+  walletAddress: String;
   date: Date;
   rank:
     | "sentinel"
@@ -30,7 +30,7 @@ export interface IDailyEarning extends Document {
 
 const DailyEarningSchema = new Schema<IDailyEarning>(
   {
-    playerId: {
+    walletAddress: {
       type: String,
       required: true,
     },
@@ -76,8 +76,8 @@ const DailyEarningSchema = new Schema<IDailyEarning>(
 
 // 🧩 Index unik opsional: 1 data per hari per player
 DailyEarningSchema.index(
-  { playerId: 1, date: 1 },
-  { unique: true, partialFilterExpression: { playerId: { $exists: true } } }
+  { walletAddress: 1, date: 1 },
+  { unique: true, partialFilterExpression: { walletAddress: { $exists: true } } }
 );
 
 export const DailyEarning = mongoose.model<IDailyEarning>(

@@ -6,6 +6,7 @@ import { Nft, INft } from "../models/Nft";
 import { doGatchaRoll, doMultiGatchaRolls } from "../services/gatchaService";
 import { decrypt } from "../utils/cryptoHelper";
 import Auth from "../models/Auth";
+import { Referral } from "../models/Referral";
 import { authenticateJWT, AuthRequest } from "../middleware/auth";
 import { buildMintTransaction, buildMintTransactionPhantom } from "../services/mintService";
 import { generateNftMetadata } from "../services/metadataGenerator";
@@ -14,6 +15,58 @@ import fs from "fs";
 import path from "path";
 
 const router = express.Router();
+/**
+ * Menambahkan reward referral sebesar 10% dari transaksi Gatcha.
+ * @param {string} userId - ID user yang melakukan Gatcha.
+ * @param {number} amount - Nominal harga Gatcha.
+ * @param {string} paymentMint - Token pembayaran (SOL atau UOG).
+ */
+export async function applyReferralReward(userId: any, amount: any, paymentMint: any, txSignature: any) {
+  try {
+    // Cari user & referrer-nya
+    const user = await Auth.findById(userId);
+    if (!user || !user.usedReferralCode) {
+      console.log("ℹ️ [Referral] User has no referrer, skip reward.");
+      return;
+    }
+
+    // Cari data referral referrer
+    const ref = await Referral.findOne({ usedReferralCode: user.usedReferralCode });
+    if (!ref) {
+      console.log("⚠️ [Referral] Referrer has no referral record, skip.");
+      return;
+    }
+
+    // Hitung reward (10%)
+    const reward = (amount || 0) * 0.1;
+    if (reward <= 0) {
+      console.log("⚠️ [Referral] No valid reward to apply.");
+      return;
+    }
+
+    // Tambah ke saldo claimable & log transaksi
+    ref.totalClaimable += reward;
+    ref.history.push({
+      fromUserId: user._id,
+      txType: "GATCHA",
+      amount: amount,
+      reward: reward,
+      txSignature: txSignature,
+      createdAt: new Date(),
+    });
+
+    await ref.save();
+
+    console.log("💰 [Referral Reward Added]", {
+      usedReferralCode: user.usedReferralCode,
+      reward,
+      paymentMint,
+      totalClaimable: ref.totalClaimable,
+    });
+  } catch (err: any) {
+    console.error("❌ [Referral Error]", err.message);
+  }
+}
 
 /**
  * CREATE Gatcha Pack
@@ -224,9 +277,14 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
   try {
     const { id: userId } = req.user;
     const { id: packId } = req.params;
-    const { paymentMint } = req.body;
+    const { paymentMint, activeWallet } = req.body;
 
-    console.log("⚡ [Phantom Gatcha] Start request:", { userId, packId, paymentMint });
+    console.log("⚡ [Phantom Gatcha] Start request:", { userId, packId, paymentMint, activeWallet });
+
+    if (!activeWallet) {
+      console.log("❌ Missing active wallet address");
+      return res.status(400).json({ error: "Missing active wallet address" });
+    }
 
     // === Ambil user & pack
     const authUser = await Auth.findById(userId);
@@ -239,6 +297,16 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     if (!pack) {
       console.log("❌ Pack not found:", packId);
       return res.status(404).json({ error: "Pack not found" });
+    }
+
+    // Pastikan wallet ini benar-benar milik user
+    const isValidWallet =
+      authUser.wallets.some(w => w.address === activeWallet) ||
+      authUser.custodialWallets?.some(w => w.address === activeWallet);
+
+    if (!isValidWallet) {
+      console.log("🚫 Wallet not associated with this user:", activeWallet);
+      return res.status(403).json({ error: "Invalid wallet address" });
     }
 
     console.log("🎁 Selected Pack:", {
@@ -311,7 +379,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     // === Build unsigned TX
     console.log("⚙️ Building unsigned transaction for Phantom...");
     const txData = await buildMintTransactionPhantom(
-      authUser.wallets[0].address,
+      activeWallet,
       {
         name: nft.name,
         symbol: "UOGNFT",
@@ -327,7 +395,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     );
 
     console.log("🧾 Unsigned TX Built:", {
-      user: authUser.wallets[0].address,
+      user: activeWallet,
       mint: txData.mint,
       price:
         paymentMint === "So11111111111111111111111111111111111111111"
@@ -341,8 +409,9 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
       name: nft.name,
       base_name: nft.base_name,
       mintAddress: txData.mint,
-      owner: authUser.wallets[0].address,
+      owner: activeWallet,
       txSignature: "",
+      status: "pending",
       isSell: false,
       price:
         paymentMint === "So11111111111111111111111111111111111111111"
@@ -375,7 +444,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
 
     // === Return response
     console.log("✅ [Phantom Gatcha] TX ready for signing:", {
-      user: authUser.wallets[0].address,
+      user: activeWallet,
       mintAddress: txData.mint,
       txLength: txData.transaction.length,
     });
@@ -398,6 +467,11 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     });
   } catch (err: any) {
     console.error("❌ Gatcha build error:", err.message);
+    const nft = await Nft.findOne({ mintAddress: req.body.mintAddress });
+    if (nft) {
+      nft.status = "failed";
+      await nft.save();
+    }
     console.error(err.stack);
     res.status(400).json({ error: err.message });
   }
@@ -446,6 +520,7 @@ router.post("/:id/confirm", async (req, res) => {
     }
 
     nft.txSignature = txSignature;
+    nft.status = "minted";
     await nft.save();
     console.log("💾 NFT updated in DB:", {
       id: nft._id,
@@ -454,7 +529,21 @@ router.post("/:id/confirm", async (req, res) => {
       txSignature,
     });
 
-    // === Step 3: Generate metadata
+    // === Step 3: Apply Referral Reward (10%)
+    const ownerUser = await Auth.findOne({
+      $or: [
+        { 'wallets.address': nft.owner },
+        { 'custodialWallets.address': nft.owner },
+      ],
+    });
+
+    if (ownerUser) {
+      await applyReferralReward(ownerUser._id, nft.price, nft.paymentMint, nft.txSignature);
+    } else {
+      console.log("⚠️ [Referral] Owner not found, skip reward.");
+    }
+
+    // === Step 4: Generate metadata
     const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
     const outputDir = path.join(process.cwd(), baseDir);
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
@@ -480,7 +569,7 @@ router.post("/:id/confirm", async (req, res) => {
       }
     }
 
-    // === Step 4: Final summary log
+    // === Step 5: Final summary log
     console.log("🎉 [Gatcha Confirm Success]", {
       name: nft.name,
       mintAddress,
@@ -491,10 +580,10 @@ router.post("/:id/confirm", async (req, res) => {
       paymentMint: nft.paymentMint,
     });
 
-    // === Step 5: Response ke frontend
+    // === Step 6: Response ke frontend
     res.json({
       message: "🎲 Gatcha success!",
-      rewardInfo: null, // placeholder
+      rewardInfo: null,
       blueprint: null,
       nft,
       metadata: {
@@ -511,8 +600,17 @@ router.post("/:id/confirm", async (req, res) => {
     });
   } catch (err: any) {
     console.error("❌ Gatcha confirm error:", err.message);
-    console.error(err.stack);
-    res.status(400).json({ error: err.message });
+
+    // 🧹 Bersihkan NFT pending yang gagal
+    if (req.body.mintAddress) {
+      const failedNft = await Nft.findOne({ mintAddress: req.body.mintAddress });
+      if (failedNft && failedNft.status === "pending") {
+        console.log(`🗑️ Deleting failed NFT: ${failedNft.name} (${failedNft.mintAddress})`);
+        await failedNft.deleteOne();
+      }
+    }
+
+    return res.status(400).json({ error: "Gatcha payment failed." });
   }
 });
 

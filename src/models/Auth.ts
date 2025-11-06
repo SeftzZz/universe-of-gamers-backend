@@ -64,6 +64,7 @@ export interface IAuth extends Document {
   otpSecret?: string; 
   createdAt: Date;
   role?: string;
+  usedReferralCode?: string;
   comparePassword(password: string): Promise<boolean>;
 }
 
@@ -106,6 +107,7 @@ const AuthSchema = new Schema<IAuth>(
     otpSecret: { type: String, select: false },
     createdAt: { type: Date, default: Date.now },
     role: { type: String, default: '' },
+    usedReferralCode: { type: String, default: null },
   },
   { collection: 'users' }
 );

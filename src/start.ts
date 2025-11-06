@@ -20,5 +20,5 @@ import { loadSecretsToEnv } from "./loadSecrets";
   }
 
   console.log("🚀 Starting main app...");
-  require("./index.ts"); // ketika di-compile, otomatis jadi ./index.js
+  require("./index.js"); // ketika di-compile, otomatis jadi ./index.js
 })();

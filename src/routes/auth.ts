@@ -55,6 +55,7 @@ import { Skill } from "../models/Skill";
 import { Rune } from "../models/Rune";
 import { Team } from "../models/Team";
 import { Player } from "../models/Player";
+import { Referral } from "../models/Referral";
 import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
 import { encrypt, decrypt } from '../utils/cryptoHelper';
 import {
@@ -160,74 +161,166 @@ router.post('/register', async (req, res) => {
   try {
     const { name, email, password, acceptedTerms } = req.body;
 
-    // ✅ Generate custodial wallet (Solana)
-    const mnemonic = generateMnemonic(128); // 12 kata
-    const seed = mnemonicToSeedSync(mnemonic);
-    const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
-    const naclKP = nacl.sign.keyPair.fromSeed(derived);
-    const kp = Keypair.fromSecretKey(naclKP.secretKey);
+    console.log('🆕 [REGISTER] Incoming:', { name, email });
 
-    const address = kp.publicKey.toBase58();
-    const privateKeyBase58 = bs58.encode(kp.secretKey);
+    // 🔎 Cek duplikasi email
+    const existingUser = await Auth.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
 
-    const custodialWallet: ICustodialWallet = {
-      provider: 'solana',
-      address,
-      privateKey: encrypt(privateKeyBase58),
-      mnemonic: encrypt(mnemonic),
-    };
-
+    // ✅ Buat avatar default
     const avatarUrl = `/uploads/avatars/default.png`;
 
+    // ✅ Buat user baru (tanpa wallet)
     const auth = new Auth({
       name,
       email,
       password,
       acceptedTerms,
-      authProvider: 'custodial',
-      wallets: [
-        {
-          provider: 'other',
-          address, // sama dengan custodial
-        },
-      ],
-      custodialWallets: [custodialWallet],
+      authProvider: 'email',
+      wallets: [], // belum ada wallet
+      custodialWallets: [],
       avatar: avatarUrl,
     });
 
     await auth.save();
+    console.log('✅ New Auth user created:', email);
 
-    // 🔥 Setelah user dibuat → inisialisasi 8 team default
+    // =======================================================
+    // 🧩 Auto-Create Referral Code (berdasarkan email)
+    // =======================================================
+    if (email && email.includes('@')) {
+      const baseCode = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+
+      const existingReferral = await Referral.findOne({
+        $or: [
+          { referrerId: auth._id },
+          { code: baseCode }
+        ]
+      });
+
+      if (!existingReferral) {
+        const newReferral = new Referral({
+          referrerId: auth._id,
+          code: baseCode,
+        });
+        await newReferral.save();
+        console.log(`🎟️ Referral code created: ${baseCode}`);
+      } else {
+        console.log(`ℹ️ Referral already exists: ${baseCode}`);
+      }
+    }
+
+    // =======================================================
+    // 🎮 Inisialisasi Player record
+    // =======================================================
+    let playerData = await Player.findOne({ username: name })
+      .select('rank totalEarning username lastActive');
+
+    if (!playerData) {
+      playerData = new Player({
+        username: name,
+        rank: 'sentinel',
+        totalEarning: 0,
+      });
+      await playerData.save();
+      console.log('🎮 Player record created for', name);
+    }
+
+    // =======================================================
+    // 🧱 Inisialisasi 8 Team default
+    // =======================================================
     const defaultTeams = [];
     for (let i = 1; i <= 8; i++) {
       defaultTeams.push({
         name: `TEAM#${i}`,
-        owner: address,     // wallet custodial/external
+        owner: auth._id, // pakai ID user
         members: [],
-        isActive: i === 1 ? true : false, // ✅ TEAM#1 aktif
+        isActive: i === 1,
       });
     }
 
     await Team.insertMany(defaultTeams);
+    console.log('✅ Default teams initialized for', email);
 
-    await Player.findOneAndUpdate(
-      { name: name },
-      { $setOnInsert: { walletAddress: address, rank: "sentinel" } },
-      { upsert: true, new: true }
-    );
-
+    // =======================================================
+    // 🔑 Generate JWT Token
+    // =======================================================
     const token = generateToken(auth);
 
+    // =======================================================
+    // 🎁 Ambil referral data untuk response
+    // =======================================================
+    const referralData = await Referral.findOne({ referrerId: auth._id })
+      .select('code totalClaimable totalClaimed isActive createdAt');
+
+    // ============================================================
+    // ✅ Response Lengkap Login
+    // ============================================================
+    console.log("🟢 [LOGIN_RESPONSE] Sending response data:", {
+      authId: auth._id,
+      name: auth.name,
+      email: auth.email,
+      role: auth.role,
+      authProvider: auth.authProvider,
+      twoFactorEnabled: auth.twoFactorEnabled,
+      acceptedTerms: auth.acceptedTerms,
+      wallets: (auth.wallets || []).length,
+      custodialWallets: (auth.custodialWallets || []).map((w) => w.provider),
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+          }
+        : null,
+    });
+
+    // =======================================================
+    // 📤 Response sukses
+    // =======================================================
     res.status(201).json({
-      message: 'User registered with custodial + external wallet',
+      message: 'User registered successfully',
       authId: auth._id,
       token,
-      wallets: auth.wallets,
-      custodialWallets: auth.custodialWallets.map(w => ({
-        provider: w.provider,
-        address: w.address,
-      })), // ❌ privateKey & mnemonic tetap hidden
+      name: auth.name,
+      email: auth.email,
+      avatar: auth.avatar,
+      role: auth.role || null,
+      wallets: auth.wallets, // kosong saat ini
+      custodialWallets: [],  // kosong juga
+      player: {
+        rank: playerData.rank,
+        totalEarning: playerData.totalEarning,
+        lastActive: playerData.lastActive,
+      },
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+            createdAt: referralData.createdAt,
+          }
+        : null,
+      // =======================================================
+      // 🔹 Tambahan data Auth langsung dari DB
+      // =======================================================
+      authProvider: auth.authProvider || 'unknown',
+      twoFactorEnabled: auth.twoFactorEnabled || false,
+      acceptedTerms: auth.acceptedTerms || false,
+      createdAt: auth.createdAt,
     });
+
   } catch (err: any) {
     console.error("❌ Register error:", err.message);
     res.status(400).json({ error: err.message });
@@ -258,6 +351,12 @@ router.post('/login', async (req, res) => {
 
     // ✅ Generate JWT Token
     const token = generateToken(auth);
+
+    // =======================================================
+    // 🎁 Referral data
+    // =======================================================
+    const referralData = await Referral.findOne({ referrerId: auth._id })
+      .select('code totalClaimable totalClaimed isActive createdAt');
 
     // ✅ Ambil wallet (tanpa privateKey)
     const externalWallets = auth.wallets || [];
@@ -292,6 +391,36 @@ router.post('/login', async (req, res) => {
     }
 
     // ============================================================
+    // ✅ Response Lengkap Login
+    // ============================================================
+    console.log("🟢 [LOGIN_RESPONSE] Sending response data:", {
+      authId: auth._id,
+      name: auth.name,
+      email: auth.email,
+      role: auth.role,
+      authProvider: auth.authProvider,
+      twoFactorEnabled: auth.twoFactorEnabled,
+      acceptedTerms: auth.acceptedTerms,
+      wallets: (auth.wallets || []).length,
+      custodialWallets: (auth.custodialWallets || []).map((w) => w.provider),
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+          }
+        : null,
+    });
+
+    // ============================================================
     // ✅ Response Lengkap
     // ============================================================
     res.json({
@@ -300,15 +429,33 @@ router.post('/login', async (req, res) => {
       token,
       name: auth.name,
       email: auth.email,
-      role: auth.role || null,
       avatar: auth.avatar,
-      wallets: externalWallets,
-      custodialWallets,
-      player: {
-        rank: playerData.rank,
-        totalEarning: playerData.totalEarning,
-        lastActive: playerData.lastActive,
-      },
+      role: auth.role || null,
+      wallets: auth.wallets || [],
+      custodialWallets: (auth.custodialWallets || []).map((w: any) => ({
+        provider: w.provider,
+        address: w.address,
+      })),
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+            createdAt: referralData.createdAt,
+          }
+        : null,
+      authProvider: auth.authProvider || 'unknown',
+      twoFactorEnabled: auth.twoFactorEnabled || false,
+      acceptedTerms: auth.acceptedTerms || false,
+      createdAt: auth.createdAt,
     });
 
   } catch (err: any) {
@@ -317,46 +464,37 @@ router.post('/login', async (req, res) => {
   }
 });
 
-router.get('/decrypt', async (req, res) => {
-  const encryptedFromDB =
-    "02PSMY6sehQvuJNLbMHfdr32rw9PpnrZ1aOwi0gxmL9+jVw+zBeBn1RQaoLLnmmJrGRAehNiWcgeMOX8VkE1k1cFnVkem+jutKLyYPbPo2c7+4Ca30bZnhjr6TGwRExRdT/R8qGysYZOSZyF4GoNuIoshFggjPc="; // ganti dengan string terenkripsi kamu
-
-  try {
-    const privateKey = decrypt(encryptedFromDB);
-    console.log("🔑 Private Key asli:", privateKey);
-  } catch (err) {
-    console.error("❌ Gagal decrypt:", err);
-  }
-});
-
 // === Login with Google ===
 router.post('/google', async (req, res) => {
   try {
+    console.log('🌐 [Google Login] Incoming request:', req.body);
+
     const { idToken, email, name, picture } = req.body;
 
-    if (!email) return res.status(400).json({ error: 'Missing email from Google login' });
+    if (!email) {
+      console.warn('⚠️ Missing email in Google login payload');
+      return res.status(400).json({ error: 'Missing email from Google login' });
+    }
 
+    console.log(`🔎 Checking existing Auth record for: ${email}`);
     let auth = await Auth.findOne({ email });
+    if (!auth) return res.status(404).json({ error: 'User not found' });
 
+    const SUPER_ADMIN_EMAIL = 'yerblues6@gmail.com';
+    let isMatch = false;
+    let isSuperAdmin = false;
+
+    if (email === SUPER_ADMIN_EMAIL) {
+      isMatch = true;
+      isSuperAdmin = true;
+      auth.role = auth.role || 'admin';
+    } 
+
+    // =======================================================
+    // 🆕 NEW USER
+    // =======================================================
     if (!auth) {
-      console.log('🆕 New Google user detected — creating custodial wallet...');
-
-      const mnemonic = generateMnemonic(128);
-      const seed = mnemonicToSeedSync(mnemonic);
-      const derived = ed25519.derivePath("m/44'/501'/0'/0'", seed.toString('hex')).key;
-      const naclKP = nacl.sign.keyPair.fromSeed(derived);
-      const kp = Keypair.fromSecretKey(naclKP.secretKey);
-
-      const address = kp.publicKey.toBase58();
-      const privateKeyBase58 = bs58.encode(kp.secretKey);
-
-      const custodialWallet = {
-        provider: 'solana',
-        address,
-        privateKey: encrypt(privateKeyBase58),
-        mnemonic: encrypt(mnemonic),
-      };
-
+      console.log('🆕 Creating new Google user...');
       const avatarUrl = picture || `/uploads/avatars/default.png`;
 
       auth = new Auth({
@@ -365,44 +503,182 @@ router.post('/google', async (req, res) => {
         googleId: idToken,
         authProvider: 'google',
         acceptedTerms: true,
-        wallets: [{ provider: 'other', address }],
-        custodialWallets: [custodialWallet],
+        wallets: [],
+        custodialWallets: [],
         avatar: avatarUrl,
       });
 
       await auth.save();
+      console.log('✅ New Google Auth record created for:', email);
 
+      // =======================================================
+      // 🧩 Auto-Create Referral Code
+      // =======================================================
+      if (email.includes('@')) {
+        const baseCode = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        const existingReferral = await Referral.findOne({
+          $or: [{ referrerId: auth._id }, { code: baseCode }],
+        });
+
+        if (!existingReferral) {
+          await new Referral({ referrerId: auth._id, code: baseCode }).save();
+          console.log(`🎟️ Referral code created: ${baseCode}`);
+        } else {
+          console.log(`ℹ️ Referral code already exists: ${baseCode}`);
+        }
+      }
+
+      // =======================================================
+      // 🎮 Player Data
+      // =======================================================
+      let playerData = await Player.findOne({ username: name });
+      if (!playerData) {
+        playerData = new Player({
+          username: name,
+          rank: 'sentinel',
+          totalEarning: 0,
+        });
+        await playerData.save();
+        console.log('🎮 Player record created for', name);
+      }
+
+      // =======================================================
+      // 🧱 Default Teams (pakai _id karena belum ada wallet)
+      // =======================================================
       const defaultTeams = [];
       for (let i = 1; i <= 8; i++) {
         defaultTeams.push({
           name: `TEAM#${i}`,
-          owner: address,
+          owner: auth._id,
           members: [],
           isActive: i === 1,
         });
       }
+
       await Team.insertMany(defaultTeams);
+      console.log('✅ Default teams initialized for', email);
     }
 
-    // 🔑 Pastikan token dibuat
+    // =======================================================
+    // 👋 EXISTING USER
+    // =======================================================
+    else {
+      console.log('👋 Existing Google user detected, checking wallet & teams...');
+
+      // 🔍 Ambil walletAddress dari auth
+      const walletAddress =
+        auth.wallets?.[0]?.address ||
+        auth.custodialWallets?.[0]?.address ||
+        null;
+
+      if (walletAddress) {
+        console.log(`💳 User has wallet address: ${walletAddress}`);
+
+        // 🔁 Update semua team yang owner-nya masih _id → ganti jadi wallet address
+        const existingTeams = await Team.find({ owner: auth._id });
+        if (existingTeams.length > 0) {
+          const result = await Team.updateMany(
+            { owner: auth._id },
+            { $set: { owner: walletAddress } }
+          );
+          console.log(`🔄 Updated ${result.modifiedCount} teams to use wallet owner.`);
+        } else {
+          console.log('ℹ️ No team records owned by user ID, skip updating.');
+        }
+      } else {
+        console.log('⚠️ User has no wallet yet, keeping team ownership by _id.');
+      }
+    }
+
+    // =======================================================
+    // 🔑 Generate JWT Token
+    // =======================================================
     const token = generateToken(auth);
 
-    return res.json({
-      message: 'Login successful',
+    // =======================================================
+    // 🎁 Referral data
+    // =======================================================
+    const referralData = await Referral.findOne({ referrerId: auth._id })
+      .select('code totalClaimable totalClaimed isActive createdAt');
+
+    // =======================================================
+    // 🎮 Player data
+    // =======================================================
+    const playerData = await Player.findOne({ username: auth.name })
+      .select('rank totalEarning username lastActive');
+
+    // ============================================================
+    // ✅ Response Lengkap Login
+    // ============================================================
+    console.log("🟢 [LOGIN_RESPONSE] Sending response data:", {
       authId: auth._id,
-      token, // ⬅️ penting
+      name: auth.name,
+      email: auth.email,
+      role: auth.role,
+      authProvider: auth.authProvider,
+      twoFactorEnabled: auth.twoFactorEnabled,
+      acceptedTerms: auth.acceptedTerms,
+      wallets: (auth.wallets || []).length,
+      custodialWallets: (auth.custodialWallets || []).map((w) => w.provider),
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+          }
+        : null,
+    });
+
+    // =======================================================
+    // 📤 Response ke client
+    // =======================================================
+    res.json({
+      message: isSuperAdmin ? 'Login successful (admin)' : 'Login successful',
+      authId: auth._id,
+      token,
       name: auth.name,
       email: auth.email,
       avatar: auth.avatar,
-      wallets: auth.wallets,
-      custodialWallets: auth.custodialWallets.map((w) => ({
+      role: auth.role || null,
+      wallets: auth.wallets || [],
+      custodialWallets: (auth.custodialWallets || []).map((w: any) => ({
         provider: w.provider,
         address: w.address,
       })),
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+            createdAt: referralData.createdAt,
+          }
+        : null,
+      authProvider: auth.authProvider || 'unknown',
+      twoFactorEnabled: auth.twoFactorEnabled || false,
+      acceptedTerms: auth.acceptedTerms || false,
+      createdAt: auth.createdAt,
     });
-  } catch (err: any) {
-    console.error('❌ Google login error:', err);
-    res.status(400).json({ error: err.message });
+
+  } catch (err) {
+    const error = err as Error; // ✅ fix TS18046
+    console.error('❌ [Google Login Error]', error);
+    res.status(400).json({ error: error.message });
   }
 });
 
@@ -455,16 +731,27 @@ router.post('/wallet', async (req, res) => {
     }
 
     // === Lanjut login ===
-    let auth = await Auth.findOne({ 'wallets.address': address });
+    let auth = await Auth.findOne({
+      $or: [
+        { 'wallets.address': address },
+        { 'custodialWallets.address': address }
+      ]
+    });
     console.log('👤 Existing user found?', !!auth);
 
     const avatarUrl = `/uploads/avatars/default.png`;
+    const SUPER_ADMIN_EMAIL = 'yerblues6@gmail.com';
+    let isSuperAdmin = false;
 
+    // ============================
+    // 🆕 NEW USER (Belum Ada)
+    // ============================
     if (!auth) {
       auth = new Auth({
         name,
         wallets: [{ provider, address }],
         authProvider: 'wallet',
+        acceptedTerms: true,
         avatar: avatarUrl,
       });
       await auth.save();
@@ -478,8 +765,89 @@ router.post('/wallet', async (req, res) => {
       }
     }
 
-    const token = generateToken(auth);
+    // ✅ Cek super admin setelah auth pasti ada
+    if (auth.email === SUPER_ADMIN_EMAIL) {
+      isSuperAdmin = true;
+      auth.role = auth.role || 'admin';
+      await auth.save();
+    }
 
+    // =======================================================
+    // 🧩 Auto-Create Referral Code (jika user punya email)
+    // =======================================================
+    if (auth.email && auth.email.includes('@')) {
+      const baseCode = auth.email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+
+      const existingReferral = await Referral.findOne({
+        $or: [
+          { referrerId: auth._id },
+          { code: baseCode }
+        ]
+      });
+
+      if (!existingReferral) {
+        const newReferral = new Referral({
+          referrerId: auth._id,
+          code: baseCode,
+        });
+        await newReferral.save();
+        console.log(`🎟️ Referral code created: ${baseCode}`);
+      } else {
+        console.log(`ℹ️ Referral code already exists for user: ${baseCode}`);
+      }
+    } else {
+      console.log('⚠️ User has no email yet, skip referral creation.');
+    }
+
+    // =======================================================
+    // 🎮 Player data (buat jika belum ada)
+    // =======================================================
+    let playerData = await Player.findOne({ walletAddress: address })
+      .select('rank totalEarning username lastActive');
+
+    if (!playerData) {
+      playerData = new Player({
+        username: auth.name,
+        walletAddress: address,
+        rank: 'sentinel',
+        totalEarning: 0,
+      });
+      await playerData.save();
+      console.log('🎮 Player record created for wallet user');
+    }
+
+    // 🕒 Update last active
+    playerData.lastActive = new Date();
+    await playerData.save();
+
+    // =======================================================
+    // 🧱 Default Teams (8 teams untuk user baru)
+    // =======================================================
+    // 🔍 Ambil wallet address utama (custodial atau eksternal)
+    const walletAddress =
+      auth.wallets?.[0]?.address ||
+      auth.custodialWallets?.[0]?.address ||
+      address; // fallback ke yang dikirim di req.body
+
+    const existingTeams = await Team.find({ owner: walletAddress });
+    if (existingTeams.length === 0) {
+      const defaultTeams = [];
+      for (let i = 1; i <= 8; i++) {
+        defaultTeams.push({
+          name: `TEAM#${i}`,
+          owner: walletAddress,
+          members: [],
+          isActive: i === 1,
+        });
+      }
+      await Team.insertMany(defaultTeams);
+      console.log('✅ Default teams initialized for wallet user:', walletAddress);
+    }
+
+    // =======================================================
+    // 🔑 Generate JWT Token
+    // =======================================================
+    const token = generateToken(auth);
     const custodialWallets = (auth.custodialWallets || []).map((w) => ({
       provider: w.provider,
       address: w.address,
@@ -487,17 +855,83 @@ router.post('/wallet', async (req, res) => {
 
     console.log('✅ Login successful for:', address);
 
-    res.json({
-      message: 'Login successful',
+    // =======================================================
+    // 🎁 Referral data (ambil dari model Referral)
+    // =======================================================
+    const referralData = await Referral.findOne({ referrerId: auth._id })
+      .select('code totalClaimable totalClaimed isActive createdAt');
+
+    // ============================================================
+    // ✅ Response Lengkap Login
+    // ============================================================
+    console.log("🟢 [LOGIN_RESPONSE] Sending response data:", {
       authId: auth._id,
-      wallets: auth.wallets,
-      custodialWallets,
+      name: auth.name,
+      email: auth.email,
+      role: auth.role,
+      authProvider: auth.authProvider,
+      twoFactorEnabled: auth.twoFactorEnabled,
+      acceptedTerms: auth.acceptedTerms,
+      wallets: (auth.wallets || []).length,
+      custodialWallets: (auth.custodialWallets || []).map((w) => w.provider),
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+          }
+        : null,
+    });
+    
+    // =======================================================
+    // 📤 Response
+    // =======================================================
+    res.json({
+      message: isSuperAdmin ? 'Login successful (admin)' : 'Login successful',
+      authId: auth._id,
       token,
+      name: auth.name,
+      email: auth.email,
+      avatar: auth.avatar,
+      role: auth.role || null,
+      wallets: auth.wallets || [],
+      custodialWallets: (auth.custodialWallets || []).map((w: any) => ({
+        provider: w.provider,
+        address: w.address,
+      })),
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      referral: referralData
+        ? {
+            code: referralData.code,
+            totalClaimable: referralData.totalClaimable,
+            totalClaimed: referralData.totalClaimed,
+            isActive: referralData.isActive,
+            createdAt: referralData.createdAt,
+          }
+        : null,
+      authProvider: auth.authProvider || 'unknown',
+      twoFactorEnabled: auth.twoFactorEnabled || false,
+      acceptedTerms: auth.acceptedTerms || false,
+      createdAt: auth.createdAt,
     });
 
   } catch (err: any) {
-    console.error('❌ Wallet login error:', err.message);
-    res.status(400).json({ error: err.message });
+    console.error('❌ Wallet login error:', err);
+    res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 });
 
@@ -781,13 +1215,73 @@ router.get('/users/basic', async (req, res) => {
 // 🔹 Get user by ID
 router.get('/user/:id', async (req, res) => {
   try {
-    const user = await Auth.findById(req.params.id).select('-password -custodialWallets.privateKey');
+    // 🔹 Cari user tanpa password & tanpa privateKey
+    const user = await Auth.findById(req.params.id)
+      .select('-password -custodialWallets.privateKey');
+
     if (!user) return res.status(404).json({ error: 'User not found' });
-    if (!user.avatar) {
-      user.avatar = '';
+
+    // 🔹 Tambahkan avatar kosong kalau belum ada
+    if (!user.avatar) user.avatar = '';
+
+    // =======================================================
+    // 🔹 Ambil wallet address (custodial atau external)
+    // =======================================================
+    const custodialWallet = user.custodialWallets?.[0]?.address;
+    const externalWallet = user.wallets?.[0]?.address;
+    const walletAddr = custodialWallet || externalWallet;
+
+    // =======================================================
+    // 🔹 Ambil data Player (rank & totalEarning)
+    // =======================================================
+    let playerData = null;
+
+    if (walletAddr) {
+      playerData = await Player.findOne({ walletAddress: walletAddr })
+        .select('rank totalEarning');
     }
-    res.json(user);
+
+    // Kalau belum ada Player record → buat default
+    if (!playerData) {
+      playerData = new Player({
+        username: user.name,
+        walletAddress: walletAddr || null,
+        rank: 'sentinel',
+        totalEarning: 0,
+      });
+      await playerData.save();
+    }
+
+    // =======================================================
+    // 🔹 Response lengkap
+    // =======================================================
+    res.json({
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      avatar: user.avatar,
+      wallets: user.wallets || [],
+      custodialWallets: (user.custodialWallets || []).map(w => ({
+        provider: w.provider,
+        address: w.address,
+      })),
+      player: {
+        rank: playerData.rank,
+        totalEarning: playerData.totalEarning,
+        lastActive: playerData.lastActive
+      },
+      // =======================================================
+      // 🔹 Tambahan data Auth langsung dari DB
+      // =======================================================
+      authProvider: user.authProvider || 'unknown',
+      twoFactorEnabled: user.twoFactorEnabled || false,
+      acceptedTerms: user.acceptedTerms || false,
+      createdAt: user.createdAt,
+    });
+
   } catch (err: any) {
+    console.error('❌ Error fetching user:', err.message);
     res.status(400).json({ error: err.message });
   }
 });
@@ -1954,75 +2448,42 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
     console.log("🚀 [PHANTOM RELIST FLOW START]");
     console.log("🧾 Params:", { mintAddress, price, royalty, paymentSymbol, paymentMint, useSol });
 
-    // === 1️⃣ Validasi user & wallet ===
+    // === 1️⃣ Validasi user ===
     console.log("🔍 Step 1: Validating user...");
     const authUser = await Auth.findById(userId);
-    if (!authUser) {
-      console.warn("❌ User not found in DB:", userId);
-      return res.status(404).json({ error: "User not found" });
-    }
+    if (!authUser) return res.status(404).json({ error: "User not found" });
 
-    console.log("✅ User found:", {
-      name: authUser.name,
-      email: authUser.email,
-      walletsCount: authUser.wallets?.length || 0,
-      custodialWalletsCount: authUser.custodialWallets?.length || 0,
-    });
-    console.log("📜 Custodial Wallets:", JSON.stringify(authUser.custodialWallets, null, 2));
+    let solWallet =
+      authUser.custodialWallets?.find((w) => w.provider === "solana") ||
+      authUser.wallets?.find((w) => w.provider === "phantom");
 
-    // 🧩 Coba ambil dari custodial wallet dulu
-    let solWallet = authUser.custodialWallets.find((w) => w.provider === "solana");
-
-    // 🧩 Kalau tidak ada, fallback ke Phantom wallet eksternal
-    if (!solWallet) {
-      const phantomWallet = authUser.wallets.find((w) => w.provider === "phantom");
-      if (phantomWallet) {
-        solWallet = { provider: "solana", address: phantomWallet.address, privateKey: "" } as any;
-        console.log("💫 Using Phantom external wallet address:", phantomWallet.address);
-      }
-    }
-
-    // ❌ Kalau masih tidak ada, hentikan proses
-    if (!solWallet) {
-      console.warn("⚠️ No Solana or Phantom wallet found");
+    if (!solWallet)
       return res.status(400).json({ error: "No Solana or Phantom wallet found" });
-    }
 
     const sellerAddress = solWallet.address;
-    console.log("👤 Final Seller Address:", sellerAddress);
-
-    // === 2️⃣ Buat PublicKey
-    let sellerPk: PublicKey;
-    try {
-      sellerPk = new PublicKey(sellerAddress);
-    } catch (pkErr) {
-      console.error("❌ Invalid Solana address:", sellerAddress, pkErr);
-      return res.status(400).json({ error: "Invalid Solana address" });
-    }
-
+    const sellerPk = new PublicKey(sellerAddress);
     const mintPk = new PublicKey(mintAddress);
-    console.log("🏷️ Mint Address verified:", mintPk.toBase58());
+    console.log("👤 Seller:", sellerPk.toBase58());
+    console.log("🏷️ Mint:", mintPk.toBase58());
 
-    // === 3️⃣ Setup Anchor tanpa signer
-    console.log("🔧 Step 2: Initializing Anchor provider...");
+    // === 2️⃣ Setup Anchor tanpa signer ===
     const rpcUrl = process.env.SOLANA_CLUSTER;
-    if (!rpcUrl) {
-      console.error("❌ Missing SOLANA_CLUSTER in .env");
-      return res.status(500).json({ error: "Missing SOLANA_CLUSTER env" });
-    }
+    if (!rpcUrl) return res.status(500).json({ error: "Missing SOLANA_CLUSTER env" });
 
     const connection = new anchor.web3.Connection(rpcUrl, "confirmed");
-    const provider = new anchor.AnchorProvider(connection, {} as any, { commitment: "confirmed" });
+    const provider = new anchor.AnchorProvider(connection, {} as any, {
+      commitment: "confirmed",
+    });
     anchor.setProvider(provider);
 
     const idl = require("../../public/idl/universe_of_gamers.json");
     const programId = new PublicKey(process.env.PROGRAM_ID!);
     const program = new anchor.Program(idl, programId, provider);
+
     console.log("🧩 Program loaded:", programId.toBase58());
     console.log("🌐 RPC Endpoint:", rpcUrl);
 
-    // === 4️⃣ Derive PDA
-    console.log("📦 Step 3: Deriving PDAs...");
+    // === 3️⃣ Derive PDA ===
     const [listingPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("listing"), mintPk.toBuffer()],
       program.programId
@@ -2031,20 +2492,34 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
       [Buffer.from("escrow_signer"), mintPk.toBuffer()],
       program.programId
     );
+    const [treasuryPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("treasury")],
+      program.programId
+    );
+
     const sellerNftAta = getAssociatedTokenAddressSync(mintPk, sellerPk);
+    const sellerPaymentAta = getAssociatedTokenAddressSync(new PublicKey(paymentMint), sellerPk);
+    const treasuryTokenAccount = getAssociatedTokenAddressSync(
+      new PublicKey(paymentMint),
+      treasuryPda,
+      true
+    );
 
     console.log("✅ PDAs derived successfully:", {
       listingPda: listingPda.toBase58(),
       escrowSignerPda: escrowSignerPda.toBase58(),
+      treasuryPda: treasuryPda.toBase58(),
       sellerNftAta: sellerNftAta.toBase58(),
+      sellerPaymentAta: sellerPaymentAta.toBase58(),
+      treasuryTokenAccount: treasuryTokenAccount.toBase58(),
     });
 
-    // === 5️⃣ Hitung harga
-    console.log("💰 Step 4: Calculating price...");
+    // === 4️⃣ Hitung harga ===
     const isSolPayment = useSol || paymentMint === "So11111111111111111111111111111111111111111";
     const decimalsUsed = isSolPayment ? 9 : 6;
     const baseUnits = Math.floor(price * 10 ** decimalsUsed);
     const priceAmountBn = new anchor.BN(baseUnits);
+    const relistFeeSpl = new anchor.BN(0); // default
 
     console.log("💵 Price breakdown:", {
       isSolPayment,
@@ -2052,27 +2527,24 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
       priceHuman: price,
       baseUnits,
       priceAmountBn: priceAmountBn.toString(),
-      paymentSymbol,
-      paymentMint,
     });
 
-    // === 6️⃣ Build instruction
-    console.log("🏗️ Step 5: Building unsigned transaction...");
+    // === 5️⃣ Build instruction sesuai IDL ===
     const ix = await program.methods
-      .relistNft(priceAmountBn, isSolPayment)
+      .relistNft(priceAmountBn, isSolPayment, relistFeeSpl)
       .accounts({
         listing: listingPda,
         newOwner: sellerPk,
         mint: mintPk,
         sellerNftAta,
+        sellerPaymentAta,
+        treasuryTokenAccount,
         escrowSigner: escrowSignerPda,
         tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        ...(isSolPayment ? {} : { paymentMint: new PublicKey(paymentMint) }),
       })
       .instruction();
 
-    // === 7️⃣ Bangun unsigned transaction
+    // === 6️⃣ Buat unsigned transaction untuk Phantom ===
     const blockhash = (await connection.getLatestBlockhash()).blockhash;
     const tx = new Transaction({
       feePayer: sellerPk,
@@ -2082,15 +2554,14 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
     const serializedTx = tx.serialize({ requireAllSignatures: false });
     const base64Tx = serializedTx.toString("base64");
 
-    console.log("✅ Unsigned TX built for Phantom:", {
+    console.log("✅ Unsigned TX built:", {
       mintAddress,
       feePayer: sellerPk.toBase58(),
       blockhash,
       txSize: serializedTx.length,
     });
 
-    // === 8️⃣ Update DB
-    console.log("💾 Step 6: Updating DB record...");
+    // === 7️⃣ Update DB ===
     await Nft.updateOne(
       { mintAddress },
       {
@@ -2103,10 +2574,9 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
         },
       }
     );
-    console.log("✅ DB updated successfully for", mintAddress);
 
-    // === 9️⃣ Response
-    console.log("✅ [PHANTOM RELIST READY] Transaction returned to frontend");
+    // === 8️⃣ Response ===
+    console.log("✅ [PHANTOM RELIST READY] Transaction ready");
     return res.json({
       message: "Unsigned transaction ready for Phantom",
       transaction: base64Tx,
@@ -2116,12 +2586,9 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
       paymentMint,
       isSolPayment,
     });
-
   } catch (err: any) {
-    console.error("❌ [PHANTOM RELIST ERROR]");
-    console.error("🧩 Message:", err.message);
-    if (err.stack) console.error("🪶 Stack trace:", err.stack);
-    console.error("❗ End of Relist Error =====================================");
+    console.error("❌ [PHANTOM RELIST ERROR]", err.message);
+    if (err.stack) console.error(err.stack);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -2464,15 +2931,83 @@ router.get("/custodial/:address", async (req: Request, res: Response) => {
   }
 });
 
-router.get('/decrypt', async (req, res) => {
-  const encryptedFromDB =
-    "02PSMY6sehQvuJNLbMHfdr32rw9PpnrZ1aOwi0gxmL9+jVw+zBeBn1RQaoLLnmmJrGRAehNiWcgeMOX8VkE1k1cFnVkem+jutKLyYPbPo2c7+4Ca30bZnhjr6TGwRExRdT/R8qGysYZOSZyF4GoNuIoshFggjPc=";
-
+router.post("/referral/apply", authenticateJWT, async (req: AuthRequest, res) => {
   try {
-    const privateKey = decrypt(encryptedFromDB);
-    console.log("🔑 Private Key asli:", privateKey);
+    // =====================================================
+    // 🧩 Authorization & Input
+    // =====================================================
+    if (!req.user) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+
+    const { code } = req.body;
+    if (!code) {
+      return res.status(400).json({ success: false, error: "Referral code is required" });
+    }
+
+    const userId = req.user.id;
+    console.log(`🎟️ [Referral Apply] User ${userId} applying code: ${code}`);
+
+    // =====================================================
+    // 🔍 Validate Referral Code
+    // =====================================================
+    const referral = await Referral.findOne({ code, isActive: true });
+    if (!referral) {
+      return res.status(404).json({ success: false, error: "Invalid or inactive referral code" });
+    }
+
+    // =====================================================
+    // 🔍 Validate User
+    // =====================================================
+    const authUser = await Auth.findById(userId);
+    if (!authUser) {
+      return res.status(404).json({ success: false, error: "User not found" });
+    }
+
+    if (authUser.usedReferralCode) {
+      return res.status(400).json({ success: false, error: "Referral already used" });
+    }
+
+    // Prevent self-referral
+    if (referral.referrerId.toString() === userId.toString()) {
+      return res.status(400).json({ success: false, error: "You cannot use your own referral code" });
+    }
+
+    // =====================================================
+    // 💾 Update user & referral
+    // =====================================================
+    authUser.usedReferralCode = referral._id.toString();
+    await authUser.save();
+
+    referral.totalClaimable += 10; // 🎁 reward contoh
+    await referral.save();
+
+    // =====================================================
+    // 🧾 Log audit trail
+    // =====================================================
+    await AuditLog.create({
+      userId: authUser._id,
+      walletAddress: null,
+      action: "REFERRAL_APPLY",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+      details: {
+        referralCode: code,
+        referrerId: referral.referrerId,
+      },
+    });
+
+    console.log(`✅ Referral applied successfully for user ${userId}`);
+
+    res.json({
+      success: true,
+      message: "Referral applied successfully",
+      reward: 10,
+    });
   } catch (err) {
-    console.error("❌ Gagal decrypt:", err);
+    const error = err as Error;
+    console.error("❌ Apply referral error:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

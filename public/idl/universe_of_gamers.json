@@ -34,6 +34,20 @@
         {
           "name": "tradeFeeBps",
           "type": "u16"
+        },
+        {
+          "name": "relistFeeBps",
+          "type": "u16"
+        },
+        {
+          "name": "multisigAdmins",
+          "type": {
+            "vec": "publicKey"
+          }
+        },
+        {
+          "name": "multisigThreshold",
+          "type": "u8"
         }
       ]
     },
@@ -223,11 +237,6 @@
         },
         {
           "name": "treasuryPda",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "escrowTemp",
           "isMut": true,
           "isSigner": false
         },
@@ -493,17 +502,22 @@
           "isSigner": false
         },
         {
+          "name": "sellerPaymentAta",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "treasuryTokenAccount",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "escrowSigner",
           "isMut": false,
           "isSigner": false
         },
         {
           "name": "tokenProgram",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "systemProgram",
           "isMut": false,
           "isSigner": false
         }
@@ -516,6 +530,10 @@
         {
           "name": "useSol",
           "type": "bool"
+        },
+        {
+          "name": "relistFeeSpl",
+          "type": "u64"
         }
       ]
     }
@@ -567,7 +585,21 @@
             "type": "u16"
           },
           {
+            "name": "relistFeeBps",
+            "type": "u16"
+          },
+          {
             "name": "treasuryBump",
+            "type": "u8"
+          },
+          {
+            "name": "multisigAdmins",
+            "type": {
+              "vec": "publicKey"
+            }
+          },
+          {
+            "name": "multisigThreshold",
             "type": "u8"
           }
         ]
@@ -609,6 +641,16 @@
       "code": 6006,
       "name": "MathOverflow",
       "msg": "Math Over flow"
+    },
+    {
+      "code": 6007,
+      "name": "Unauthorized",
+      "msg": "Unauthorized"
+    },
+    {
+      "code": 6008,
+      "name": "InvalidThreshold",
+      "msg": "InvalidThreshold"
     }
   ]
 }

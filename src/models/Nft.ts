@@ -41,6 +41,8 @@ export interface INft extends Document {
   paymentMint: string,      // optional: mint address SPL token
 
   txSignature?: string;
+
+  status: "pending" | "minted" | "failed";
   createdAt: Date;
   updatedAt: Date;
 }
@@ -84,6 +86,13 @@ const NftSchema = new Schema<INft>(
     paymentMint: { type: String, default: "" },      // optional: mint address SPL token
 
     txSignature: { type: String },
+
+    // 🟩 STATUS baru: pending / minted / failed
+    status: {
+      type: String,
+      enum: ["pending", "minted", "failed"],
+      default: "pending",
+    },
   },
   { collection: "nfts", timestamps: true }
 );
