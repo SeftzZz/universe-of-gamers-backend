@@ -617,7 +617,7 @@ router.post("/battle/simulate", async (req, res) => {
 
         // 🔹 Global reward multiplier (tanpa ubah config DB)
         const totalFragment = economicFragment * skillFragment * booster * rankModifier;
-        const totalDaily = totalFragment * 10;
+        const totalDaily = totalFragment;
 
         console.log(`📈 Win Streak: ${winStreak}`);
         console.log(`⚙️ Skill Fragment: ${skillFragment}`);

@@ -442,7 +442,7 @@ router.put("/battle/:id", async (req, res) => {
           const booster = winStreak >= 3 ? 2 : 1;
 
           const totalFragment = economicFragment * skillFragment * booster * rankModifier;
-          const totalDaily = totalFragment * 10;
+          const totalDaily = totalFragment;
 
           console.log(`📈 Win Streak: ${winStreak}`);
           console.log(`⚙️ Skill Fragment: ${formatExcel(skillFragment)}`);
