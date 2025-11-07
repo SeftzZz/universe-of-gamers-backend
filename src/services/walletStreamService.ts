@@ -8,7 +8,7 @@ import { Client } from "@solana-tracker/data-api";
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 
 // === Konfigurasi ===
-const POLL_INTERVAL = 5 * 1000; // 5 detik
+const POLL_INTERVAL = 1 * 60 * 1000; // 1 menit
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_KEY}`;
 const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
 

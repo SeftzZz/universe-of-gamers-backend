@@ -23,10 +23,153 @@ interface IDailyEarningPayload {
   heroes: { rarity: string; level: number }[];
 }
 
-// ✅ Helper: cari rank modifier dari DB
+// ============================================================
+// 🔧 Rank Modifier
+// ============================================================
 async function getRankModifier(rank: string): Promise<number> {
+  console.log("──────────────────────────────────────────────");
+  console.log("🔧 [getRankModifier] Fetching rank modifier...");
+  console.log(`🎖️ Requested Rank: ${rank}`);
+
   const rankDoc = await RankConfig.findOne({ rank: rank.toLowerCase() });
-  return rankDoc ? rankDoc.modifier : 0;
+
+  if (rankDoc) {
+    console.log(`✅ Rank found in DB → ${rankDoc.rank}`);
+    console.log(`💠 Modifier Value: ${rankDoc.modifier}`);
+    console.log("──────────────────────────────────────────────");
+    return rankDoc.modifier;
+  } else {
+    console.warn(`⚠️ Rank not found in RankConfig: ${rank}`);
+    console.log("🧩 Fallback Modifier: 0 (default)");
+    console.log("──────────────────────────────────────────────");
+    return 0;
+  }
+}
+
+// ============================================================
+// 💰 Economic Fragment Calculator (with Character Rarity)
+// ============================================================
+async function calculateEconomicFragment(
+  teamId: Types.ObjectId | string
+): Promise<number> {
+  console.log("──────────────────────────────────────────────");
+  console.log("💰 [calculateEconomicFragment] Starting calculation...");
+  console.log(`🧩 Team ID: ${teamId}`);
+
+  // 🧠 Populate members + their character
+  const team = await Team.findById(teamId)
+    .populate({
+      path: "members",
+      populate: {
+        path: "character",
+        model: "Character",
+        select: "name rarity baseHp baseAtk baseDef baseSpd",
+      },
+    });
+
+  if (!team || !team.members || team.members.length === 0) {
+    console.warn(`⚠️ Team not found or has no members: ${teamId}`);
+    console.log("──────────────────────────────────────────────");
+    return 0;
+  }
+
+  const MAX_NORMALIZED = 37500 * 3;
+  let totalValue = 0;
+  let lowestRarity: "common" | "rare" | "epic" | "legendary" = "legendary";
+  const rarityOrder = ["common", "rare", "epic", "legendary"];
+
+  console.log(`👥 Team Members Count: ${team.members.length}`);
+
+  for (const h of team.members as any[]) {
+    const char = h.character;
+    const rarity = char?.rarity?.toLowerCase?.() ?? "common";
+    const level = h.level ?? 1;
+
+    console.log(`   🦸 Hero: ${h.name || "(Unnamed Hero)"}`);
+    console.log(`      ➜ Character: ${char?.name || "Unknown Character"}`);
+    console.log(`      ➜ Rarity (from Character): ${rarity}`);
+    console.log(`      ➜ Level: ${level}`);
+
+    const config = await HeroConfig.findOne({ rarity });
+    if (config) {
+      const teamVal = (config.teamValue as Record<number, number>)[level] || 0;
+      totalValue += teamVal;
+
+      console.log(`      💎 teamValue(level ${level}): ${teamVal}`);
+      console.log(`      ⚙️ teamModifier (rarity ${rarity}): ${config.teamModifier}`);
+
+      if (rarityOrder.indexOf(rarity) < rarityOrder.indexOf(lowestRarity)) {
+        lowestRarity = rarity as any;
+      }
+    } else {
+      console.warn(`      ⚠️ No HeroConfig found for rarity: ${rarity}`);
+    }
+  }
+
+  console.log(`📊 Total Value (sum of teamValue): ${totalValue}`);
+
+  const totalNormalized = totalValue / MAX_NORMALIZED;
+  console.log(`📈 Total Normalized: ${totalNormalized.toFixed(6)}`);
+
+  const rarityCfg = await HeroConfig.findOne({ rarity: lowestRarity });
+  const teamModifier = rarityCfg ? rarityCfg.teamModifier : 0.15;
+  console.log(`🧩 Lowest Rarity: ${lowestRarity} | Team Modifier: ${teamModifier}`);
+
+  const result = totalNormalized * (1 - teamModifier) + teamModifier * 100;
+  console.log(`✅ Economic Fragment Result: ${result.toFixed(6)}`);
+  console.log("──────────────────────────────────────────────");
+
+  return result;
+}
+
+// ============================================================
+// 💾 Save DailyEarning
+// ============================================================
+async function saveDailyEarning(result: IDailyEarningPayload, walletAddress: string) {
+  console.log("──────────────────────────────────────────────");
+  console.log("💾 [saveDailyEarning] Updating daily record...");
+  console.log(`👛 Wallet Address: ${walletAddress}`);
+  console.log(`📅 Rank: ${result.rank}`);
+  console.log(`🔥 Win Streak: ${result.winStreak}`);
+  console.log(`💎 Total Fragment (+): ${result.totalFragment}`);
+  console.log(`💰 Total Daily (+): ${result.totalDaily}`);
+
+  const todayStart = startOfDay(new Date());
+  const todayEnd = endOfDay(new Date());
+  console.log(`🕓 Date Range: ${todayStart.toISOString()} → ${todayEnd.toISOString()}`);
+
+  try {
+    const updateResult = await DailyEarning.findOneAndUpdate(
+      {
+        walletAddress,
+        date: { $gte: todayStart, $lte: todayEnd },
+      },
+      {
+        $set: {
+          rank: result.rank,
+          winStreak: result.winStreak,
+          heroesUsed: result.heroes,
+        },
+        $inc: {
+          totalFragment: result.totalFragment,
+          totalDailyEarning: result.totalDaily,
+        },
+      },
+      { upsert: true, new: true }
+    );
+
+    if (updateResult) {
+      console.log("✅ DailyEarning successfully updated or created.");
+      console.log(`📊 New Total Fragment: ${updateResult.totalFragment}`);
+      console.log(`📊 New Total DailyEarning: ${updateResult.totalDailyEarning}`);
+    } else {
+      console.warn("⚠️ DailyEarning update returned null (unexpected).");
+    }
+  } catch (err: any) {
+    console.error("❌ Error saving DailyEarning:", err.message);
+  }
+
+  console.log("──────────────────────────────────────────────");
 }
 
 // =====================================================
@@ -128,72 +271,6 @@ async function verifyNftIntegrity(nft: any): Promise<void> {
   console.log(`✅ NFT integrity OK: ${nft.name}`);
   console.log("──────────────────────────────────────────────");
 }
-// =====================================================
-// 💰 Economic Fragment Calculation
-// =====================================================
-async function calculateEconomicFragment(
-  teamId: Types.ObjectId | string
-): Promise<number> {
-  const team = await Team.findById(teamId).populate("members");
-  if (!team || !team.members || team.members.length === 0) return 0;
-
-  const MAX_NORMALIZED = 37500 * 3;
-  let totalValue = 0;
-  let lowestRarity: "common" | "rare" | "epic" | "legendary" = "legendary";
-
-  const rarityOrder = ["common", "rare", "epic", "legendary"];
-
-  for (const h of team.members as any[]) {
-    const rarity = h.rarity ?? "common";
-    const level = h.level ?? 1;
-
-    const config = await HeroConfig.findOne({ rarity });
-    if (config) {
-      totalValue += (config.teamValue as Record<number, number>)[level] || 0;
-      if (rarityOrder.indexOf(rarity) < rarityOrder.indexOf(lowestRarity)) {
-        lowestRarity = rarity;
-      }
-    }
-  }
-
-  const totalNormalized = totalValue / MAX_NORMALIZED;
-  const rarityCfg = await HeroConfig.findOne({ rarity: lowestRarity });
-  const teamModifier = rarityCfg ? rarityCfg.teamModifier : 0.15;
-
-  return totalNormalized * (1 - teamModifier) + teamModifier;
-}
-
-async function saveDailyEarning(
-  result: IDailyEarningPayload,
-  walletAddress: string
-) {
-  try {
-    const todayStart = startOfDay(new Date());
-    const todayEnd = endOfDay(new Date());
-
-    await DailyEarning.findOneAndUpdate(
-      {
-        walletAddress,
-        date: { $gte: todayStart, $lte: todayEnd },
-      },
-      {
-        $set: {
-          rank: result.rank,
-          winStreak: result.winStreak,
-          heroesUsed: result.heroes,
-        },
-        $inc: {
-          totalFragment: result.totalFragment,
-          totalDailyEarning: result.totalDaily,
-        },
-      },
-      { upsert: true, new: true }
-    );
-  } catch (err: any) {
-    console.error("❌ Error saving daily earning:", err.message);
-  }
-}
-
 
 // =====================================================
 // 🎮 API ROUTES
@@ -325,36 +402,53 @@ router.put("/battle/:id", async (req, res) => {
       // ===================================================
       if (result === "end_battle") {
         console.log("🎯 Battle marked as END — processing rewards...");
+
+        // 🔹 Helper format angka seperti di Excel (koma desimal, tanpa scaling)
+        function formatExcel(value: number): string {
+          return value.toLocaleString("id-ID", {
+            minimumFractionDigits: 6,
+            maximumFractionDigits: 9,
+          });
+        }
+
         for (const p of battle.players) {
           const walletAddress = p.user;
           const isWinner = p.isWinner;
           console.log(`🏁 Processing player: ${walletAddress} (${isWinner ? "WINNER" : "LOSER"})`);
 
+          // ❌ Kalau kalah → tidak dapat apa-apa
+          if (!isWinner) {
+            console.log(`🚫 ${walletAddress} lost — no rewards granted.`);
+            console.log("-----------------------------------");
+            continue;
+          }
+
+          // ✅ Kalau menang, baru proses reward
           const teamId = p.team?._id || p.team;
           const economicFragment = await calculateEconomicFragment(teamId);
-          console.log(`💰 Economic Fragment: ${economicFragment.toFixed(4)}`);
+          console.log(`💰 Economic Fragment: ${formatExcel(economicFragment)}`);
 
           const lastEarning = await DailyEarning.findOne({ walletAddress }).sort({ createdAt: -1 });
           const playerRank = lastEarning?.rank || "sentinel";
           const rankModifier = await getRankModifier(playerRank);
-          console.log(`🎖️ Rank: ${playerRank} | Rank Modifier: ${rankModifier}`);
+          console.log(`🎖️ Rank: ${playerRank} | Rank Modifier: ${formatExcel(rankModifier)}`);
 
-          const winStreak = isWinner ? (lastEarning?.winStreak || 0) + 1 : 0;
+          const winStreak = (lastEarning?.winStreak || 0) + 1;
           const WINRATE_MODIFIER: Record<number, number> = {
             1: 0.01, 2: 0.05, 3: 0.07, 4: 0.09, 5: 0.11,
             6: 0.13, 7: 0.15, 8: 0.17, 9: 0.21,
           };
-          const skillFragment = (WINRATE_MODIFIER[Math.min(winStreak, 9)] || 0.21) * 100;
+          const skillFragment = (WINRATE_MODIFIER[Math.min(winStreak, 9)] || 0);
           const booster = winStreak >= 3 ? 2 : 1;
 
           const totalFragment = economicFragment * skillFragment * booster * rankModifier;
           const totalDaily = totalFragment * 10;
 
           console.log(`📈 Win Streak: ${winStreak}`);
-          console.log(`⚙️  Skill Fragment: ${skillFragment}`);
-          console.log(`⚙️  Booster: ${booster}`);
-          console.log(`💎 Total Fragment: ${totalFragment.toFixed(2)}`);
-          console.log(`💰 Total Daily: ${totalDaily.toFixed(2)}`);
+          console.log(`⚙️ Skill Fragment: ${formatExcel(skillFragment)}`);
+          console.log(`⚙️ Booster: ${booster}`);
+          console.log(`💎 Total Fragment: ${formatExcel(totalFragment)}`);
+          console.log(`💰 Total Daily: ${formatExcel(totalDaily)}`);
 
           const today = new Date();
           today.setHours(0, 0, 0, 0);
@@ -368,7 +462,7 @@ router.put("/battle/:id", async (req, res) => {
             { walletAddress, gameNumber: nextGameNumber },
             {
               $setOnInsert: {
-                winCount: isWinner ? 1 : 0,
+                winCount: 1,
                 skillFragment,
                 economicFragment,
                 booster,
@@ -387,15 +481,12 @@ router.put("/battle/:id", async (req, res) => {
           }
 
           await Player.findOneAndUpdate(
-            { walletAddress: walletAddress },
-            {
-              $inc: { totalEarning: totalFragment },
-              $set: { lastActive: new Date() },
-            },
+            { walletAddress },
+            { $inc: { totalEarning: totalFragment }, $set: { lastActive: new Date() } },
             { upsert: false }
           );
 
-          console.log(`🧾 Player updated: ${walletAddress} | +${totalFragment.toFixed(2)} fragments`);
+          console.log(`🧾 Player updated: ${walletAddress} | +${formatExcel(totalFragment)} fragments`);
 
           await saveDailyEarning(
             {

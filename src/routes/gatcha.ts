@@ -10,58 +10,76 @@ import { Referral } from "../models/Referral";
 import { authenticateJWT, AuthRequest } from "../middleware/auth";
 import { buildMintTransaction, buildMintTransactionPhantom } from "../services/mintService";
 import { generateNftMetadata } from "../services/metadataGenerator";
+import { Client } from "@solana-tracker/data-api";
 
 import fs from "fs";
 import path from "path";
 
 const router = express.Router();
-/**
- * Menambahkan reward referral sebesar 10% dari transaksi Gatcha.
- * @param {string} userId - ID user yang melakukan Gatcha.
- * @param {number} amount - Nominal harga Gatcha.
- * @param {string} paymentMint - Token pembayaran (SOL atau UOG).
- */
-export async function applyReferralReward(userId: any, amount: any, paymentMint: any, txSignature: any) {
+
+const client = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
+
+export async function applyReferralReward(
+  userId: any,
+  amount: number | undefined,
+  paymentMint: string | undefined,
+  txSignature: string | undefined
+) {
   try {
-    // Cari user & referrer-nya
+    const finalAmount = Number(amount) || 0;
+    const finalMint = paymentMint || "So11111111111111111111111111111111111111111";
+    const finalTx = txSignature || "UNKNOWN_TX";
+
+    // === Cari user & referrer ===
     const user = await Auth.findById(userId);
     if (!user || !user.usedReferralCode) {
       console.log("ℹ️ [Referral] User has no referrer, skip reward.");
       return;
     }
 
-    // Cari data referral referrer
-    const ref = await Referral.findOne({ usedReferralCode: user.usedReferralCode });
+    const ref = await Referral.findById(user.usedReferralCode);
     if (!ref) {
-      console.log("⚠️ [Referral] Referrer has no referral record, skip.");
+      console.log("⚠️ [Referral] Referrer record not found for code:", user.usedReferralCode);
       return;
     }
 
-    // Hitung reward (10%)
-    const reward = (amount || 0) * 0.1;
-    if (reward <= 0) {
-      console.log("⚠️ [Referral] No valid reward to apply.");
-      return;
+    // === Ambil harga token ===
+    let tokenPriceUsd = 0;
+    let tokenSymbol = "UNKNOWN";
+    try {
+      const info = await client.getTokenInfo(String(finalMint));
+      const pools = info?.pools || [];
+      if (pools.length > 0 && pools[0].price?.usd) tokenPriceUsd = pools[0].price.usd;
+      tokenSymbol = info?.token?.symbol || "TOKEN";
+    } catch (err: any) {
+      console.warn(`⚠️ [Referral] Failed to fetch price for ${finalMint}: ${err.message}`);
     }
 
-    // Tambah ke saldo claimable & log transaksi
-    ref.totalClaimable += reward;
+    const amountUsd = tokenPriceUsd > 0 ? finalAmount * tokenPriceUsd : finalAmount;
+    const rewardUsd = amountUsd * 0.1;
+    if (rewardUsd <= 0) return console.log("⚠️ [Referral] No valid reward to apply.");
+
+    ref.totalClaimable = (ref.totalClaimable || 0) + rewardUsd;
     ref.history.push({
       fromUserId: user._id,
       txType: "GATCHA",
-      amount: amount,
-      reward: reward,
-      txSignature: txSignature,
+      amount: finalAmount,
+      reward: rewardUsd,
+      paymentMint: finalMint,
+      tokenSymbol,
+      tokenPriceUsd,
+      txSignature: finalTx,
       createdAt: new Date(),
     });
 
     await ref.save();
 
     console.log("💰 [Referral Reward Added]", {
-      usedReferralCode: user.usedReferralCode,
-      reward,
-      paymentMint,
-      totalClaimable: ref.totalClaimable,
+      refCode: ref.code,
+      tokenSymbol,
+      price: `$${tokenPriceUsd.toFixed(4)}`,
+      rewardUsd: rewardUsd.toFixed(4),
+      totalClaimable: ref.totalClaimable.toFixed(4),
     });
   } catch (err: any) {
     console.error("❌ [Referral Error]", err.message);
@@ -185,25 +203,34 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
 
     console.log("⚡ Custodian gatcha request:", { userId, packId });
 
-    // Ambil user
+    // === Ambil user
     const authUser = await Auth.findById(userId);
     if (!authUser) return res.status(404).json({ error: "User not found" });
 
-    const custodian = authUser.custodialWallets.find(w => w.provider === "solana");
-    if (!custodian) return res.status(400).json({ error: "No custodial Solana wallet" });
+    // === Ambil semua wallet user (hanya eksternal)
+    const allWallets = Array.isArray(authUser.wallets) ? authUser.wallets : [];
 
-    const decrypted = decrypt(custodian.privateKey);
-    const userKp = Keypair.fromSecretKey(bs58.decode(decrypted));
-    console.log("🔓 Custodian wallet:", userKp.publicKey.toBase58());
+    // === Cari wallet Solana
+    const custodian = allWallets.find(
+      (w: any) => w.provider === "phantom" || w.provider === "solana" || w.chain === "solana"
+    );
+
+    // === Validasi wallet
+    if (!custodian) {
+      return res.status(400).json({ error: "No Solana wallet found in user account" });
+    }
+
+    console.log("🪙 Using external Solana wallet:", custodian.address);
 
     // Ambil pack
     const pack = await GatchaPack.findById(packId);
     if (!pack) return res.status(404).json({ error: "Pack not found" });
 
-    // Roll gatcha multi
-    const rolls = await doMultiGatchaRolls(pack, custodian.address, 3);
+    // Roll gatcha multi (0 NFT)
+    const rolls = await doMultiGatchaRolls(pack, custodian.address, 0);
 
     const processedResults = [];
+
     for (let i = 0; i < rolls.length; i++) {
       let { nft } = rolls[i];
 
@@ -214,6 +241,7 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
       if (nft.character) nft = await nft.populate("character");
       if (nft.rune) nft = await nft.populate("rune");
 
+      // === Generate nama & base_name
       if (nft.character && (nft.character as any)._id) {
         const charId = (nft.character as any)._id;
         const charName = (nft.character as any).name;
@@ -232,7 +260,7 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
 
       await nft.save();
 
-      // Metadata JSON dummy
+      // === Metadata JSON dummy
       const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
       const outputDir = path.join(process.cwd(), baseDir);
       if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
@@ -251,7 +279,29 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
       });
     }
 
-    // TX dummy
+    // === STEP 3: Apply Referral Reward (hanya sekali per transaksi)
+    console.log("🎁 Checking referral reward eligibility...");
+    const ownerUser = await Auth.findOne({
+      $or: [
+        { 'wallets.address': custodian.address },
+        { 'custodialWallets.address': custodian.address },
+      ],
+    });
+
+    if (ownerUser) {
+      const totalAmount = (pack.priceSOL || 0); // bisa diganti total semua NFT jika multi
+      await applyReferralReward(
+        ownerUser._id,
+        totalAmount,
+        "So11111111111111111111111111111111111111112",
+        `CUSTODIAN_${Date.now()}`
+      );
+      console.log("💰 Referral reward applied successfully.");
+    } else {
+      console.log("⚠️ [Referral] Owner not found, skip reward.");
+    }
+
+    // // TX dummy
     const resultsWithTx = processedResults.map(r => ({
       ...r,
       tx: {

@@ -19,6 +19,7 @@ import authRoutes from "./routes/auth";
 import solRoutes from "./routes/sol";
 import characterRoutes from "./routes/character";
 import gatchaRoutes from "./routes/gatcha";
+import withdrawRoutes from "./routes/withdraw";
 
 import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
 
@@ -92,6 +93,7 @@ app.use("/api/nft", nftRoutes);
 app.use("/api/wallet", walletRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/gatcha", gatchaRoutes);
+app.use("/api/withdraw", withdrawRoutes);
 app.use("/api", battleRoutes);
 app.use("/api", solRoutes);
 app.use("/api", battleSimulateRouter);
@@ -316,7 +318,7 @@ wss.on("connection", (ws: WebSocket) => {
 
             const teamId = p.team?._id || p.team;
             const economicFragment = await calculateEconomicFragment(teamId);
-            console.log(`💰 Economic Fragment: ${economicFragment.toFixed(4)}`);
+            console.log(`💰 Economic Fragment: ${economicFragment}`);
 
             const lastEarning = await DailyEarning.findOne({ walletAddress }).sort({ createdAt: -1 });
             const playerRank = lastEarning?.rank || "sentinel";
@@ -329,13 +331,11 @@ wss.on("connection", (ws: WebSocket) => {
               1: 0.01, 2: 0.05, 3: 0.07, 4: 0.09, 5: 0.11,
               6: 0.13, 7: 0.15, 8: 0.17, 9: 0.21,
             };
-            const skillFragment = (WINRATE_MODIFIER[Math.min(winStreak, 9)] || 0.21) * 100;
+            const skillFragment = (WINRATE_MODIFIER[Math.min(winStreak, 9)] || 0.21);
             const booster = winStreak >= 3 ? 2 : 1;
 
-            const totalFragment = parseFloat(
-              (economicFragment * skillFragment * booster * rankModifier).toFixed(4)
-            );
-            const totalDaily = parseFloat((totalFragment * 10).toFixed(4));
+            const totalFragment = economicFragment * skillFragment * booster * rankModifier;
+            const totalDaily = totalFragment * 10;
 
             console.log(`📈 WinStreak=${winStreak} | Booster=${booster}`);
             console.log(`⚙️ SkillFrag=${skillFragment} | RankMod=${rankModifier}`);
@@ -399,19 +399,19 @@ wss.on("connection", (ws: WebSocket) => {
             console.log(`📅 DailyEarning updated for ${walletAddress}`);
 
             // ✅ Kirim pesan ke client pengirim
-            // ws.send(
-            //   JSON.stringify({
-            //     type: "battle_reward",
-            //     battleId: battle._id,
-            //     walletAddress,
-            //     rank: playerRank,
-            //     totalFragment,
-            //     totalDaily,
-            //     winStreak,
-            //     booster,
-            //     isWinner,
-            //   })
-            // );
+            ws.send(
+              JSON.stringify({
+                type: "battle_reward",
+                battleId: battle._id,
+                walletAddress,
+                rank: playerRank,
+                totalFragment,
+                totalDaily,
+                winStreak,
+                booster,
+                isWinner,
+              })
+            );
 
             // ✅ Broadcast ke semua client
             broadcast({
@@ -592,7 +592,7 @@ export const broadcast = (data: any) => {
 
   server.listen(PORT, () => {
     console.log(`📡 Program ID:${process.env.PROGRAM_ID}`);
-    console.log(`   Backend version 5.11.2025.0115`);
+    console.log(`   Backend version 7.11.2025.1950`);
     console.log(`🚀 NFT Backend running on http://localhost:${PORT}`);
     console.log(`📡 WebSocket active on ws://localhost:${PORT}`);
     console.log("🌍 Allowed Origins:", allowedOrigins.join(", "));
