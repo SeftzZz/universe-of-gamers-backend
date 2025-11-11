@@ -417,33 +417,35 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
     const now = Date.now();
     const dbCache = await WalletBalance.findOne({ address }).lean();
 
-    // 🧠 Cek apakah masih valid (kurang dari 5 menit)
+    // 🧠 Cek apakah cache masih valid (< 5 menit)
     if (dbCache && now - new Date(dbCache.lastUpdated).getTime() < MAX_CACHE_AGE) {
       console.log(`✅ Returning cached balance for ${address}`);
       return res.json({ ...dbCache, source: "db-cache" });
     }
 
-    // 🌐 Fetch dari chain (Anchor)
+    // 🌐 Fetch dari Solana RPC
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const walletPubkey = new PublicKey(address);
 
-    const provider = new anchor.AnchorProvider(connection, {} as any, {
-      preflightCommitment: "confirmed",
-    });
-    const idl = require("../../public/idl/universe_of_gamers.json");
-    const programId = new PublicKey(process.env.PROGRAM_ID as string);
-    const program = new anchor.Program(idl, programId, provider);
-
     // === Ambil balance SOL ===
     const lamports = await connection.getBalance(walletPubkey);
-    const solBalance = lamports / LAMPORTS_PER_SOL;
+    const sol = lamports / LAMPORTS_PER_SOL;
+    console.log(`💰 [SOL] ${sol.toFixed(6)} SOL (${lamports} lamports)`);
 
-    // === Ambil harga SOL dari Coingecko ===
-    const coingeckoResp: any = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
-    ).then((r) => r.json());
-    const solPriceUsd = coingeckoResp?.solana?.usd || 0;
-    const usdValue = solBalance * solPriceUsd;
+    // === Ambil harga SOL↔USD dari CoinGecko ===
+    let solPriceUsd = 0;
+    try {
+      const cgResp = await fetch(
+        "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+      ).then((r) => r.json());
+      solPriceUsd = cgResp?.solana?.usd || 0;
+    } catch (err) {
+      console.warn("⚠️ CoinGecko fetch failed, fallback to $100");
+      solPriceUsd = 100;
+    }
+
+    const usdValue = sol * solPriceUsd;
+    console.log(`💹 1 SOL = $${solPriceUsd.toFixed(2)} → $${usdValue.toFixed(4)} total`);
 
     // === Ambil SPL Token Balance (UOG) ===
     let uogBalance = 0;
@@ -459,6 +461,7 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
           uogBalance = amount;
         }
       }
+      console.log(`🪙 UOG Token Balance: ${uogBalance}`);
     } catch (err) {
       console.warn("⚠️ Failed to fetch SPL tokens:", (err as any).message);
     }
@@ -467,15 +470,15 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
     const percentChange = 0;
     const trend = 0;
 
-    // === Simpan ke DB sebagai cache baru ===
+    // === Simpan ke DB (cache baru) ===
     const updated = await WalletBalance.findOneAndUpdate(
       { address },
       {
         address,
-        solBalance,
+        lamports,
+        sol,
         solPriceUsd,
         usdValue,
-        uogBalance,
         percentChange,
         trend,
         lastUpdated: new Date(),
@@ -484,9 +487,24 @@ router.get("/balance/:address", async (req: Request, res: Response) => {
     );
 
     console.log(`✅ Cached balance updated for ${address}`);
+    console.log(
+      `📊 Balance Summary: ${sol.toFixed(6)} SOL = $${usdValue.toFixed(
+        2
+      )} @ $${solPriceUsd.toFixed(2)} | UOG: ${uogBalance}`
+    );
 
+    // === Response lengkap ke frontend ===
     res.json({
-      ...updated.toObject(),
+      _id: updated._id,
+      address,
+      lamports,
+      sol,
+      solPriceUsd,
+      usdValue,
+      uogBalance,
+      percentChange,
+      trend,
+      lastUpdated: updated.lastUpdated,
       source: "onchain",
     });
   } catch (err: any) {
@@ -1900,161 +1918,161 @@ router.post("/swap/build", authenticateJWT, async (req: AuthRequest, res) => {
 //
 // POST /wallet/swap/submit
 //
-router.post("/swap/submit", async (req: Request, res: Response) => {
-  const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
+// router.post("/swap/submit", async (req: Request, res: Response) => {
+//   const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
 
-  try {
-    console.log(chalk.cyan("\n📩 [SWAP SUBMIT] Request received ========================"));
-    console.log(chalk.gray(JSON.stringify(req.body, null, 2)));
+//   try {
+//     console.log(chalk.cyan("\n📩 [SWAP SUBMIT] Request received ========================"));
+//     console.log(chalk.gray(JSON.stringify(req.body, null, 2)));
 
-    const { signedTx, inAmount, fromMint, toMint } = req.body;
-    if (!signedTx) return res.status(400).json({ error: "signedTx required" });
+//     const { signedTx, inAmount, fromMint, toMint } = req.body;
+//     if (!signedTx) return res.status(400).json({ error: "signedTx required" });
 
-    const fundLamports = parseInt(inAmount) + 5000;
-    console.log(`💰 Funding WSOL ATA with ${fundLamports / 1e9} SOL for ${fromMint} → ${toMint}`);
-    console.log(chalk.blue("🔗 Network:"), process.env.SOLANA_CLUSTER);
+//     const fundLamports = parseInt(inAmount) + 5000;
+//     console.log(`💰 Funding WSOL ATA with ${fundLamports / 1e9} SOL for ${fromMint} → ${toMint}`);
+//     console.log(chalk.blue("🔗 Network:"), process.env.SOLANA_CLUSTER);
 
-    const txBuffer = Buffer.from(signedTx, "base64");
-    console.log(chalk.gray("Tx buffer length:"), txBuffer.length, "bytes");
+//     const txBuffer = Buffer.from(signedTx, "base64");
+//     console.log(chalk.gray("Tx buffer length:"), txBuffer.length, "bytes");
 
-    // ============================================================
-    // 🧩 Decode Transaction — cari sender & recipient
-    // ============================================================
-    let isVersioned = false;
-    let senderAddress: string | null = null;
-    let recipientAddress: string | null = null;
+//     // ============================================================
+//     // 🧩 Decode Transaction — cari sender & recipient
+//     // ============================================================
+//     let isVersioned = false;
+//     let senderAddress: string | null = null;
+//     let recipientAddress: string | null = null;
 
-    try {
-      const vtx = VersionedTransaction.deserialize(txBuffer);
-      isVersioned = true;
-      console.log(chalk.yellow("🧩 Versioned TX Keys:"));
-      vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) =>
-        console.log(`  [${i}] ${key.toBase58()}`)
-      );
+//     try {
+//       const vtx = VersionedTransaction.deserialize(txBuffer);
+//       isVersioned = true;
+//       console.log(chalk.yellow("🧩 Versioned TX Keys:"));
+//       vtx.message.staticAccountKeys.forEach((key: PublicKey, i: number) =>
+//         console.log(`  [${i}] ${key.toBase58()}`)
+//       );
 
-      senderAddress = vtx.message.staticAccountKeys[0]?.toBase58?.() ?? null;
-      recipientAddress = vtx.message.staticAccountKeys[1]?.toBase58?.() ?? null;
-    } catch {
-      const tx = Transaction.from(txBuffer);
-      console.log(chalk.yellow("🧩 Legacy TX Keys:"));
-      (tx as any).message.accountKeys.forEach((key: PublicKey, i: number) =>
-        console.log(`  [${i}] ${key.toBase58()}`)
-      );
+//       senderAddress = vtx.message.staticAccountKeys[0]?.toBase58?.() ?? null;
+//       recipientAddress = vtx.message.staticAccountKeys[1]?.toBase58?.() ?? null;
+//     } catch {
+//       const tx = Transaction.from(txBuffer);
+//       console.log(chalk.yellow("🧩 Legacy TX Keys:"));
+//       (tx as any).message.accountKeys.forEach((key: PublicKey, i: number) =>
+//         console.log(`  [${i}] ${key.toBase58()}`)
+//       );
 
-      senderAddress = tx.feePayer?.toBase58?.() ?? tx.instructions?.[0]?.keys?.[0]?.pubkey?.toBase58?.() ?? null;
-      recipientAddress = tx.instructions?.[0]?.keys?.[1]?.pubkey?.toBase58?.() ?? null;
-    }
+//       senderAddress = tx.feePayer?.toBase58?.() ?? tx.instructions?.[0]?.keys?.[0]?.pubkey?.toBase58?.() ?? null;
+//       recipientAddress = tx.instructions?.[0]?.keys?.[1]?.pubkey?.toBase58?.() ?? null;
+//     }
 
-    console.log("🎯 Parsed sender:", senderAddress);
-    console.log("🎯 Parsed recipient:", recipientAddress);
+//     console.log("🎯 Parsed sender:", senderAddress);
+//     console.log("🎯 Parsed recipient:", recipientAddress);
 
-    // ============================================================
-    // 🩹 Sanity Check: Pastikan WSOL ATA aktif
-    // ============================================================
-    try {
-      const user = new PublicKey(senderAddress ?? "7GeP2NXT6DzX3Sw973G5mvFacG7AiyUe25XjvKDpQDGZ");
-      const WSOL_ATA = getAssociatedTokenAddressSync(
-        new PublicKey("So11111111111111111111111111111111111111112"),
-        user
-      );
+//     // ============================================================
+//     // 🩹 Sanity Check: Pastikan WSOL ATA aktif
+//     // ============================================================
+//     try {
+//       const user = new PublicKey(senderAddress ?? "7GeP2NXT6DzX3Sw973G5mvFacG7AiyUe25XjvKDpQDGZ");
+//       const WSOL_ATA = getAssociatedTokenAddressSync(
+//         new PublicKey("So11111111111111111111111111111111111111112"),
+//         user
+//       );
 
-      const info = await connection.getAccountInfo(WSOL_ATA);
-      if (!info) {
-        console.warn(chalk.red(`⚠️ WSOL ATA belum ditemukan (${WSOL_ATA.toBase58()})`));
+//       const info = await connection.getAccountInfo(WSOL_ATA);
+//       if (!info) {
+//         console.warn(chalk.red(`⚠️ WSOL ATA belum ditemukan (${WSOL_ATA.toBase58()})`));
 
-        const createIx = createAssociatedTokenAccountInstruction(
-          user,
-          WSOL_ATA,
-          user,
-          new PublicKey("So11111111111111111111111111111111111111112")
-        );
+//         const createIx = createAssociatedTokenAccountInstruction(
+//           user,
+//           WSOL_ATA,
+//           user,
+//           new PublicKey("So11111111111111111111111111111111111111112")
+//         );
 
-        const payer = Keypair.fromSecretKey(
-          Uint8Array.from(JSON.parse(fs.readFileSync("/home/msi/.config/solana/seftzzz.json", "utf8")))
-        );
+//         const payer = Keypair.fromSecretKey(
+//           Uint8Array.from(JSON.parse(fs.readFileSync("/home/msi/.config/solana/seftzzz.json", "utf8")))
+//         );
 
-        const tx = new Transaction().add(createIx);
-        const sigCreate = await sendAndConfirmTransaction(connection, tx, [payer]);
-        console.log(chalk.green(`✅ WSOL ATA recreated: ${WSOL_ATA.toBase58()} (${sigCreate})`));
+//         const tx = new Transaction().add(createIx);
+//         const sigCreate = await sendAndConfirmTransaction(connection, tx, [payer]);
+//         console.log(chalk.green(`✅ WSOL ATA recreated: ${WSOL_ATA.toBase58()} (${sigCreate})`));
 
-        await new Promise((r) => setTimeout(r, 2000)); // biar cluster sync
-      } else {
-        const parsed = await connection.getParsedAccountInfo(WSOL_ATA);
-        const balance = (parsed.value as any)?.data?.parsed?.info?.tokenAmount?.uiAmount;
-        console.log(chalk.green(`✅ WSOL ATA exists [balance=${balance}]`));
-      }
-    } catch (e) {
-      console.warn(chalk.red("⚠️ WSOL ATA check failed:"), (e as Error).message);
-    }
+//         await new Promise((r) => setTimeout(r, 2000)); // biar cluster sync
+//       } else {
+//         const parsed = await connection.getParsedAccountInfo(WSOL_ATA);
+//         const balance = (parsed.value as any)?.data?.parsed?.info?.tokenAmount?.uiAmount;
+//         console.log(chalk.green(`✅ WSOL ATA exists [balance=${balance}]`));
+//       }
+//     } catch (e) {
+//       console.warn(chalk.red("⚠️ WSOL ATA check failed:"), (e as Error).message);
+//     }
 
-    // ============================================================
-    // 🚀 Kirim transaksi
-    // ============================================================
-    let sig: string;
-    try {
-      if (isVersioned) {
-        console.log(chalk.green("🔄 Sending VersionedTransaction..."));
-        const vtx = VersionedTransaction.deserialize(txBuffer);
-        sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 5 });
-      } else {
-        console.log(chalk.green("🔄 Sending Legacy Transaction..."));
-        sig = await sendAndConfirmRawTransaction(connection, txBuffer, {
-          skipPreflight: false,
-          maxRetries: 5,
-        });
-      }
-    } catch (sendErr: any) {
-      console.error(chalk.red("❌ sendTransaction failed:"), sendErr.message);
-      throw sendErr;
-    }
+//     // ============================================================
+//     // 🚀 Kirim transaksi
+//     // ============================================================
+//     let sig: string;
+//     try {
+//       if (isVersioned) {
+//         console.log(chalk.green("🔄 Sending VersionedTransaction..."));
+//         const vtx = VersionedTransaction.deserialize(txBuffer);
+//         sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 5 });
+//       } else {
+//         console.log(chalk.green("🔄 Sending Legacy Transaction..."));
+//         sig = await sendAndConfirmRawTransaction(connection, txBuffer, {
+//           skipPreflight: false,
+//           maxRetries: 5,
+//         });
+//       }
+//     } catch (sendErr: any) {
+//       console.error(chalk.red("❌ sendTransaction failed:"), sendErr.message);
+//       throw sendErr;
+//     }
 
-    console.log(chalk.green("✅ TX sent to cluster, signature:"), sig);
-    console.log("🔍 Explorer:", `https://solscan.io/tx/${sig}?cluster=mainnet`);
+//     console.log(chalk.green("✅ TX sent to cluster, signature:"), sig);
+//     console.log("🔍 Explorer:", `https://solscan.io/tx/${sig}?cluster=mainnet`);
 
-    // ============================================================
-    // 🧾 Konfirmasi transaksi di jaringan
-    // ============================================================
-    for (let i = 0; i < 10; i++) {
-      const confirmation = await connection.confirmTransaction(sig, "confirmed");
-      if (confirmation.value.err == null) {
-        console.log(chalk.green("✅ Confirmed on-chain"));
-        break;
-      }
-      console.warn(chalk.yellow(`⚠️ Retry confirm [${i + 1}]...`));
-      await new Promise((r) => setTimeout(r, 4000));
-    }
+//     // ============================================================
+//     // 🧾 Konfirmasi transaksi di jaringan
+//     // ============================================================
+//     for (let i = 0; i < 10; i++) {
+//       const confirmation = await connection.confirmTransaction(sig, "confirmed");
+//       if (confirmation.value.err == null) {
+//         console.log(chalk.green("✅ Confirmed on-chain"));
+//         break;
+//       }
+//       console.warn(chalk.yellow(`⚠️ Retry confirm [${i + 1}]...`));
+//       await new Promise((r) => setTimeout(r, 4000));
+//     }
 
-    // ============================================================
-    // 🧹 Cache Sync setelah Confirmed
-    // ============================================================
-    if (senderAddress) await invalidateWalletCache(senderAddress);
-    if (recipientAddress) await invalidateWalletCache(recipientAddress);
+//     // ============================================================
+//     // 🧹 Cache Sync setelah Confirmed
+//     // ============================================================
+//     if (senderAddress) await invalidateWalletCache(senderAddress);
+//     if (recipientAddress) await invalidateWalletCache(recipientAddress);
 
-    if (senderAddress) await refreshWalletCache(senderAddress);
-    if (recipientAddress) await refreshWalletCache(recipientAddress);
+//     if (senderAddress) await refreshWalletCache(senderAddress);
+//     if (recipientAddress) await refreshWalletCache(recipientAddress);
 
-    if (senderAddress) walletEvents.emit("forceUpdate", senderAddress);
-    if (recipientAddress) walletEvents.emit("forceUpdate", recipientAddress);
+//     if (senderAddress) walletEvents.emit("forceUpdate", senderAddress);
+//     if (recipientAddress) walletEvents.emit("forceUpdate", recipientAddress);
 
-    console.log("✅ Cache updated and broadcasted for swap participants.");
+//     console.log("✅ Cache updated and broadcasted for swap participants.");
 
-    res.json({
-      signature: sig,
-      explorer: `https://solscan.io/tx/${sig}?cluster=mainnet`,
-    });
-  } catch (err: any) {
-    console.error(chalk.red("❌ swap/submit error:"), err.message);
-    if (err.logs) console.error(chalk.gray("On-chain logs:"), err.logs.join("\n"));
+//     res.json({
+//       signature: sig,
+//       explorer: `https://solscan.io/tx/${sig}?cluster=mainnet`,
+//     });
+//   } catch (err: any) {
+//     console.error(chalk.red("❌ swap/submit error:"), err.message);
+//     if (err.logs) console.error(chalk.gray("On-chain logs:"), err.logs.join("\n"));
 
-    if (err.message?.includes("custom program error: 0xbc4")) {
-      console.error(
-        chalk.redBright("💥 Detected AnchorError: AccountNotInitialized — CPMM gagal baca ATA WSOL sebelum sync.")
-      );
-    }
+//     if (err.message?.includes("custom program error: 0xbc4")) {
+//       console.error(
+//         chalk.redBright("💥 Detected AnchorError: AccountNotInitialized — CPMM gagal baca ATA WSOL sebelum sync.")
+//       );
+//     }
 
-    res.status(500).json({ error: err.message });
-  }
-});
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
 // GET /wallet/:address?mint=<mintAddress>
 router.get("/trades/:address", async (req, res) => {

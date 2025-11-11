@@ -20,6 +20,7 @@ import solRoutes from "./routes/sol";
 import characterRoutes from "./routes/character";
 import gatchaRoutes from "./routes/gatcha";
 import withdrawRoutes from "./routes/withdraw";
+import referralRoutes from "./routes/referral";
 
 import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
 
@@ -94,6 +95,7 @@ app.use("/api/wallet", walletRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/gatcha", gatchaRoutes);
 app.use("/api/withdraw", withdrawRoutes);
+app.use("/api/referral", referralRoutes);
 app.use("/api", battleRoutes);
 app.use("/api", solRoutes);
 app.use("/api", battleSimulateRouter);
@@ -592,7 +594,7 @@ export const broadcast = (data: any) => {
 
   server.listen(PORT, () => {
     console.log(`📡 Program ID:${process.env.PROGRAM_ID}`);
-    console.log(`   Backend version 7.11.2025.1950`);
+    console.log(`   Backend version 10.11.2025.1550`);
     console.log(`🚀 NFT Backend running on http://localhost:${PORT}`);
     console.log(`📡 WebSocket active on ws://localhost:${PORT}`);
     console.log("🌍 Allowed Origins:", allowedOrigins.join(", "));

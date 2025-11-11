@@ -49,6 +49,7 @@ const CustodialWalletSchema = new Schema<ICustodialWallet>(
  *  Main Auth Schema
  *  ============================= */
 export interface IAuth extends Document {
+  _id: mongoose.Types.ObjectId;
   name?: string;
   email?: string;
   password?: string;
@@ -64,7 +65,7 @@ export interface IAuth extends Document {
   otpSecret?: string; 
   createdAt: Date;
   role?: string;
-  usedReferralCode?: string;
+  usedReferralCode?: string | null;
   comparePassword(password: string): Promise<boolean>;
 }
 

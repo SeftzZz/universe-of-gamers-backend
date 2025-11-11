@@ -227,7 +227,7 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
     if (!pack) return res.status(404).json({ error: "Pack not found" });
 
     // Roll gatcha multi (0 NFT)
-    const rolls = await doMultiGatchaRolls(pack, custodian.address, 0);
+    const rolls = await doMultiGatchaRolls(pack, custodian.address, 1);
 
     const processedResults = [];
 

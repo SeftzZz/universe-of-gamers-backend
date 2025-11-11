@@ -159,9 +159,9 @@ async function logTxDetail(connection: Connection, sig: string, label: string) {
 // === Register Local + Custodial Wallet ===
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password, acceptedTerms } = req.body;
+    const { name, email, password, acceptedTerms, referralCode } = req.body;
 
-    console.log('🆕 [REGISTER] Incoming:', { name, email });
+    console.log('🆕 [REGISTER] Incoming:', { name, email, referralCode });
 
     // 🔎 Cek duplikasi email
     const existingUser = await Auth.findOne({ email });
@@ -182,6 +182,7 @@ router.post('/register', async (req, res) => {
       wallets: [], // belum ada wallet
       custodialWallets: [],
       avatar: avatarUrl,
+      usedReferralCode: referralCode || null,
     });
 
     await auth.save();
@@ -194,10 +195,7 @@ router.post('/register', async (req, res) => {
       const baseCode = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
 
       const existingReferral = await Referral.findOne({
-        $or: [
-          { referrerId: auth._id },
-          { code: baseCode }
-        ]
+        $or: [{ referrerId: auth._id }, { code: baseCode }],
       });
 
       if (!existingReferral) {
@@ -212,11 +210,41 @@ router.post('/register', async (req, res) => {
       }
     }
 
+    // =====================================================
+    // 🎟️ APPLY REFERRAL CODE (perbaikan variabel)
+    // =====================================================
+    if (referralCode && referralCode.trim() !== '') {
+      console.log(`🎟️ [REGISTER REFERRAL CODE] Attempting to apply referral code: ${referralCode}`);
+
+      const referral = await Referral.findOne({ code: referralCode, isActive: true });
+      if (!referral) {
+        console.warn(`❌ [REGISTER REFERRAL CODE] Invalid referral code: ${referralCode}`);
+        return res.status(404).json({ success: false, error: 'Invalid referral code' });
+      }
+
+      if (referral.referrerId.toString() === String(auth._id)) {
+        console.warn(`⚠️ [REGISTER REFERRAL CODE] User tried to use their own referral code.`);
+        return res.status(400).json({ success: false, error: 'You cannot use your own referral code' });
+      }
+
+      if (!auth.usedReferralCode) {
+        auth.usedReferralCode = referral._id.toString();
+        await auth.save();
+
+        referral.totalClaimable += 0;
+        await referral.save();
+        console.log(`✅ [REGISTER REFERRAL CODE] Referral successfully applied for ${auth.email}`);
+      } else {
+        console.log(`ℹ️ [REGISTER REFERRAL CODE] Referral already applied earlier.`);
+      }
+    }
+
     // =======================================================
     // 🎮 Inisialisasi Player record
     // =======================================================
-    let playerData = await Player.findOne({ username: name })
-      .select('rank totalEarning username lastActive');
+    let playerData = await Player.findOne({ username: name }).select(
+      'rank totalEarning username lastActive'
+    );
 
     if (!playerData) {
       playerData = new Player({
@@ -235,7 +263,7 @@ router.post('/register', async (req, res) => {
     for (let i = 1; i <= 8; i++) {
       defaultTeams.push({
         name: `TEAM#${i}`,
-        owner: auth._id, // pakai ID user
+        owner: auth._id,
         members: [],
         isActive: i === 1,
       });
@@ -252,38 +280,9 @@ router.post('/register', async (req, res) => {
     // =======================================================
     // 🎁 Ambil referral data untuk response
     // =======================================================
-    const referralData = await Referral.findOne({ referrerId: auth._id })
-      .select('code totalClaimable totalClaimed isActive createdAt');
-
-    // ============================================================
-    // ✅ Response Lengkap Login
-    // ============================================================
-    console.log("🟢 [LOGIN_RESPONSE] Sending response data:", {
-      authId: auth._id,
-      name: auth.name,
-      email: auth.email,
-      role: auth.role,
-      authProvider: auth.authProvider,
-      twoFactorEnabled: auth.twoFactorEnabled,
-      acceptedTerms: auth.acceptedTerms,
-      wallets: (auth.wallets || []).length,
-      custodialWallets: (auth.custodialWallets || []).map((w) => w.provider),
-      player: playerData
-        ? {
-            rank: playerData.rank,
-            totalEarning: playerData.totalEarning,
-            lastActive: playerData.lastActive,
-          }
-        : null,
-      referral: referralData
-        ? {
-            code: referralData.code,
-            totalClaimable: referralData.totalClaimable,
-            totalClaimed: referralData.totalClaimed,
-            isActive: referralData.isActive,
-          }
-        : null,
-    });
+    const referralData = await Referral.findOne({ referrerId: auth._id }).select(
+      'code totalClaimable totalClaimed isActive createdAt'
+    );
 
     // =======================================================
     // 📤 Response sukses
@@ -296,8 +295,8 @@ router.post('/register', async (req, res) => {
       email: auth.email,
       avatar: auth.avatar,
       role: auth.role || null,
-      wallets: auth.wallets, // kosong saat ini
-      custodialWallets: [],  // kosong juga
+      wallets: auth.wallets,
+      custodialWallets: [],
       player: {
         rank: playerData.rank,
         totalEarning: playerData.totalEarning,
@@ -312,17 +311,13 @@ router.post('/register', async (req, res) => {
             createdAt: referralData.createdAt,
           }
         : null,
-      // =======================================================
-      // 🔹 Tambahan data Auth langsung dari DB
-      // =======================================================
       authProvider: auth.authProvider || 'unknown',
       twoFactorEnabled: auth.twoFactorEnabled || false,
       acceptedTerms: auth.acceptedTerms || false,
       createdAt: auth.createdAt,
     });
-
   } catch (err: any) {
-    console.error("❌ Register error:", err.message);
+    console.error('❌ Register error:', err.message);
     res.status(400).json({ error: err.message });
   }
 });
@@ -381,13 +376,13 @@ router.post('/login', async (req, res) => {
 
     // Kalau belum ada Player record, buat default
     if (!playerData) {
-      playerData = new Player({
-        username: auth.name,
-        walletAddress: walletAddr || null,
-        rank: "sentinel",
-        totalEarning: 0,
-      });
-      await playerData.save();
+      // playerData = new Player({
+      //   username: auth.name,
+      //   walletAddress: walletAddr || null,
+      //   rank: "sentinel",
+      //   totalEarning: 0,
+      // });
+      // await playerData.save();
     }
 
     // ============================================================
@@ -452,7 +447,7 @@ router.post('/login', async (req, res) => {
             createdAt: referralData.createdAt,
           }
         : null,
-      authProvider: auth.authProvider || 'unknown',
+      authProvider: auth.authProvider,
       twoFactorEnabled: auth.twoFactorEnabled || false,
       acceptedTerms: auth.acceptedTerms || false,
       createdAt: auth.createdAt,
@@ -694,6 +689,7 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
 
     walletChallenges.delete(address);
 
+    // ✅ Verifikasi signature
     const message = `test-login`;
     const isValid = nacl.sign.detached.verify(
       new TextEncoder().encode(message),
@@ -702,10 +698,32 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
     );
     console.log('✅ Signature valid?', isValid);
 
-    if (!isValid) return res.status(401).json({ error: 'Invalid signature' });
+    if (!isValid) {
+      console.warn('❌ Invalid signature for address:', address);
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
 
     // =====================================================
-    // 🧩 Step 1. Cari user berdasarkan JWT (kalau ada)
+    // 🚫 Validasi wallet duplikat (tidak boleh dipakai user lain)
+    // =====================================================
+    const existingWalletUser = await Auth.findOne({
+      $or: [
+        { 'wallets.address': address },
+        { 'custodialWallets.address': address },
+      ],
+      _id: { $ne: req.user?.id || null },
+    });
+
+    if (existingWalletUser) {
+      console.warn(`⚠️ Wallet ${address} already linked to another account: ${existingWalletUser._id}`);
+      return res.status(400).json({
+        success: false,
+        error: 'This wallet address is already linked to another account.',
+      });
+    }
+
+    // =====================================================
+    // 🧩 Step 1. Cek JWT user (kalau ada)
     // =====================================================
     let auth = null;
     console.log('👤 [JWT User Check] req.user =', req.user);
@@ -737,8 +755,8 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
       auth = await Auth.findOne({
         $or: [
           { 'wallets.address': address },
-          { 'custodialWallets.address': address }
-        ]
+          { 'custodialWallets.address': address },
+        ],
       });
 
       if (auth) {
@@ -758,25 +776,24 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
     }
 
     // =====================================================
-    // 👑 Super admin
+    // 👑 Super admin (auto elevate)
     // =====================================================
     const SUPER_ADMIN_EMAIL = 'yerblues6@gmail.com';
-    let isSuperAdmin = false;
     if (auth.email === SUPER_ADMIN_EMAIL) {
-      isSuperAdmin = true;
       auth.role = auth.role || 'admin';
       await auth.save();
       console.log(`👑 Super admin privileges applied to ${auth.email}`);
     }
 
     // =====================================================
-    // 🎟️ Referral Code (auto-create jika punya email)
+    // 🎟️ Referral auto-create
     // =====================================================
     if (auth.email && auth.email.includes('@')) {
       const baseCode = auth.email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
       const existingReferral = await Referral.findOne({
         $or: [{ referrerId: auth._id }, { code: baseCode }],
       });
+
       if (!existingReferral) {
         await new Referral({ referrerId: auth._id, code: baseCode }).save();
         console.log(`🎟️ Referral code created: ${baseCode}`);
@@ -791,47 +808,61 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
     // 🎮 Player record (buat jika belum ada)
     // =====================================================
     console.log(`🎮 Checking Player record for wallet ${address}`);
+
     let playerData = await Player.findOne({ walletAddress: address })
       .select('rank totalEarning username lastActive');
 
     if (!playerData) {
+      console.log('🆕 No Player found — creating new one...');
+      let baseUsername = auth.name || name || `User-${address.slice(0, 6)}`;
+      let username = baseUsername;
+      let counter = 1;
+
+      while (await Player.findOne({ username })) {
+        username = `${baseUsername}-${Math.floor(Math.random() * 1000)}`;
+        counter++;
+        if (counter > 5) break;
+      }
+
       playerData = new Player({
-        username: auth.name || name,
+        username,
         walletAddress: address,
         rank: 'sentinel',
         totalEarning: 0,
+        lastActive: new Date(),
       });
+
       await playerData.save();
-      console.log('🎮 New Player record created for wallet user');
+      console.log(`✅ New Player record created: ${username}`);
     } else {
-      console.log(`ℹ️ Existing Player found for wallet ${address}`);
+      console.log(`ℹ️ Existing Player found: ${playerData.username} (${playerData.rank})`);
+      playerData.lastActive = new Date();
+      await playerData.save();
+      console.log(`🕓 Player lastActive updated for ${address}`);
     }
 
-    playerData.lastActive = new Date();
-    await playerData.save();
-
     // =====================================================
-    // 🧱 Default teams
+    // 🧱 Default teams (init 8 tim)
     // =====================================================
-    const walletAddress =
+    const walletAddr =
       auth.wallets?.[0]?.address ||
       auth.custodialWallets?.[0]?.address ||
       address;
 
-    const existingTeams = await Team.find({ owner: walletAddress });
+    const existingTeams = await Team.find({ owner: walletAddr });
     if (existingTeams.length === 0) {
       console.log('🧱 Initializing default teams...');
       const defaultTeams = [];
       for (let i = 1; i <= 8; i++) {
         defaultTeams.push({
           name: `TEAM#${i}`,
-          owner: walletAddress,
+          owner: walletAddr,
           members: [],
           isActive: i === 1,
         });
       }
       await Team.insertMany(defaultTeams);
-      console.log('✅ Default teams initialized for wallet user:', walletAddress);
+      console.log('✅ Default teams initialized for wallet user:', walletAddr);
     } else {
       console.log(`ℹ️ User already has ${existingTeams.length} teams`);
     }
@@ -855,7 +886,8 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
     // 📤 Response
     // =====================================================
     res.json({
-      message: isSuperAdmin ? 'Login successful (admin)' : 'Login successful',
+      message: 'Login successful',
+      success: true,
       authId: auth._id,
       token,
       name: auth.name,
@@ -1277,10 +1309,50 @@ router.post('/user/:id/avatar', upload.single('avatar'), async (req, res) => {
 router.put('/user/:id/profile', async (req, res) => {
   try {
     const { name, email } = req.body;
-    const user = await Auth.findByIdAndUpdate(req.params.id, { name, email }, { new: true });
+    console.log('📝 [UpdateProfile] Incoming payload:', { name, email });
+
+    // =====================================================
+    // 🔍 Validasi input
+    // =====================================================
+    if (!name && !email) {
+      console.warn('⚠️ [UpdateProfile] Missing name and email.');
+      return res.status(400).json({
+        success: false,
+        error: 'At least one field (name or email) must be provided.',
+      });
+    }
+
+    if (email) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(email)) {
+        console.warn('⚠️ [UpdateProfile] Invalid email format:', email);
+        return res.status(400).json({
+          success: false,
+          error: "Invalid email format. Please include '@' and domain name.",
+        });
+      }
+    }
+
+    // =====================================================
+    // 🧩 Update user
+    // =====================================================
+    const user = await Auth.findByIdAndUpdate(
+      req.params.id,
+      { ...(name && { name }), ...(email && { email }) },
+      { new: true, runValidators: true } // 💡 runValidators penting biar schema Mongoose tetap jalan
+    );
+
+    if (!user) {
+      console.warn('⚠️ [UpdateProfile] User not found:', req.params.id);
+      return res.status(404).json({ success: false, error: 'User not found.' });
+    }
+
+    console.log('✅ [UpdateProfile] Profile updated for:', user.email || user._id);
+
     res.json({ success: true, user });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    console.error('❌ [UpdateProfile] Error:', err.message);
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
@@ -2245,49 +2317,164 @@ router.get("/custodial/:address", async (req: Request, res: Response) => {
 
 // 🔹 Apply referral + update profile
 router.post("/referral/apply-and-update", authenticateJWT, async (req: AuthRequest, res) => {
+  const traceId = Math.random().toString(36).substring(2, 10).toUpperCase();
+  console.log(`\n🧭 [TRACE ${traceId}] ───────────────────────────────────────────`);
+  console.log(`📥 Incoming /referral/apply-and-update request`);
+
   try {
-    // =====================================================
-    // 🧩 Authorization & Input
-    // =====================================================
     if (!req.user) {
+      console.warn(`⚠️ [${traceId}] Unauthorized access attempt.`);
       return res.status(401).json({ success: false, error: "Unauthorized" });
     }
 
-    const { email, password, code } = req.body;
+    const { email, password, code, walletAddress } = req.body;
     const userId = req.user.id;
 
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: "Email and password are required" });
-    }
+    console.log(`👤 [${traceId}] Authenticated user: ${userId}`);
+    console.log(`📩 Payload received:`, { email, password: password ? "••••" : null, code, walletAddress });
 
-    // =====================================================
-    // 🔍 Find user
-    // =====================================================
     const auth = await Auth.findById(userId);
     if (!auth) {
+      console.warn(`❌ [${traceId}] User not found in Auth collection.`);
       return res.status(404).json({ success: false, error: "User not found" });
     }
 
-    // =====================================================
-    // 💾 Update email & password
-    // =====================================================
-    auth.email = email;
-    auth.password = await bcrypt.hash(password, 10);
-    await auth.save();
+    console.log(`🧩 [${traceId}] Current Auth Info:`, {
+      authProvider: auth.authProvider,
+      email: auth.email || null,
+      wallets: auth.wallets?.length || 0,
+      custodialWallets: auth.custodialWallets?.length || 0,
+      hasReferral: !!auth.usedReferralCode,
+    });
 
-    console.log(`📧 [Profile Update] ${auth._id} -> ${email}`);
+    // =====================================================
+    // 🧩 VALIDASI WALLET DUPLIKAT
+    // =====================================================
+    if (auth.wallets && auth.wallets.length > 0) {
+      const walletAddresses = auth.wallets.map((w) => w.address);
+      console.log(`🔍 [${traceId}] Checking wallet duplicates:`, walletAddresses);
+
+      const duplicateUser = await Auth.findOne({
+        _id: { $ne: auth._id },
+        $or: [
+          { "wallets.address": { $in: walletAddresses } },
+          { "custodialWallets.address": { $in: walletAddresses } },
+        ],
+      });
+
+      if (duplicateUser) {
+        console.warn(`⚠️ [${traceId}] Wallet already linked to another user: ${duplicateUser._id}`);
+        return res.status(400).json({
+          success: false,
+          error: "This wallet address is already linked to another account.",
+        });
+      }
+    }
+
+    let updated = false;
 
     // =====================================================
-    // 🧩 Auto-Create Referral Code (jika user punya email)
+    // 🧩 CASE 1: WALLET LOGIN
+    // =====================================================
+    if (auth.authProvider === "wallet") {
+      console.log(`🪪 [${traceId}] Wallet-Mode: Checking email & password update...`);
+
+      // EMAIL VALIDATION
+      if (!auth.email && email) {
+        console.log(`📨 [${traceId}] Incoming email: ${email}`);
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          console.warn(`⚠️ [${traceId}] Invalid email format detected.`);
+          return res.status(400).json({
+            success: false,
+            error: "Invalid email format. Please include '@' and domain name.",
+          });
+        }
+        auth.email = email.trim();
+        updated = true;
+        console.log(`✅ [${traceId}] Wallet user email set: ${email}`);
+      } else if (auth.email) {
+        console.log(`ℹ️ [${traceId}] Email already exists: ${auth.email}`);
+      } else {
+        console.log(`⚠️ [${traceId}] No email provided in request body.`);
+      }
+
+      // PASSWORD VALIDATION
+      if (!auth.password && password) {
+        console.log(`🔐 [${traceId}] Incoming password detected, validating length...`);
+        if (password.length < 8) {
+          console.warn(`⚠️ [${traceId}] Password too short (${password.length} chars).`);
+          return res.status(400).json({
+            success: false,
+            error: "Password must be at least 8 characters long.",
+          });
+        }
+        auth.password = password;
+        updated = true;
+        console.log(`✅ [${traceId}] Wallet user password set.`);
+      } else if (auth.password) {
+        console.log(`ℹ️ [${traceId}] Password already exists — skip.`);
+      } else {
+        console.log(`⚠️ [${traceId}] No password provided in request body.`);
+      }
+    }
+
+    // =====================================================
+    // 🧩 CASE 2: GOOGLE LOGIN
+    // =====================================================
+    if (auth.authProvider === "google") {
+      console.log(`🧠 [${traceId}] Google-Mode: Checking password update...`);
+
+      if (password) {
+        if (password.length < 8) {
+          console.warn(`⚠️ [${traceId}] Google user password too short.`);
+          return res.status(400).json({
+            success: false,
+            error: "Password must be at least 8 characters long.",
+          });
+        }
+
+        // 🟢 Paksa update meski sudah ada password
+        auth.password = password;
+        auth.markModified("password"); // 🔥 <--- penting, paksa Mongoose trigger hook
+        auth.authProvider = "local";
+        updated = true;
+
+        await auth.save();
+        console.log(`✅ [${traceId}] Google user converted to local login.`);
+      } else {
+        console.log(`⚠️ [${traceId}] No password provided for Google user.`);
+      }
+    }
+
+    // =====================================================
+    // 🧩 CASE 3: LOCAL LOGIN
+    // =====================================================
+    if (auth.authProvider === "local") {
+      console.log(`ℹ️ [${traceId}] Local-Mode: skipping email/password update.`);
+    }
+
+    if (updated) {
+      console.log(`💾 [${traceId}] Final check before save:`, {
+        email: auth.email,
+        provider: auth.authProvider,
+        hasPassword: !!auth.password
+      });
+      await auth.save();
+      console.log(`💾 [${traceId}] Profile saved successfully for user ${auth._id}`);
+    } else {
+      console.log(`ℹ️ [${traceId}] No profile update needed.`);
+    }
+
+    // =====================================================
+    // 🎟️ AUTO-CREATE REFERRAL CODE
     // =====================================================
     if (auth.email && auth.email.includes("@")) {
       const baseCode = auth.email.split("@")[0].replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+      console.log(`🎟️ [${traceId}] Checking referral existence for baseCode: ${baseCode}`);
 
       const existingReferral = await Referral.findOne({
-        $or: [
-          { referrerId: auth._id },
-          { code: baseCode },
-        ],
+        $or: [{ referrerId: auth._id }, { code: baseCode }],
       });
 
       if (!existingReferral) {
@@ -2299,62 +2486,46 @@ router.post("/referral/apply-and-update", authenticateJWT, async (req: AuthReque
           totalClaimed: 0,
         });
         await newReferral.save();
-        console.log(`🎟️ Referral code created: ${baseCode}`);
+        console.log(`🎟️ [${traceId}] Referral created: ${baseCode}`);
       } else {
-        console.log(`ℹ️ Referral code already exists for user: ${baseCode}`);
+        console.log(`ℹ️ [${traceId}] Referral already exists for user.`);
       }
     } else {
-      console.log("⚠️ User has no email yet, skip referral creation.");
+      console.log(`⚠️ [${traceId}] Cannot create referral — no valid email found.`);
     }
 
     // =====================================================
-    // 🎟️ Apply referral (optional)
+    // 🎟️ APPLY REFERRAL CODE
     // =====================================================
-    let referralApplied = null;
     if (code && code.trim() !== "") {
-      console.log(`🎟️ [Referral Apply] User ${userId} applying code: ${code}`);
+      console.log(`🎟️ [${traceId}] Attempting to apply referral code: ${code}`);
 
       const referral = await Referral.findOne({ code, isActive: true });
       if (!referral) {
-        return res.status(404).json({ success: false, error: "Invalid or inactive referral code" });
-      }
-
-      if (auth.usedReferralCode) {
-        return res.status(400).json({ success: false, error: "Referral already used" });
+        console.warn(`❌ [${traceId}] Invalid referral code: ${code}`);
+        return res.status(404).json({ success: false, error: "Invalid referral code" });
       }
 
       if (referral.referrerId.toString() === userId.toString()) {
+        console.warn(`⚠️ [${traceId}] User tried to use their own referral code.`);
         return res.status(400).json({ success: false, error: "You cannot use your own referral code" });
       }
 
-      // Apply reward logic
-      auth.usedReferralCode = referral._id.toString();
-      await auth.save();
+      if (!auth.usedReferralCode) {
+        auth.usedReferralCode = referral._id.toString();
+        await auth.save();
 
-      referral.totalClaimable += 0; // 🎁 example reward
-      await referral.save();
-
-      referralApplied = {
-        code,
-        reward: 0,
-        referrerId: referral.referrerId,
-      };
-
-      // 🧾 Log audit
-      await AuditLog.create({
-        userId: auth._id,
-        action: "REFERRAL_APPLY",
-        ip: req.ip,
-        userAgent: req.headers["user-agent"],
-        details: referralApplied,
-      });
-
-      console.log(`✅ Referral applied successfully for user ${userId}`);
+        referral.totalClaimable += 0;
+        await referral.save();
+        console.log(`✅ [${traceId}] Referral successfully applied for ${auth.email}`);
+      } else {
+        console.log(`ℹ️ [${traceId}] Referral already applied earlier.`);
+      }
     }
 
-    // =======================================================
-    // 🎮 Player data (buat jika belum ada)
-    // =======================================================
+    // =====================================================
+    // 🎮 CREATE PLAYER RECORD
+    // =====================================================
     let playerData = await Player.findOne({ walletAddress: auth.wallets?.[0]?.address })
       .select("rank totalEarning lastActive");
 
@@ -2366,47 +2537,34 @@ router.post("/referral/apply-and-update", authenticateJWT, async (req: AuthReque
         totalEarning: 0,
       });
       await playerData.save();
-      console.log("🎮 Player record created for updated user");
+      console.log(`🎮 [${traceId}] New player record created.`);
+    } else {
+      console.log(`ℹ️ [${traceId}] Player record found.`);
     }
 
-    // 🕒 Update last active
     playerData.lastActive = new Date();
     await playerData.save();
+    console.log(`💾 [${traceId}] Player data updated.`);
 
-    // =======================================================
-    // 🎁 Referral data (ambil dari model Referral)
-    // =======================================================
+    // =====================================================
+    // 🎁 GET REFERRAL INFO
+    // =====================================================
     const referralData = await Referral.findOne({ referrerId: auth._id })
       .select("code totalClaimable totalClaimed isActive createdAt");
-
-    // =======================================================
-    // 🔑 Generate JWT Token
-    // =======================================================
     const token = generateToken(auth);
 
-    // =======================================================
-    // 📤 Full Response (Sama Format Seperti Wallet Login)
-    // =======================================================
+    console.log(`📤 [${traceId}] Preparing response payload...`);
     res.json({
       message: "Profile updated successfully",
+      success: true,
       authId: auth._id,
       token,
       name: auth.name,
       email: auth.email,
       avatar: auth.avatar,
-      role: auth.role || null,
+      authProvider: auth.authProvider,
       wallets: auth.wallets || [],
-      custodialWallets: (auth.custodialWallets || []).map((w: any) => ({
-        provider: w.provider,
-        address: w.address,
-      })),
-      player: playerData
-        ? {
-            rank: playerData.rank,
-            totalEarning: playerData.totalEarning,
-            lastActive: playerData.lastActive,
-          }
-        : null,
+      custodialWallets: auth.custodialWallets || [],
       referral: referralData
         ? {
             code: referralData.code,
@@ -2416,15 +2574,24 @@ router.post("/referral/apply-and-update", authenticateJWT, async (req: AuthReque
             createdAt: referralData.createdAt,
           }
         : null,
-      authProvider: auth.authProvider || "wallet",
-      twoFactorEnabled: auth.twoFactorEnabled || false,
-      acceptedTerms: auth.acceptedTerms || true,
+      usedReferralCode: auth.usedReferralCode,
+      player: playerData
+        ? {
+            rank: playerData.rank,
+            totalEarning: playerData.totalEarning,
+            lastActive: playerData.lastActive,
+          }
+        : null,
+      acceptedTerms: auth.acceptedTerms,
       createdAt: auth.createdAt,
-      success: true,
     });
+
+    console.log(`✅ [${traceId}] Request completed successfully.`);
   } catch (err: any) {
-    console.error("❌ apply-and-update error:", err);
-    res.status(500).json({ error: "Internal server error", details: err.message });
+    console.error(`💥 [${traceId}] apply-and-update error:`, err);
+    res.status(500).json({ success: false, error: "Internal server error", details: err.message });
+  } finally {
+    console.log(`🧾 [TRACE ${traceId}] END ───────────────────────────────────────────\n`);
   }
 });
 

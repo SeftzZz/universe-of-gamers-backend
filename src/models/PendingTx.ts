@@ -9,7 +9,8 @@ export interface IPendingTx extends mongoose.Document {
   txBase64: string;
   signedTx?: string;
   signature?: string;
-  status: "pending" | "signed" | "confirmed" | "failed";
+  signedTxAdmin?: string;
+  status: "admin_stage" | "pending" | "signed" | "confirmed" | "failed";
   createdAt: Date;
   signedAt?: Date;
   updatedAt?: Date;
@@ -32,12 +33,13 @@ const PendingTxSchema = new mongoose.Schema({
   // 🔹 Transaksi
   txBase64: { type: String, required: true }, // unsigned transaction
   signedTx: { type: String },                 // hasil tanda tangan base64
-  signature: { type: String },                // signature blockchain setelah submit
+  signature: { type: String },
+  signedTxAdmin: { type: String, default: null },                // signature blockchain setelah submit
 
   // 🔹 Status
   status: {
     type: String,
-    enum: ["pending", "signed", "confirmed", "failed"],
+    enum: ["admin_stage", "pending", "signed", "confirmed", "failed"],
     default: "pending"
   },
 

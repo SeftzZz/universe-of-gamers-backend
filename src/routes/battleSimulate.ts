@@ -48,25 +48,23 @@ async function getRankModifier(rank: string): Promise<number> {
 // ============================================================
 // 💰 Economic Fragment Calculator (with Character Rarity)
 // ============================================================
-export async function calculateEconomicFragment(
+async function calculateEconomicFragment(
   teamId: Types.ObjectId | string
 ): Promise<number> {
   console.log("──────────────────────────────────────────────");
   console.log("💰 [calculateEconomicFragment] Starting calculation...");
   console.log(`🧩 Team ID: ${teamId}`);
 
-  // 🧠 Populate members + their character
-  const team = await Team.findById(teamId)
-    .populate({
-      path: "members",
-      populate: {
-        path: "character",
-        model: "Character",
-        select: "name rarity baseHp baseAtk baseDef baseSpd",
-      },
-    });
+  const team = await Team.findById(teamId).populate({
+    path: "members",
+    populate: {
+      path: "character",
+      model: "Character",
+      select: "name rarity baseHp baseAtk baseDef baseSpd",
+    },
+  });
 
-  if (!team || !team.members || team.members.length === 0) {
+  if (!team || !team.members?.length) {
     console.warn(`⚠️ Team not found or has no members: ${teamId}`);
     console.log("──────────────────────────────────────────────");
     return 0;
@@ -86,7 +84,7 @@ export async function calculateEconomicFragment(
 
     console.log(`   🦸 Hero: ${h.name || "(Unnamed Hero)"}`);
     console.log(`      ➜ Character: ${char?.name || "Unknown Character"}`);
-    console.log(`      ➜ Rarity (from Character): ${rarity}`);
+    console.log(`      ➜ Rarity: ${rarity}`);
     console.log(`      ➜ Level: ${level}`);
 
     const config = await HeroConfig.findOne({ rarity });
@@ -111,10 +109,10 @@ export async function calculateEconomicFragment(
   console.log(`📈 Total Normalized: ${totalNormalized.toFixed(6)}`);
 
   const rarityCfg = await HeroConfig.findOne({ rarity: lowestRarity });
-  const teamModifier = rarityCfg ? rarityCfg.teamModifier : 0.15;
-  console.log(`🧩 Lowest Rarity: ${lowestRarity} | Team Modifier: ${teamModifier}`);
+  const teamModifier = rarityCfg?.teamModifier ?? 0;
+  console.log(`🧩 Lowest Rarity: ${lowestRarity} | Team Modifier: ${teamModifier.toFixed(3)}`);
 
-  const result = totalNormalized * (1 - teamModifier) + teamModifier * 100;
+  const result = Math.min(100, Math.max(0, ((totalNormalized * (1 - teamModifier)) + teamModifier) * 100));
   console.log(`✅ Economic Fragment Result: ${result.toFixed(6)}`);
   console.log("──────────────────────────────────────────────");
 
