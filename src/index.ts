@@ -594,7 +594,7 @@ export const broadcast = (data: any) => {
 
   server.listen(PORT, () => {
     console.log(`📡 Program ID:${process.env.PROGRAM_ID}`);
-    console.log(`   Backend version 10.11.2025.1550`);
+    console.log(`   Backend version 13.11.2025.0520`);
     console.log(`🚀 NFT Backend running on http://localhost:${PORT}`);
     console.log(`📡 WebSocket active on ws://localhost:${PORT}`);
     console.log("🌍 Allowed Origins:", allowedOrigins.join(", "));

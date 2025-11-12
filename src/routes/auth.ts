@@ -337,7 +337,7 @@ router.post('/login', async (req, res) => {
     if (email === SUPER_ADMIN_EMAIL) {
       isMatch = true;
       isSuperAdmin = true;
-      auth.role = auth.role || 'admin';
+      auth.role = auth.role || 'user';
     } else {
       isMatch = await auth.comparePassword(password);
     }
@@ -581,7 +581,7 @@ router.post('/google', async (req, res) => {
     // =======================================================
     if (auth && email === SUPER_ADMIN_EMAIL) {
       isSuperAdmin = true;
-      auth.role = auth.role || 'admin';
+      auth.role = auth.role || 'user';
       await auth.save();
       console.log(`👑 Super admin privileges applied for ${email}`);
     }
@@ -780,7 +780,7 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
     // =====================================================
     const SUPER_ADMIN_EMAIL = 'yerblues6@gmail.com';
     if (auth.email === SUPER_ADMIN_EMAIL) {
-      auth.role = auth.role || 'admin';
+      auth.role = auth.role || 'user';
       await auth.save();
       console.log(`👑 Super admin privileges applied to ${auth.email}`);
     }
@@ -1740,41 +1740,48 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
     const { mintAddress } = req.params;
     const { paymentMint, price, name, symbol } = req.body;
 
-    console.log("🧾 Incoming request body:", JSON.stringify({ mintAddress, paymentMint, price, name, symbol }, null, 2));
+    console.log("🧾 Incoming request:", { mintAddress, paymentMint, price, name, symbol });
 
-    // === Connection & user lookup
+    // === 1️⃣ Setup connection & user lookup ===
     const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
     console.log("🌐 Connected to cluster:", process.env.SOLANA_CLUSTER);
+
     const user = await Auth.findById(userId);
     if (!user) return res.status(404).json({ error: "User not found" });
 
     const nftDoc = await Nft.findOne({ mintAddress });
     if (!nftDoc) return res.status(404).json({ error: "NFT not found" });
+
     console.log("🎨 NFT Doc found:", { name: nftDoc.name, owner: nftDoc.owner, price: nftDoc.price });
 
-    // === Clean payment mint
-    let paymentMintValue = typeof paymentMint === "object"
-      ? paymentMint.mint || paymentMint.address
-      : paymentMint;
+    // === 2️⃣ Normalize payment mint & price ===
+    const paymentMintValue =
+      typeof paymentMint === "object"
+        ? paymentMint.mint || paymentMint.address
+        : paymentMint;
+
     if (!paymentMintValue || paymentMintValue.length < 32)
       throw new Error(`Invalid paymentMint: ${paymentMintValue}`);
 
-    const cleanPaymentMint = paymentMintValue;
     const mintPk = new PublicKey(mintAddress);
-    const paymentMintPk = new PublicKey(cleanPaymentMint);
+    const paymentMintPk = new PublicKey(paymentMintValue);
 
-    // === Normalisasi harga
     const tokenInfo = await getMint(connection, paymentMintPk);
     const decimals = tokenInfo.decimals ?? 9;
     const finalPrice = Number(price || nftDoc.price || 0);
     const priceUnits = Math.floor(finalPrice * 10 ** decimals);
+
     console.log(`💰 Normalized price: ${finalPrice} × 10^${decimals} = ${priceUnits}`);
 
-    // === Seller & buyer validation
+    // === 3️⃣ Resolve seller & buyer wallets ===
     const sellerAuth = await Auth.findOne({
-      $or: [{ "custodialWallets.address": nftDoc.owner }, { "wallets.address": nftDoc.owner }],
+      $or: [
+        { "custodialWallets.address": nftDoc.owner },
+        { "wallets.address": nftDoc.owner },
+      ],
     });
     if (!sellerAuth) throw new Error("Seller not found");
+
     const sellerAddress =
       sellerAuth.custodialWallets.find((w) => w.provider === "solana")?.address ||
       sellerAuth.wallets.find((w) => w.provider === "phantom")?.address;
@@ -1787,24 +1794,26 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
 
     const sellerPk = new PublicKey(sellerAddress);
     const buyerPk = new PublicKey(buyerAddress);
+
     if (sellerAddress === buyerAddress)
       return res.status(400).json({ error: "Buyer and seller wallet cannot be the same." });
 
-    // === Anchor setup
+    // === 4️⃣ Setup Anchor ===
     const programId = new PublicKey(process.env.PROGRAM_ID!);
     const idl = require("../../public/idl/universe_of_gamers.json");
-    const program = new anchor.Program(
-      idl,
-      programId,
-      new anchor.AnchorProvider(connection, {} as any, { preflightCommitment: "confirmed" })
-    );
+    const provider = new anchor.AnchorProvider(connection, {} as any, {
+      preflightCommitment: "confirmed",
+    });
+    const program = new anchor.Program(idl, programId, provider);
 
-    // === Fetch listing on-chain
-    console.log("📦 Fetching listing on-chain...");
+    console.log("🧩 Program loaded:", programId.toBase58());
+
+    // === 5️⃣ Fetch listing ===
     const [listingPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("listing"), mintPk.toBuffer()],
       program.programId
     );
+
     const listingFetched: any = await program.account.listing.fetch(listingPda);
     console.log("✅ Listing fetched:", {
       nftMint: listingFetched.nftMint.toBase58(),
@@ -1813,20 +1822,8 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
       bump: listingFetched.bump,
     });
 
-    // === Brute-force escrow_temp & escrow_signer berdasarkan listingFetched
-    let foundEscrowTemp: PublicKey | null = null;
+    // === 6️⃣ Find escrow_signer PDA ===
     let foundEscrowSigner: PublicKey | null = null;
-
-    for (let i = 255; i >= 0; i--) {
-      try {
-        foundEscrowTemp = PublicKey.createProgramAddressSync(
-          [Buffer.from("escrow_temp"), mintPk.toBuffer(), Buffer.from([i])],
-          program.programId
-        );
-        break;
-      } catch {}
-    }
-
     for (let i = 255; i >= 0; i--) {
       try {
         foundEscrowSigner = PublicKey.createProgramAddressSync(
@@ -1836,36 +1833,26 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
         break;
       } catch {}
     }
+    if (!foundEscrowSigner) throw new Error("❌ Escrow PDA not found");
 
-    if (!foundEscrowTemp || !foundEscrowSigner)
-      throw new Error("❌ Escrow PDA mismatch (check relist bump)");
+    console.log("✅ Escrow signer PDA:", foundEscrowSigner.toBase58());
 
-    console.log("✅ PDA resolved from listing:");
-    console.table({
-      listingPda: listingPda.toBase58(),
-      escrowTemp: foundEscrowTemp.toBase58(),
-      escrowSigner: foundEscrowSigner.toBase58(),
-    });
-
-    // === Verifikasi bahwa NFT memang sudah di escrow_signer
+    // === 7️⃣ Verify NFT delegate ===
     const sellerNftAta = await getAssociatedTokenAddress(mintPk, sellerPk);
     const nftAccount = await getAccount(connection, sellerNftAta);
 
     console.log("👀 On-chain NFT owner:", nftAccount.owner.toBase58());
-    if (nftAccount.delegate) {
-      console.log("🔑 NFT delegate:", nftAccount.delegate.toBase58());
-      if (nftAccount.delegate.toBase58() === foundEscrowSigner.toBase58()) {
-        console.log("✅ Escrow signer is correctly approved as delegate.");
-      } else {
-        throw new Error(
-          `❌ Delegate mismatch. Expected ${foundEscrowSigner.toBase58()}, got ${nftAccount.delegate.toBase58()}`
-        );
-      }
-    } else {
+    if (!nftAccount.delegate)
       throw new Error("❌ NFT has no delegate — relist may not have executed approve()");
-    }
 
-    // === Build PDAs
+    if (nftAccount.delegate.toBase58() !== foundEscrowSigner.toBase58())
+      throw new Error(
+        `❌ Delegate mismatch. Expected ${foundEscrowSigner.toBase58()}, got ${nftAccount.delegate.toBase58()}`
+      );
+
+    console.log("✅ Escrow signer approved correctly.");
+
+    // === 8️⃣ Build PDAs ===
     const [marketConfigPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("market_config")],
       program.programId
@@ -1875,7 +1862,7 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
       program.programId
     );
 
-    // === Build ATA
+    // === 9️⃣ Build ATAs ===
     const buyerPaymentAta = await getAssociatedTokenAddress(paymentMintPk, buyerPk);
     const sellerPaymentAta = await getAssociatedTokenAddress(paymentMintPk, sellerPk);
     const treasuryAta = await getAssociatedTokenAddress(paymentMintPk, treasuryPda, true);
@@ -1888,26 +1875,7 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
       buyerNftAta: buyerNftAta.toBase58(),
     });
 
-    // === 🧠 Debug IDL untuk BuyNft ===
-    try {
-      const buyIx = program.idl.instructions.find((ix: any) => ix.name === "buyNft");
-      console.log("🔍 IDL[BuyNft] Definition:");
-      console.log(JSON.stringify(buyIx, null, 2));
-
-      if (buyIx?.accounts) {
-        console.table(
-          buyIx.accounts.map((a: any) => ({
-            name: a.name,
-            isMut: a.isMut,
-            isSigner: a.isSigner,
-          }))
-        );
-      }
-    } catch (e: any) {
-      console.warn("⚠️ Tidak bisa membaca IDL BuyNft:", e.message);
-    }
-
-    // === Build instruction buyNft
+    // === 🔧 10️⃣ Build instruction (sesuai struct BuyNft) ===
     const ix = await program.methods
       .buyNft()
       .accountsStrict({
@@ -1918,65 +1886,37 @@ router.post("/nft/:mintAddress/buy", authenticateJWT, async (req: AuthRequest, r
         sellerPaymentAta,
         treasuryTokenAccount: treasuryAta,
         treasuryPda,
-        escrowTemp: foundEscrowTemp,
         sellerNftAta,
         buyerNftAta,
         marketConfig: marketConfigPda,
         escrowSigner: foundEscrowSigner,
-        paymentMint: paymentMintPk,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([
-        // Semua mut account berdasarkan IDL
-        { pubkey: sellerPk, isWritable: true, isSigner: false },
-        { pubkey: listingPda, isWritable: true, isSigner: false },
-        { pubkey: buyerPaymentAta, isWritable: true, isSigner: false },
-        { pubkey: sellerPaymentAta, isWritable: true, isSigner: false },
-        { pubkey: treasuryAta, isWritable: true, isSigner: false },
-        { pubkey: treasuryPda, isWritable: true, isSigner: false },
-        { pubkey: foundEscrowTemp, isWritable: true, isSigner: false },
-        { pubkey: sellerNftAta, isWritable: true, isSigner: false },
-        { pubkey: buyerNftAta, isWritable: true, isSigner: false },
-        { pubkey: foundEscrowSigner, isWritable: true, isSigner: false },
-      ])
       .instruction();
 
-
-    // === Build transaction
+    // === 11️⃣ Build transaction ===
     const tx = new Transaction();
 
-    // Ensure buyer NFT ATA exists
     const buyerNftInfo = await connection.getAccountInfo(buyerNftAta);
-    if (!buyerNftInfo) {
-      tx.add(
-        createAssociatedTokenAccountInstruction(buyerPk, buyerNftAta, buyerPk, mintPk)
-      );
-    }
+    if (!buyerNftInfo)
+      tx.add(createAssociatedTokenAccountInstruction(buyerPk, buyerNftAta, buyerPk, mintPk));
 
-    // Ensure buyer Payment ATA exists
     const buyerPayInfo = await connection.getAccountInfo(buyerPaymentAta);
-    if (!buyerPayInfo) {
+    if (!buyerPayInfo)
       tx.add(
-        createAssociatedTokenAccountInstruction(
-          buyerPk,
-          buyerPaymentAta,
-          buyerPk,
-          paymentMintPk
-        )
+        createAssociatedTokenAccountInstruction(buyerPk, buyerPaymentAta, buyerPk, paymentMintPk)
       );
-    }
 
     tx.add(ix);
     tx.feePayer = buyerPk;
     tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-    tx.signatures.push({
-      publicKey: buyerPk,
-      signature: null,
-    });
+    tx.signatures.push({ publicKey: buyerPk, signature: null });
 
+    // === 12️⃣ Serialize untuk Phantom ===
     const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
     const base64Tx = serialized.toString("base64");
+
     console.log("✅ Transaction built successfully (unsigned).");
     console.log("===============================================");
 
@@ -2086,24 +2026,71 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
       treasuryTokenAccount: treasuryTokenAccount.toBase58(),
     });
 
-    // === 4️⃣ Hitung harga ===
-    const isSolPayment = useSol || paymentMint === "So11111111111111111111111111111111111111111";
+    // === 4️⃣ Ambil PDA market_config dari program ===
+    const [marketConfigPk] = PublicKey.findProgramAddressSync(
+      [Buffer.from("market_config")],
+      program.programId
+    );
+
+    const marketConfig: any = await program.account.marketConfig.fetch(marketConfigPk);
+
+    console.log("⚙️ Market config:", {
+      pubkey: marketConfigPk.toBase58(),
+      relistFeeBps: Number(marketConfig.relist_fee_bps),
+      tradeFeeBps: Number(marketConfig.trade_fee_bps),
+      mintFeeBps: Number(marketConfig.mint_fee_bps),
+    });
+
+    // === 5️⃣ Hitung price base units ===
+    const isSolPayment =
+      useSol || paymentMint === "So11111111111111111111111111111111111111111";
     const decimalsUsed = isSolPayment ? 9 : 6;
     const baseUnits = Math.floor(price * 10 ** decimalsUsed);
     const priceAmountBn = new anchor.BN(baseUnits);
-    const relistFeeSpl = new anchor.BN(250); // default
 
     console.log("💵 Price breakdown:", {
       isSolPayment,
-      decimalsUsed,
       priceHuman: price,
       baseUnits,
       priceAmountBn: priceAmountBn.toString(),
     });
 
-    // === 5️⃣ Build instruction sesuai IDL ===
+    // === 6️⃣ Buat TX lebih awal agar bisa tambah IX ===
+    const blockhash = (await connection.getLatestBlockhash()).blockhash;
+    const tx = new Transaction({
+      feePayer: sellerPk,
+      recentBlockhash: blockhash,
+    });
+
+    // 🛠️ Pastikan sellerPaymentAta sudah ada di chain
+    const sellerPayInfo = await connection.getAccountInfo(sellerPaymentAta);
+    if (!sellerPayInfo) {
+      const createSellerAtaIx = createAssociatedTokenAccountInstruction(
+        sellerPk, // payer
+        sellerPaymentAta,
+        sellerPk, // owner
+        new PublicKey(paymentMint)
+      );
+      tx.add(createSellerAtaIx);
+      console.log("🪙 Created missing seller ATA:", sellerPaymentAta.toBase58());
+    }
+
+    // 🛠️ Pastikan treasuryTokenAccount sudah ada di chain
+    const treasuryInfo = await connection.getAccountInfo(treasuryTokenAccount);
+    if (!treasuryInfo) {
+      const createTreasuryAtaIx = createAssociatedTokenAccountInstruction(
+        sellerPk, // payer sementara (karena PDA ga bisa bayar)
+        treasuryTokenAccount,
+        treasuryPda,
+        new PublicKey(paymentMint)
+      );
+      tx.add(createTreasuryAtaIx);
+      console.log("🏦 Created missing treasury ATA:", treasuryTokenAccount.toBase58());
+    }
+
+    // === 7️⃣ Build instruction utama ===
     const ix = await program.methods
-      .relistNft(priceAmountBn, isSolPayment, relistFeeSpl)
+      .relistNft(priceAmountBn, isSolPayment)
       .accounts({
         listing: listingPda,
         newOwner: sellerPk,
@@ -2111,18 +2098,18 @@ router.post("/nft/:mintAddress/sell", authenticateJWT, async (req: AuthRequest, 
         sellerNftAta,
         sellerPaymentAta,
         treasuryTokenAccount,
+        treasuryPda,
         escrowSigner: escrowSignerPda,
+        marketConfig: marketConfigPk,
+        systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .instruction();
 
-    // === 6️⃣ Buat unsigned transaction untuk Phantom ===
-    const blockhash = (await connection.getLatestBlockhash()).blockhash;
-    const tx = new Transaction({
-      feePayer: sellerPk,
-      recentBlockhash: blockhash,
-    }).add(ix);
+    // Tambahkan instruksi utama setelah ATA creations
+    tx.add(ix);
 
+    // === 8️⃣ Serialize TX untuk Phantom ===
     const serializedTx = tx.serialize({ requireAllSignatures: false });
     const base64Tx = serializedTx.toString("base64");
 

@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "1.11.25",
   "name": "universe_of_gamers",
   "instructions": [
     {
@@ -88,7 +88,10 @@
         {
           "name": "seller",
           "isMut": true,
-          "isSigner": true
+          "isSigner": true,
+          "docs": [
+            "Seller: signer"
+          ]
         },
         {
           "name": "mint",
@@ -136,6 +139,16 @@
           "isSigner": false
         },
         {
+          "name": "admin",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "adminTokenAccount",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "metadata",
           "isMut": true,
           "isSigner": false
@@ -144,11 +157,6 @@
           "name": "tokenMetadataProgram",
           "isMut": false,
           "isSigner": false
-        },
-        {
-          "name": "payer",
-          "isMut": true,
-          "isSigner": true
         },
         {
           "name": "updateAuthority",
@@ -291,7 +299,7 @@
           "isMut": false,
           "isSigner": false,
           "docs": [
-            "SPL mint (UOG, USDC, dll) atau So111..."
+            "SPL mint (UOG, USDC, etc) or So111..."
           ]
         },
         {
@@ -315,7 +323,26 @@
         {
           "name": "admin",
           "isMut": true,
-          "isSigner": true
+          "isSigner": true,
+          "docs": [
+            "Optional: legacy admin mode"
+          ]
+        },
+        {
+          "name": "signer1",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Admin 1"
+          ]
+        },
+        {
+          "name": "signer2",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Admin 2"
+          ]
         },
         {
           "name": "systemProgram",
@@ -332,35 +359,6 @@
         {
           "name": "amount",
           "type": "u64"
-        }
-      ]
-    },
-    {
-      "name": "updateMarketConfig",
-      "accounts": [
-        {
-          "name": "marketConfig",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "admin",
-          "isMut": false,
-          "isSigner": true
-        }
-      ],
-      "args": [
-        {
-          "name": "newMintFeeBps",
-          "type": "u16"
-        },
-        {
-          "name": "newTradeFeeBps",
-          "type": "u16"
-        },
-        {
-          "name": "newTreasuryBump",
-          "type": "u8"
         }
       ]
     },
@@ -429,56 +427,6 @@
       ]
     },
     {
-      "name": "swapToken",
-      "accounts": [
-        {
-          "name": "user",
-          "isMut": true,
-          "isSigner": true
-        },
-        {
-          "name": "dexProgram",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "marketConfig",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "treasuryPda",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "outputMint",
-          "isMut": false,
-          "isSigner": false
-        },
-        {
-          "name": "treasuryTokenAccount",
-          "isMut": true,
-          "isSigner": false
-        },
-        {
-          "name": "userOutTokenAccount",
-          "isMut": true,
-          "isSigner": false
-        }
-      ],
-      "args": [
-        {
-          "name": "data",
-          "type": "bytes"
-        },
-        {
-          "name": "inAmount",
-          "type": "u64"
-        }
-      ]
-    },
-    {
       "name": "relistNft",
       "accounts": [
         {
@@ -512,7 +460,22 @@
           "isSigner": false
         },
         {
+          "name": "treasuryPda",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
           "name": "escrowSigner",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "marketConfig",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "systemProgram",
           "isMut": false,
           "isSigner": false
         },
@@ -530,10 +493,6 @@
         {
           "name": "useSol",
           "type": "bool"
-        },
-        {
-          "name": "relistFeeSpl",
-          "type": "u64"
         }
       ]
     }
@@ -609,48 +568,28 @@
   "errors": [
     {
       "code": 6000,
-      "name": "InvalidPrice",
-      "msg": "Invalid Price"
-    },
-    {
-      "code": 6001,
-      "name": "FeeTooHigh",
-      "msg": "Fee too High"
-    },
-    {
-      "code": 6002,
       "name": "InvalidOwner",
       "msg": "Invalid Owner"
     },
     {
-      "code": 6003,
-      "name": "MissingAccount",
-      "msg": "Missing Account"
-    },
-    {
-      "code": 6004,
+      "code": 6001,
       "name": "InvalidNFT",
       "msg": "Invalid NFT"
     },
     {
-      "code": 6005,
-      "name": "InsufficientFunds",
-      "msg": "Insufficient Funds"
-    },
-    {
-      "code": 6006,
+      "code": 6002,
       "name": "MathOverflow",
       "msg": "Math Over flow"
     },
     {
-      "code": 6007,
-      "name": "Unauthorized",
-      "msg": "Unauthorized"
-    },
-    {
-      "code": 6008,
+      "code": 6003,
       "name": "InvalidThreshold",
       "msg": "InvalidThreshold"
+    },
+    {
+      "code": 6004,
+      "name": "Unauthorized",
+      "msg": "Unauthorized action"
     }
   ]
 }

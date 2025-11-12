@@ -1,6 +1,30 @@
 import express from "express";
-import bs58 from "bs58";
-import { Connection, Keypair, Transaction, PublicKey } from "@solana/web3.js";
+import bs58Module from "bs58";
+import {
+  Connection,
+  LAMPORTS_PER_SOL,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  Keypair,
+  TransactionInstruction,
+  sendAndConfirmTransaction
+} from "@solana/web3.js";
+import * as anchor from "@project-serum/anchor";
+import { BN } from "@project-serum/anchor";
+import {
+  getAssociatedTokenAddressSync,
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  MINT_SIZE,
+  createInitializeMintInstruction,
+  createAssociatedTokenAccountInstruction,
+  getAccount,
+  getAssociatedTokenAddress,
+  getOrCreateAssociatedTokenAccount,
+  getMint,
+  createTransferInstruction
+} from "@solana/spl-token";
 import { GatchaPack } from "../models/GatchaPack";
 import { Nft, INft } from "../models/Nft";
 import { doGatchaRoll, doMultiGatchaRolls } from "../services/gatchaService";
@@ -8,7 +32,7 @@ import { decrypt } from "../utils/cryptoHelper";
 import Auth from "../models/Auth";
 import { Referral } from "../models/Referral";
 import { authenticateJWT, AuthRequest } from "../middleware/auth";
-import { buildMintTransaction, buildMintTransactionPhantom } from "../services/mintService";
+import { buildMintTransactionPhantom } from "../services/mintService";
 import { generateNftMetadata } from "../services/metadataGenerator";
 import { Client } from "@solana-tracker/data-api";
 
@@ -16,6 +40,29 @@ import fs from "fs";
 import path from "path";
 
 const router = express.Router();
+
+// ✅ Fix default import (ESM / CJS interop)
+const bs58: any = (bs58Module as any).default || bs58Module;
+
+export const getAdminKeypair = (): Keypair => {
+  console.log("🔑 [getAdminKeypair] Loading from .env...");
+  const secret = process.env.ADMIN_TREASURY_KEY;
+
+  if (!secret) {
+    console.error("❌ [getAdminKeypair] Missing ADMIN_TREASURY_KEY in .env");
+    throw new Error("Missing ADMIN_TREASURY_KEY in .env");
+  }
+
+  try {
+    const secretKey = bs58.decode(secret.trim());
+    const keypair = Keypair.fromSecretKey(secretKey);
+    console.log("👑 [Admin Keypair Loaded]", keypair.publicKey.toBase58());
+    return keypair;
+  } catch (err: any) {
+    console.error("❌ [getAdminKeypair] Invalid key format:", err.message);
+    throw new Error("Invalid ADMIN_TREASURY_KEY format (must be base58)");
+  }
+};
 
 const client = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
 
@@ -328,35 +375,32 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     const { id: userId } = req.user;
     const { id: packId } = req.params;
     const { paymentMint, activeWallet } = req.body;
+    const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
 
     console.log("⚡ [Phantom Gatcha] Start request:", { userId, packId, paymentMint, activeWallet });
-
-    if (!activeWallet) {
-      console.log("❌ Missing active wallet address");
-      return res.status(400).json({ error: "Missing active wallet address" });
-    }
+    if (!activeWallet) return res.status(400).json({ error: "Missing active wallet address" });
 
     // === Ambil user & pack
     const authUser = await Auth.findById(userId);
-    if (!authUser) {
-      console.log("❌ User not found:", userId);
-      return res.status(404).json({ error: "User not found" });
-    }
+    if (!authUser) return res.status(404).json({ error: "User not found" });
 
     const pack = await GatchaPack.findById(packId);
-    if (!pack) {
-      console.log("❌ Pack not found:", packId);
-      return res.status(404).json({ error: "Pack not found" });
-    }
+    if (!pack) return res.status(404).json({ error: "Pack not found" });
 
-    // Pastikan wallet ini benar-benar milik user
+    // === Pastikan wallet milik user
     const isValidWallet =
       authUser.wallets.some(w => w.address === activeWallet) ||
       authUser.custodialWallets?.some(w => w.address === activeWallet);
+    if (!isValidWallet) return res.status(403).json({ error: "Invalid wallet address" });
 
-    if (!isValidWallet) {
-      console.log("🚫 Wallet not associated with this user:", activeWallet);
-      return res.status(403).json({ error: "Invalid wallet address" });
+    // === Cegah double pull (masih ada mint pending)
+    const existingPending = await Nft.findOne({ owner: activeWallet, status: "pending" });
+    if (existingPending) {
+      console.log("🚫 Pending mint exists, skip new pull:", existingPending.mintAddress);
+      return res.status(400).json({
+        error: "You already have a pending mint. Please confirm it first.",
+        mintAddress: existingPending.mintAddress,
+      });
     }
 
     console.log("🎁 Selected Pack:", {
@@ -369,26 +413,24 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     // === Roll reward
     console.log("🎲 Rolling reward...");
     let { nft, blueprint, rewardInfo } = await doGatchaRoll(pack, String(authUser._id));
-    console.log("🎯 Roll result:", {
-      nftType: nft.character ? "Character" : nft.rune ? "Rune" : "Unknown",
-      blueprint,
-      rewardInfo,
-    });
+    console.log("🎯 Roll result:", { nftType: nft.character ? "Character" : "Rune", blueprint, rewardInfo });
 
+    // === Generate mint address
     const mintKp = Keypair.generate();
     const mintAddress = mintKp.publicKey.toBase58();
     nft.mintAddress = mintAddress;
     console.log("🪙 Generated Mint Address:", mintAddress);
 
-    // === Populate & naming
+    // === Populate karakter/rune
     if (nft.character) nft = await nft.populate("character");
     if (nft.rune) nft = await nft.populate("rune");
 
-    let finalName: string;
-    if (nft.character && (nft.character as any)._id) {
+    // === Penamaan final
+    let finalName = "";
+    if (nft.character) {
       const char = nft.character as any;
-      const existingCount = await Nft.countDocuments({ character: char._id });
-      finalName = `${char.name} #${existingCount + 1}`;
+      const count = await Nft.countDocuments({ character: char._id });
+      finalName = `${char.name} #${count + 1}`;
       Object.assign(nft, {
         name: finalName,
         base_name: char.name,
@@ -399,11 +441,10 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
         def: char.baseDef,
         spd: char.baseSpd,
       });
-      console.log("🧬 Character NFT Generated:", { char: char.name, finalName, image: nft.image });
-    } else if (nft.rune && (nft.rune as any)._id) {
+    } else if (nft.rune) {
       const rune = nft.rune as any;
-      const existingCount = await Nft.countDocuments({ rune: rune._id });
-      finalName = `${rune.name} #${existingCount + 1}`;
+      const count = await Nft.countDocuments({ rune: rune._id });
+      finalName = `${rune.name} #${count + 1}`;
       Object.assign(nft, {
         name: finalName,
         base_name: rune.name,
@@ -414,19 +455,13 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
         def: rune.def || 0,
         spd: rune.spd || 0,
       });
-      console.log("💎 Rune NFT Generated:", { rune: rune.name, finalName, image: nft.image });
     } else {
       throw new Error("NFT not have character or rune");
     }
 
-    console.log("🎨 NFT Final:", {
-      name: nft.name,
-      base_name: nft.base_name,
-      mintAddress,
-      stats: { hp: nft.hp, atk: nft.atk, def: nft.def, spd: nft.spd },
-    });
+    console.log("🎨 NFT Final:", { name: nft.name, mintAddress, stats: { hp: nft.hp, atk: nft.atk, def: nft.def, spd: nft.spd } });
 
-    // === Build unsigned TX
+    // === Build unsigned TX untuk Phantom
     console.log("⚙️ Building unsigned transaction for Phantom...");
     const txData = await buildMintTransactionPhantom(
       activeWallet,
@@ -434,10 +469,7 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
         name: nft.name,
         symbol: "UOGNFT",
         uri: "",
-        price:
-          paymentMint === "So11111111111111111111111111111111111111111"
-            ? pack.priceSOL || 0
-            : pack.priceUOG || 0,
+        price: paymentMint === "So11111111111111111111111111111111111111111" ? pack.priceSOL || 0 : pack.priceUOG || 0,
         royalty: nft.royalty || 0,
       },
       paymentMint,
@@ -447,14 +479,11 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     console.log("🧾 Unsigned TX Built:", {
       user: activeWallet,
       mint: txData.mint,
-      price:
-        paymentMint === "So11111111111111111111111111111111111111111"
-          ? pack.priceSOL || 0
-          : pack.priceUOG || 0,
       paymentMint,
+      mintPubkey: mintKp.publicKey.toBase58(),
     });
 
-    // === Save pending NFT
+    // === Simpan pending NFT
     const newNft = await Nft.create({
       name: nft.name,
       base_name: nft.base_name,
@@ -463,12 +492,8 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
       txSignature: "",
       status: "pending",
       isSell: false,
-      price:
-        paymentMint === "So11111111111111111111111111111111111111111"
-          ? pack.priceSOL || 0
-          : pack.priceUOG || 0,
-      paymentSymbol:
-        paymentMint === "So11111111111111111111111111111111111111111" ? "SOL" : "UOG",
+      price: paymentMint === "So11111111111111111111111111111111111111111" ? pack.priceSOL || 0 : pack.priceUOG || 0,
+      paymentSymbol: paymentMint === "So11111111111111111111111111111111111111111" ? "SOL" : "UOG",
       paymentMint,
       hp: nft.hp,
       atk: nft.atk,
@@ -485,20 +510,10 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
       rune: nft.rune?._id,
     });
 
-    console.log("💾 NFT Saved to DB:", {
-      id: newNft._id,
-      name: newNft.name,
-      owner: newNft.owner,
-      mint: newNft.mintAddress,
-    });
+    console.log("💾 NFT Saved to DB:", { id: newNft._id, name: newNft.name, mint: newNft.mintAddress });
 
-    // === Return response
-    console.log("✅ [Phantom Gatcha] TX ready for signing:", {
-      user: activeWallet,
-      mintAddress: txData.mint,
-      txLength: txData.transaction.length,
-    });
-
+    // === Return ke frontend
+    console.log("✅ [Phantom Gatcha] TX ready for signing:", { user: activeWallet, mintAddress: txData.mint, txLength: txData.transaction.length });
     return res.json({
       message: "Unsigned transaction ready for Phantom",
       transaction: txData.transaction,
@@ -508,21 +523,19 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
       blueprint,
       nft,
       costs: {
-        priceAmount:
-          paymentMint === "So11111111111111111111111111111111111111111"
-            ? pack.priceSOL || 0
-            : pack.priceUOG || 0,
+        priceAmount: paymentMint === "So11111111111111111111111111111111111111111" ? pack.priceSOL || 0 : pack.priceUOG || 0,
         paymentMint,
       },
     });
   } catch (err: any) {
     console.error("❌ Gatcha build error:", err.message);
-    const nft = await Nft.findOne({ mintAddress: req.body.mintAddress });
-    if (nft) {
-      nft.status = "failed";
-      await nft.save();
+    if (req.body.mintAddress) {
+      const nft = await Nft.findOne({ mintAddress: req.body.mintAddress });
+      if (nft) {
+        nft.status = "failed";
+        await nft.save();
+      }
     }
-    console.error(err.stack);
     res.status(400).json({ error: err.message });
   }
 });
@@ -540,29 +553,68 @@ router.post("/:id/confirm", async (req, res) => {
     if (!mintAddress || !signedTx)
       return res.status(400).json({ error: "Missing mintAddress or signedTx" });
 
-    // === Step 1: Broadcast TX ke Solana
+    // === Step 1: Siapkan koneksi & admin signer ===
     const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
+    // const adminKeypair = getAdminKeypair();
+
+    // console.log("👑 [Admin Keypair Loaded]", adminKeypair.publicKey.toBase58());
+
+    // === Step 2: Decode TX dari Phantom (signed oleh user) ===
     const tx = Transaction.from(bs58.decode(signedTx));
-    console.log("🧩 Decoded transaction:", {
-      instructions: tx.instructions?.length || 0,
-      recentBlockhash: tx.recentBlockhash,
+    console.log("🧩 Decoded TX signers:");
+    tx.signatures.forEach((s, i) => {
+      console.log(`#${i} ${s.publicKey.toBase58()} signed=${!!s.signature}`);
     });
 
+    // ✅ Validasi tanda tangan user (seller)
+    if (!tx.signatures?.some(s => s.signature)) {
+      throw new Error("No user signature found in Phantom TX");
+    }
+
+    // ✅ Log tanda tangan sebelum ditambah admin
+    console.log("🖋️ Signers before adding admin:", 
+      tx.signatures.map(s => ({
+        pubkey: s.publicKey?.toBase58(),
+        signed: !!s.signature,
+      }))
+    );
+
+    // === Step 3: Admin ikut tanda tangan (partial sign) ===
+    // tx.partialSign(adminKeypair);
+    // console.log(`✍️ Added admin signature: ${adminKeypair.publicKey.toBase58()}`);
+
+    // === Step 4: Validasi fee payer & log final signatures ===
+    if (tx.feePayer) {
+      console.log("💸 Fee payer:", tx.feePayer.toBase58());
+    } else {
+      throw new Error("Missing feePayer in transaction");
+    }
+
+    console.log("🖋️ Signers before send:",
+      tx.signatures.map(s => ({
+        pubkey: s.publicKey?.toBase58(),
+        signed: !!s.signature,
+      }))
+    );
+
+    // === Step 5: Kirim transaksi ke jaringan ===
     console.log("🚀 Sending raw transaction to network...");
-    const txSignature = await connection.sendRawTransaction(tx.serialize(), {
+    const rawTx = tx.serialize();
+    const txSignature = await connection.sendRawTransaction(rawTx, {
       skipPreflight: false,
+      preflightCommitment: "processed",
     });
 
     console.log("⏳ Waiting for confirmation...");
     const confirmation = await connection.confirmTransaction(txSignature, "confirmed");
+
     console.log("✅ TX broadcasted & confirmed:", {
       mintAddress,
       txSignature,
       slot: confirmation?.context?.slot,
     });
 
-    // === Step 2: Update NFT record
-    console.log("🧾 Updating NFT record for:", mintAddress);
+    // === Step 6: Update NFT record ===
     const nft = await Nft.findOne({ mintAddress }).populate("character").populate("rune");
     if (!nft) {
       console.error("❌ NFT not found in DB:", mintAddress);
@@ -572,6 +624,7 @@ router.post("/:id/confirm", async (req, res) => {
     nft.txSignature = txSignature;
     nft.status = "minted";
     await nft.save();
+
     console.log("💾 NFT updated in DB:", {
       id: nft._id,
       name: nft.name,
@@ -579,21 +632,26 @@ router.post("/:id/confirm", async (req, res) => {
       txSignature,
     });
 
-    // === Step 3: Apply Referral Reward (10%)
+    // === Step 7: Apply referral reward ===
     const ownerUser = await Auth.findOne({
       $or: [
-        { 'wallets.address': nft.owner },
-        { 'custodialWallets.address': nft.owner },
+        { "wallets.address": nft.owner },
+        { "custodialWallets.address": nft.owner },
       ],
     });
 
     if (ownerUser) {
-      await applyReferralReward(ownerUser._id, nft.price, nft.paymentMint, nft.txSignature);
+      await applyReferralReward(
+        ownerUser._id,
+        nft.price,
+        nft.paymentMint,
+        nft.txSignature
+      );
     } else {
       console.log("⚠️ [Referral] Owner not found, skip reward.");
     }
 
-    // === Step 4: Generate metadata
+    // === Step 8: Generate metadata ===
     const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
     const outputDir = path.join(process.cwd(), baseDir);
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
@@ -607,7 +665,7 @@ router.post("/:id/confirm", async (req, res) => {
     fs.writeFileSync(filePath, JSON.stringify(metadataResult.metadata, null, 2));
     const metadataUri = `https://api.universeofgamers.io/api/nft/${mintAddress}/metadata`;
 
-    // ✅ PATCH: Tambahkan image dari metadata jika kosong
+    // Tambah image jika kosong
     if (!nft.image || nft.image === "") {
       const imageFromMeta = metadataResult.metadata?.image || null;
       if (imageFromMeta) {
@@ -619,7 +677,6 @@ router.post("/:id/confirm", async (req, res) => {
       }
     }
 
-    // === Step 5: Final summary log
     console.log("🎉 [Gatcha Confirm Success]", {
       name: nft.name,
       mintAddress,
@@ -630,7 +687,6 @@ router.post("/:id/confirm", async (req, res) => {
       paymentMint: nft.paymentMint,
     });
 
-    // === Step 6: Response ke frontend
     res.json({
       message: "🎲 Gatcha success!",
       rewardInfo: null,
@@ -651,7 +707,6 @@ router.post("/:id/confirm", async (req, res) => {
   } catch (err: any) {
     console.error("❌ Gatcha confirm error:", err.message);
 
-    // 🧹 Bersihkan NFT pending yang gagal
     if (req.body.mintAddress) {
       const failedNft = await Nft.findOne({ mintAddress: req.body.mintAddress });
       if (failedNft && failedNft.status === "pending") {
