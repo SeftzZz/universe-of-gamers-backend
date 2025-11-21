@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"mint":{"$numberInt":"1"}},"name":"mint_1","background":true}],"uuid":"94f8763201974509951b8a91fb2c862a","collectionName":"trendingtokens","type":"collection"}

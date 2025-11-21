@@ -98,6 +98,8 @@ router.post("/claim", authenticateJWT, async (req: Request, res: Response) => {
       solPriceUsd = 100;
     }
 
+    console.log("admin address:", adminKeypair.publicKey);
+
     // Hitung konversi SOL → USD
     const claimableUSD = claimableSOL * solPriceUsd;
     console.log(`💱 ${claimableSOL} SOL ≈ $${claimableUSD.toFixed(2)} USD`);

@@ -21,6 +21,8 @@ import characterRoutes from "./routes/character";
 import gatchaRoutes from "./routes/gatcha";
 import withdrawRoutes from "./routes/withdraw";
 import referralRoutes from "./routes/referral";
+import prizePoolRoutes from "./routes/prizepool";
+import tournamentRoutes from "./routes/tournament";
 
 import { authenticateJWT, requireAdmin, AuthRequest } from "./middleware/auth";
 
@@ -98,6 +100,8 @@ app.use("/api/withdraw", withdrawRoutes);
 app.use("/api/referral", referralRoutes);
 app.use("/api", battleRoutes);
 app.use("/api", solRoutes);
+app.use("/api", prizePoolRoutes);
+app.use("/api", tournamentRoutes);
 app.use("/api", battleSimulateRouter);
 
 // app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
@@ -249,12 +253,12 @@ wss.on("connection", (ws: WebSocket) => {
       // ======================================================
       // ⚔️ UPDATE BATTLE RESULT (via WebSocket)
       // ======================================================
-      if (data.type === "battle_updated") {
-        const { battleId, result, players } = data;
-        console.log("──────────────────────────────────────────────");
-        console.log(`⚔️ [WS Battle Update] Processing → ${battleId}`);
-        console.log(`🧩 Result: ${result || "N/A"} | Players: ${players ? players.length : 0}`);
-        console.log("──────────────────────────────────────────────");
+      if (data.message.type === "battle_updated") {
+        const { battleId, result, players } = data.message;
+        // console.log("──────────────────────────────────────────────");
+        // console.log(`⚔️ [WS Battle Update] Processing → ${battleId}`);
+        // console.log(`🧩 Result: ${result || "N/A"} | Players: ${players ? players.length : 0}`);
+        // console.log("──────────────────────────────────────────────");
 
         const updateData: Record<string, any> = {};
         if (result) updateData.result = result;
@@ -297,7 +301,7 @@ wss.on("connection", (ws: WebSocket) => {
 
           if (team?.members && Array.isArray(team.members)) {
             for (const nft of team.members) {
-              console.log(`🧬 Verifying NFT integrity → ${nft.name}`);
+              console.log(`🧬 Verifying NFT integrity → ${nft.name} → ${nft.mintAddress}`);
               await verifyNftIntegrity(nft);
             }
           }
@@ -450,62 +454,99 @@ wss.on("connection", (ws: WebSocket) => {
       // ======================================================
       // 🧩 APPEND VERIFIED BATTLE LOG
       // ======================================================
-      else if (data.type === "battle_log") {
-        const { battleId, attacker, defender, skill, damage, isCrit } = data;
+      else if (data.message.type === "battle_log") {
+        console.log("🧩 APPEND VERIFIED BATTLE LOG");
+        const { battleId, attacker, defender, skill, damage, isCrit } = data.message;
 
         try {
-          // 1️⃣ Validasi input dasar
+          // 1️⃣ Validasi input
           if (!battleId || !attacker || !defender || !skill || damage === undefined) {
             ws.send(JSON.stringify({
               type: "battle_error",
-              error: "Missing required battle log fields (battleId, attacker, defender, skill, damage)",
+              error: "Missing required battle log fields",
             }));
             return;
           }
 
-          // 2️⃣ Cek battle
-          const battle = await Battle.findById(battleId);
+          // 2️⃣ Load battle + populate team + members (NFT)
+          const battle = await Battle.findById(battleId)
+            .populate({
+              path: "players.team",
+              populate: {
+                path: "members",
+                model: "Nft",
+                select: "name owner",
+              }
+            });
+
           if (!battle) {
             ws.send(JSON.stringify({ type: "battle_error", error: "Battle not found" }));
             return;
           }
 
-          // 3️⃣ Ambil attacker & defender NFT
+          // 3️⃣ Extract team membership
+          const teamMembersMap: Record<string, string[]> = {};
+
+          for (const player of battle.players) {
+            const team = player.team as any;
+
+            if (team && Array.isArray(team.members)) {
+              teamMembersMap[player.user] = team.members.map((m: any) => m.name);
+            }
+          }
+
+          // 4️⃣ Validasi attacker harus bagian dari team yang benar
+          const attackerOwner = battle.players.find(p =>
+            (teamMembersMap[p.user] || []).includes(attacker)
+          )?.user;
+
+          if (!attackerOwner) {
+            throw new Error("Attacker NFT is not part of player's team (CHEAT!)");
+          }
+
+          // 5️⃣ Validasi defender harus bagian dari team yang benar
+          const defenderOwner = battle.players.find(p =>
+            (teamMembersMap[p.user] || []).includes(defender)
+          )?.user;
+
+          if (!defenderOwner) {
+            throw new Error("Defender NFT is not part of player's team (CHEAT!)");
+          }
+
+          // 6️⃣ Ambil NFT attacker & defender berdasarkan name + owner
           const [attackerNft, defenderNft] = await Promise.all([
-            Nft.findOne({ name: attacker })
+            Nft.findOne({ name: attacker, owner: attackerOwner })
               .populate({ path: "character", model: "Character" })
               .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } }),
-            Nft.findOne({ name: defender })
+
+            Nft.findOne({ name: defender, owner: defenderOwner })
               .populate({ path: "character", model: "Character" })
               .populate({ path: "equipped", populate: { path: "rune", model: "Rune" } }),
           ]);
 
           if (!attackerNft || !defenderNft) {
-            ws.send(JSON.stringify({
-              type: "battle_error",
-              error: "Attacker or defender NFT not found",
-            }));
-            return;
+            throw new Error("Attacker or defender NFT not found (invalid owner or not in team)");
           }
 
-          // 4️⃣ Verifikasi integritas NFT attacker & defender
+          // 7️⃣ NFT integrity check
           await verifyNftIntegrity(attackerNft);
           await verifyNftIntegrity(defenderNft);
 
-          // 5️⃣ Hitung HP dasar defender
-          const baseDefenderHp = defenderNft.hp ?? (defenderNft.character as ICharacter)?.baseHp ?? 100;
+          // 8️⃣ Hitung base HP defender
+          const char: any = defenderNft.character;
+          const baseDefenderHp = defenderNft.hp ?? char?.baseHp ?? 100;
 
-          // 6️⃣ Cari HP terakhir defender di log sebelumnya
-          const prevLogs = battle.log.filter(l => l.defender === defender);
+          // 9️⃣ Ambil HP terakhir dari log
+          const prevLogs = battle.log.filter((l: any) => l.defender === defender);
           const lastHp =
             prevLogs.length > 0
               ? prevLogs[prevLogs.length - 1].remainingHp
               : baseDefenderHp;
 
-          // 7️⃣ Hitung HP baru server-side (tanpa input client)
+          // 🔟 Hitung HP baru
           const remainingHp = Math.max(0, lastHp - damage);
 
-          // 8️⃣ Buat log baru
+          // 1️⃣1️⃣ Buat log
           const newLog = {
             attacker,
             defender,
@@ -516,31 +557,23 @@ wss.on("connection", (ws: WebSocket) => {
             timestamp: new Date(),
           };
 
-          // 9️⃣ Simpan log ke DB
+          // 1️⃣2️⃣ Simpan ke DB
           battle.log.push(newLog);
           battle.updatedAt = new Date();
           await battle.save();
 
-          // 🔟 Logging real-time di server
-          console.log("🧩 [BATTLE LOG VERIFIED]");
-          console.log(`BattleID=${battle._id}`);
-          console.log(`🕹️ ${attacker} ➜ ${defender}`);
-          console.log(`⚔️ Skill=${skill} | Damage=${damage} | Crit=${!!isCrit}`);
-          console.log(`❤️ HP: ${lastHp} → ${remainingHp}`);
-          console.log("-----------------------------------");
-
-          // 11️⃣ Broadcast hasil ke semua client
+          // 1️⃣3️⃣ Broadcast
           broadcast({
             type: "battle_log_broadcast",
             battleId,
             log: newLog,
           });
 
-          // 12️⃣ Kirim respon ke pengirim
+          // 1️⃣4️⃣ Response
           ws.send(JSON.stringify({
             type: "battle_log_saved",
             success: true,
-            message: "Battle log appended (HP computed server-side)",
+            message: "Battle log appended safely",
             log: newLog,
           }));
 
@@ -557,7 +590,7 @@ wss.on("connection", (ws: WebSocket) => {
       // ======================================================
       // 🧭 Ping-Pong
       // ======================================================
-      else if (data.type === "ping") {
+      else if (data.message.type === "ping") {
         ws.send(JSON.stringify({ type: "pong", time: new Date().toISOString() }));
       }
     } catch (err: any) {
@@ -594,7 +627,7 @@ export const broadcast = (data: any) => {
 
   server.listen(PORT, () => {
     console.log(`📡 Program ID:${process.env.PROGRAM_ID}`);
-    console.log(`   Backend version 13.11.2025.0520`);
+    console.log(`   Backend version 14.11.2025.2100`);
     console.log(`🚀 NFT Backend running on http://localhost:${PORT}`);
     console.log(`📡 WebSocket active on ws://localhost:${PORT}`);
     console.log("🌍 Allowed Origins:", allowedOrigins.join(", "));

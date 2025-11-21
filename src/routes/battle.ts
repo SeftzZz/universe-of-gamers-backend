@@ -71,7 +71,7 @@ async function calculateEconomicFragment(
     return 0;
   }
 
-  const MAX_NORMALIZED = 37500 * 3;
+  const MAX_NORMALIZED = 3125000 * 3;
   let totalValue = 0;
   let lowestRarity: "common" | "rare" | "epic" | "legendary" = "legendary";
   const rarityOrder = ["common", "rare", "epic", "legendary"];
@@ -110,10 +110,18 @@ async function calculateEconomicFragment(
   console.log(`📈 Total Normalized: ${totalNormalized.toFixed(6)}`);
 
   const rarityCfg = await HeroConfig.findOne({ rarity: lowestRarity });
-  const teamModifier = rarityCfg?.teamModifier ?? 0;
+  const teamModifierRaw = rarityCfg?.teamModifier ?? 0; // 0.10
+  const teamModifier = teamModifierRaw * 100; // 10
   console.log(`🧩 Lowest Rarity: ${lowestRarity} | Team Modifier: ${teamModifier.toFixed(3)}`);
+  // Formula disesuaikan agar tetap normal
+  const result = Math.min(
+    100,
+    Math.max(
+      0,
+      ((totalNormalized * (1 - teamModifierRaw)) + teamModifierRaw) * 100
+    )
+  );
 
-  const result = Math.min(100, Math.max(0, ((totalNormalized * (1 - teamModifier)) + teamModifier) * 100));
   console.log(`✅ Economic Fragment Result: ${result.toFixed(6)}`);
   console.log("──────────────────────────────────────────────");
 

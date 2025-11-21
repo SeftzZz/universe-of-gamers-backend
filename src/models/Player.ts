@@ -26,7 +26,6 @@ const PlayerSchema = new Schema<IPlayer>(
     username: {
       type: String,
       required: true,
-      unique: true,
       trim: true,
     },
     walletAddress: {
@@ -50,19 +49,42 @@ const PlayerSchema = new Schema<IPlayer>(
       ],
       default: "sentinel",
     },
-    totalEarning: {
-      type: Number,
-      default: 0,
-    },
-    lastActive: {
-      type: Date,
-      default: Date.now,
-    },
+    totalEarning: { type: Number, default: 0 },
+    lastActive: { type: Date, default: Date.now },
   },
   {
     collection: "players",
-    timestamps: true, // otomatis buat createdAt & updatedAt
+    timestamps: true,
   }
 );
+
+// 🛡️ VALIDASI MANUAL — Cegah insert username duplikat TANPA error MongoDB
+PlayerSchema.pre("save", async function (next) {
+  try {
+    const Player = mongoose.models.Player;
+
+    const exists = await Player.findOne({
+      username: this.username,
+      _id: { $ne: this._id },
+    });
+
+    if (exists) {
+      console.log(`⚠️ [Player] Duplicate username, skipping: ${this.username}`);
+
+      // 🛑 Hack Mongoose: tandai bahwa dokumen bukan dokumen baru
+      (this as any).isNew = false;
+
+      return next(); // skip tanpa error
+    }
+
+    next();
+  } catch (err: any) {
+    console.log("⚠️ [Player] Validation failed:", err.message);
+
+    // Tetap skip save tanpa error
+    (this as any).isNew = false;
+    return next();
+  }
+});
 
 export const Player = mongoose.model<IPlayer>("Player", PlayerSchema);

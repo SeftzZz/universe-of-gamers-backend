@@ -35,14 +35,19 @@ import { authenticateJWT, AuthRequest } from "../middleware/auth";
 import { buildMintTransactionPhantom } from "../services/mintService";
 import { generateNftMetadata } from "../services/metadataGenerator";
 import { Client } from "@solana-tracker/data-api";
+import { broadcast } from "../index";
 
 import fs from "fs";
 import path from "path";
+import fetch from "node-fetch";
+import https from "https";
 
 const router = express.Router();
 
 // ✅ Fix default import (ESM / CJS interop)
 const bs58: any = (bs58Module as any).default || bs58Module;
+
+let lastGatchaPackSnapshot: any[] | null = null;
 
 export const getAdminKeypair = (): Keypair => {
   console.log("🔑 [getAdminKeypair] Loading from .env...");
@@ -133,6 +138,334 @@ export async function applyReferralReward(
   }
 }
 
+/* ================================================================
+   🔥 AUTO WITHDRAW PRIZEPOOL + FORWARD TO ADMIN PROGRAM
+================================================================ */
+export async function withdrawPrizepoolAndForward(amountSol: number) {
+  console.log("⚙️ [withdrawPrizepoolAndForward] START");
+
+  const PROGRAM_ID = new PublicKey(process.env.PROGRAM_ID!);
+  const MARKET_CONFIG = new PublicKey(process.env.MARKET_CONFIG!);
+  const TREASURY_PDA = new PublicKey(process.env.TREASURY_PDA!);
+
+  const rpcUrl = process.env.SOLANA_CLUSTER!;
+  const connection = new Connection(rpcUrl, "confirmed");
+
+  // =====================================================
+  // 🔑 Load admin multisig keypairs
+  // =====================================================
+  const admin1 = getAdminKeypair();
+  const admin2 = getAdminKeypair(); 
+  const adminMain = getAdminKeypair();
+
+  // =============================================================
+  // 🔑 Load admin program wallet from ENV (ADMIN_PRIVATE_KEY)
+  // =============================================================
+  const adminProgramSecret = process.env.ADMIN_PRIVATE_KEY;
+
+  if (!adminProgramSecret) {
+    throw new Error("❌ ADMIN_PRIVATE_KEY missing in .env");
+  }
+
+  let adminProgram: Keypair;
+
+  try {
+    const secretBytes = bs58.decode(adminProgramSecret.trim());
+    adminProgram = Keypair.fromSecretKey(secretBytes);
+  } catch (err: any) {
+    console.error("❌ Invalid ADMIN_PRIVATE_KEY format:", err.message);
+    throw new Error("ADMIN_PRIVATE_KEY must be a base58-encoded secret key");
+  }
+
+  console.log("👑 Admin Program:", adminProgram.publicKey.toBase58());
+
+  // =====================================================
+  // Setup Anchor provider
+  // =====================================================
+  const wallet = new anchor.Wallet(admin1);
+  const provider = new anchor.AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+  });
+  anchor.setProvider(provider);
+
+  // =====================================================
+  // Load IDL + Program
+  // =====================================================
+  const idl = await anchor.Program.fetchIdl(PROGRAM_ID, provider);
+  if (!idl) throw new Error("IDL not found on chain");
+
+  const program = new anchor.Program(idl, PROGRAM_ID, provider);
+
+  // =====================================================
+  // GET mintFeeBps FROM on-chain marketConfig
+  // =====================================================
+  const mc = await program.account.marketConfig.fetch(MARKET_CONFIG);
+  const mintFeeBps = Number(mc.mintFeeBps?.toString() || "0");
+
+  console.log("🔢 On-chain mintFeeBps =", mintFeeBps);
+
+  // =====================================================
+  // Hitung fee sebenarnya
+  // =====================================================
+  let finalAmountSol = amountSol; // default dari parameter
+
+  if (mintFeeBps > 0) {
+    // override menggunakan mintFeeBps yg benar
+    finalAmountSol = amountSol * (mintFeeBps / 10_000);
+  }
+
+  console.log("💰 Final fee to withdraw (SOL):", finalAmountSol);
+
+  const lamports = Math.floor(finalAmountSol * LAMPORTS_PER_SOL);
+  console.log("💰 Withdraw Amount (lamports):", lamports);
+
+  // =====================================================
+  // Dummy mint untuk memuaskan Anchor SPL constraints
+  // =====================================================
+  const DUMMY_MINT = new PublicKey(
+    "So11111111111111111111111111111111111111112"
+  );
+
+  const dummyAta = await getAssociatedTokenAddressSync(
+    DUMMY_MINT,
+    admin1.publicKey,
+    true
+  );
+
+  // =====================================================
+  // BUILD withdraw Treasury TX
+  // =====================================================
+  const tx = await program.methods
+    .withdrawTreasury(new BN(lamports))
+    .accounts({
+      marketConfig: MARKET_CONFIG,
+      treasuryPda: TREASURY_PDA,
+      admin: adminMain.publicKey,
+      signer1: admin1.publicKey,
+      signer2: admin2.publicKey,
+      mint: DUMMY_MINT,
+      treasuryTokenAccount: dummyAta,
+      adminTokenAccount: dummyAta,
+      systemProgram: SystemProgram.programId,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .transaction();
+
+  tx.feePayer = admin1.publicKey;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+
+  // =====================================================
+  // Sign multisig
+  // =====================================================
+  tx.partialSign(adminMain);
+  tx.partialSign(admin1);
+  tx.partialSign(admin2);
+
+  const sim = await connection.simulateTransaction(tx);
+  if (sim.value.err) {
+    console.error("❌ Simulation error:", sim.value.err);
+    console.log(sim.value.logs);
+    throw new Error("Simulation failed");
+  }
+
+  // =====================================================
+  // SEND WITHDRAW TX
+  // =====================================================
+  const sig = await connection.sendRawTransaction(tx.serialize());
+  await connection.confirmTransaction(sig, "confirmed");
+  console.log("🎉 Withdraw Success:", sig);
+
+  // =====================================================
+  // STEP 2: FORWARD TO ADMIN PROGRAM
+  // =====================================================
+  const balAdmin = await connection.getBalance(admin1.publicKey);
+  const adminSol = balAdmin / LAMPORTS_PER_SOL;
+
+  if (adminSol <= 0.001) {
+    console.log("🪫 Admin1 tidak cukup SOL untuk forward.");
+    return { withdrawSig: sig, forwarded: false };
+  }
+
+  const forwardSol = finalAmountSol;
+  const forwardLamports = Math.floor(forwardSol * LAMPORTS_PER_SOL);
+
+  console.log("🔁 Forwarding:", {
+    from: admin1.publicKey.toBase58(),
+    to: adminProgram.publicKey.toBase58(),
+    forwardSol,
+  });
+
+  const forwardTx = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: admin1.publicKey,
+      toPubkey: adminProgram.publicKey,
+      lamports: forwardLamports,
+    })
+  );
+
+  forwardTx.feePayer = admin1.publicKey;
+  forwardTx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  forwardTx.sign(admin1);
+
+  const sim2 = await connection.simulateTransaction(forwardTx);
+  if (sim2.value.err) {
+    console.error("❌ Forward Simulation Failed:", sim2.value.err);
+    console.log(sim2.value.logs);
+    throw new Error("Forward simulation error");
+  }
+
+  const sigForward = await connection.sendRawTransaction(
+    forwardTx.serialize()
+  );
+  await connection.confirmTransaction(sigForward, "confirmed");
+
+  console.log("🎉 Forward Success:", sigForward);
+
+  return {
+    withdrawSig: sig,
+    forwardSig: sigForward,
+    forwarded: true,
+  };
+}
+
+/**
+ * ============================================================
+ *   GATCHA AUTO WATCHER (REALTIME BROADCAST TANPA USER HIT)
+ * ============================================================
+ */
+const WATCH_INTERVAL = 4000; // 4 seconds
+
+async function runGatchaWatcher() {
+  try {
+    const packs = await GatchaPack.find({ priceSOL: { $gt: 0 } }).lean();
+
+    if (!lastGatchaPackSnapshot) {
+      // console.log("🆕 [WATCHER] Initial snapshot created");
+      lastGatchaPackSnapshot = packs;
+
+      console.log("📡 [WATCHER] First broadcast");
+      broadcast({
+        type: "gatcha_packs_update",
+        timestamp: Date.now(),
+        packs,
+      });
+      return;
+    }
+
+    const snapshotStr = JSON.stringify(lastGatchaPackSnapshot);
+    const newDataStr = JSON.stringify(packs);
+
+    if (snapshotStr !== newDataStr) {
+      console.log("🟡 [WATCHER] GatchaPack changed");
+
+      packs.forEach((newPack) => {
+        const oldPack = lastGatchaPackSnapshot!.find(
+          (p) => p._id.toString() === newPack._id.toString()
+        );
+
+        if (!oldPack) {
+          console.log(`🆕 [WATCHER] New pack added: ${newPack._id}`);
+          return;
+        }
+
+        const diff: any = {};
+        const newPackRec = newPack as unknown as Record<string, any>;
+        const oldPackRec = oldPack as unknown as Record<string, any>;
+
+        Object.keys(newPackRec).forEach((key) => {
+          if (JSON.stringify(newPackRec[key]) !== JSON.stringify(oldPackRec[key])) {
+            diff[key] = {
+              before: oldPackRec[key],
+              after: newPackRec[key],
+            };
+          }
+        });
+
+        if (Object.keys(diff).length > 0) {
+          console.log(`🔄 [WATCHER] Pack updated: ${newPack._id}`, diff);
+        }
+      });
+
+      lastGatchaPackSnapshot = packs;
+
+      console.log("📡 [WATCHER] Broadcast sent");
+      broadcast({
+        type: "gatcha_packs_update",
+        timestamp: Date.now(),
+        packs,
+      });
+    } else {
+      // console.log("⏸ [WATCHER] No changes → No broadcast");
+    }
+  } catch (err: any) {
+    console.error("❌ [WATCHER] Error:", err.message);
+  }
+}
+
+const agent = new https.Agent({
+  keepAlive: true,
+  rejectUnauthorized: false, // sementara false, bisa true setelah TLS OK
+});
+
+// ============================================================
+// 🔥 Ambil harga SOL dari market (SolanaTracker)
+// ============================================================
+async function getUsdPrice(mint: string): Promise<number> {
+  const url = `https://data.solanatracker.io/tokens/${mint}`;
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    "x-api-key": process.env.SOLANATRACKER_API_KEY || "d1df9e86-48aa-4875-bd20-b41bcad5c389",
+  };
+
+  const res = await fetch(url, { headers, agent }); // ⚡ gunakan https agent
+  if (!res.ok)
+    throw new Error(`Solana Tracker error ${res.status}: ${res.statusText}`);
+
+  const data = await res.json();
+  const pools = Array.isArray(data.pools) ? data.pools : [];
+  const top = pools.sort(
+    (a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+  )[0];
+
+  return top?.price?.usd ?? 0;
+}
+
+/* =======================================================================
+   END OF WATCHER — ROUTER BELOW STILL NORMAL / WORKS AS REST ENDPOINT
+======================================================================= */
+
+// ============================================================
+// 🔥 GET /gatcha-packs → override priceSOL dari priceUSD & harga SOL
+// ============================================================
+router.get("/", async (_req, res) => {
+  try {
+    const packs = await GatchaPack.find({ priceUSD: { $gt: 0 } })
+      .lean()
+      .sort({ createdAt: 1 });
+
+    const solPrice = await getUsdPrice("So11111111111111111111111111111111111111112");
+    const safeSolPrice = solPrice > 0 ? solPrice : 1;
+
+    const mapped = packs.map((p) => {
+      const usd = p.priceUSD ?? 0;
+
+      // pastikan selalu number
+      const solValue: number =
+        usd > 0 ? usd / safeSolPrice : p.priceSOL ?? 0;
+
+      return {
+        ...p,
+        priceSOL: Number(solValue.toFixed(6)),
+      };
+    });
+
+    res.json(mapped);
+  } catch (err: any) {
+    console.error("❌ Error fetching packs:", err);
+    res.status(500).json({ error: "Failed to fetch gatcha packs" });
+  }
+});
+
 /**
  * CREATE Gatcha Pack
  */
@@ -144,20 +477,6 @@ router.post("/", async (req, res) => {
   } catch (err: any) {
     console.error("❌ Error creating gatcha pack:", err.message);
     res.status(500).json({ error: "Failed to create gatcha pack" });
-  }
-});
-
-/**
- * GET all Gatcha Packs
- */
-router.get("/", async (_req, res) => {
-  try {
-    // ambil hanya packs dengan price > 0
-    const packs = await GatchaPack.find({ priceSOL: { $gt: 0 } });
-    res.json(packs);
-  } catch (err: any) {
-    console.error("❌ Error fetching gatcha packs:", err.message);
-    res.status(500).json({ error: "Failed to fetch gatcha packs" });
   }
 });
 
@@ -245,123 +564,121 @@ router.post("/pull", async (req, res) => {
 // Untuk demo custodian, ga perlu paymentMint
 router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res) => {
   try {
-    const { id: userId } = req.user;
-    const { id: packId } = req.params;
+    // const { id: userId } = req.body;
+    // const { id: packId } = req.params;
 
-    console.log("⚡ Custodian gatcha request:", { userId, packId });
+    // console.log("⚡ Custodian gatcha request:", { userId, packId });
 
-    // === Ambil user
-    const authUser = await Auth.findById(userId);
-    if (!authUser) return res.status(404).json({ error: "User not found" });
+    // // === Ambil user
+    // const authUser = await Auth.findById(userId);
+    // if (!authUser) return res.status(404).json({ error: "User not found" });
 
-    // === Ambil semua wallet user (hanya eksternal)
-    const allWallets = Array.isArray(authUser.wallets) ? authUser.wallets : [];
+    // // === Ambil semua wallet user (hanya eksternal)
+    // const allWallets = Array.isArray(authUser.wallets) ? authUser.wallets : [];
 
-    // === Cari wallet Solana
-    const custodian = allWallets.find(
-      (w: any) => w.provider === "phantom" || w.provider === "solana" || w.chain === "solana"
-    );
+    // // === Cari wallet Solana
+    // const custodian = allWallets.find(
+    //   (w: any) => w.provider === "phantom" || w.provider === "solana" || w.chain === "solana"
+    // );
 
-    // === Validasi wallet
-    if (!custodian) {
-      return res.status(400).json({ error: "No Solana wallet found in user account" });
-    }
+    // // === Validasi wallet
+    // if (!custodian) {
+    //   return res.status(400).json({ error: "No Solana wallet found in user account" });
+    // }
 
-    console.log("🪙 Using external Solana wallet:", custodian.address);
+    // console.log("🪙 Using external Solana wallet:", custodian.address);
 
-    // Ambil pack
-    const pack = await GatchaPack.findById(packId);
-    if (!pack) return res.status(404).json({ error: "Pack not found" });
+    // // Ambil pack
+    // const pack = await GatchaPack.findById(packId);
+    // if (!pack) return res.status(404).json({ error: "Pack not found" });
 
-    // Roll gatcha multi (0 NFT)
-    const rolls = await doMultiGatchaRolls(pack, custodian.address, 1);
+    // // Roll gatcha multi (0 NFT)
+    // const rolls = await doMultiGatchaRolls(pack, custodian.address, 0);
 
-    const processedResults = [];
+    // const processedResults = [];
 
-    for (let i = 0; i < rolls.length; i++) {
-      let { nft } = rolls[i];
+    // for (let i = 0; i < rolls.length; i++) {
+    //   let { nft } = rolls[i];
 
-      const mintKp = Keypair.generate();
-      const mintAddress = mintKp.publicKey.toBase58();
-      nft.mintAddress = mintAddress;
+    //   const mintKp = Keypair.generate();
+    //   const mintAddress = mintKp.publicKey.toBase58();
+    //   nft.mintAddress = mintAddress;
 
-      if (nft.character) nft = await nft.populate("character");
-      if (nft.rune) nft = await nft.populate("rune");
+    //   if (nft.character) nft = await nft.populate("character");
+    //   if (nft.rune) nft = await nft.populate("rune");
 
-      // === Generate nama & base_name
-      if (nft.character && (nft.character as any)._id) {
-        const charId = (nft.character as any)._id;
-        const charName = (nft.character as any).name;
-        const existingCount = await Nft.countDocuments({ character: charId });
-        nft.name = `${charName} #${existingCount + 1}`;
-        nft.base_name = charName;
-      } else if (nft.rune && (nft.rune as any)._id) {
-        const runeId = (nft.rune as any)._id;
-        const runeName = (nft.rune as any).name;
-        const existingCount = await Nft.countDocuments({ rune: runeId });
-        nft.name = `${runeName} #${existingCount + 1}`;
-        nft.base_name = runeName;
-      } else {
-        throw new Error("NFT tidak punya karakter atau rune");
-      }
+    //   // === Generate nama & base_name
+    //   if (nft.character && (nft.character as any)._id) {
+    //     const charId = (nft.character as any)._id;
+    //     const charName = (nft.character as any).name;
+    //     const existingCount = await Nft.countDocuments({ character: charId });
+    //     nft.name = `${charName} #${existingCount + 1}`;
+    //     nft.base_name = charName;
+    //   } else if (nft.rune && (nft.rune as any)._id) {
+    //     const runeId = (nft.rune as any)._id;
+    //     const runeName = (nft.rune as any).name;
+    //     const existingCount = await Nft.countDocuments({ rune: runeId });
+    //     nft.name = `${runeName} #${existingCount + 1}`;
+    //     nft.base_name = runeName;
+    //   } else {
+    //     throw new Error("NFT tidak punya karakter atau rune");
+    //   }
 
-      await nft.save();
+    //   await nft.save();
 
-      // === Metadata JSON dummy
-      const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
-      const outputDir = path.join(process.cwd(), baseDir);
-      if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+    //   // === Metadata JSON dummy
+    //   const baseDir = process.env.METADATA_DIR || "uploads/metadata/nft";
+    //   const outputDir = path.join(process.cwd(), baseDir);
+    //   if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-      const filePath = path.join(outputDir, `${mintAddress}.json`);
-      const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
-      if (!metadataResult.success) throw new Error(`Metadata generation failed: ${metadataResult.error}`);
+    //   const filePath = path.join(outputDir, `${mintAddress}.json`);
+    //   const metadataResult = await generateNftMetadata(mintAddress, outputDir, true);
+    //   if (!metadataResult.success) throw new Error(`Metadata generation failed: ${metadataResult.error}`);
 
-      processedResults.push({
-        nft,
-        blueprint: rolls[i].blueprint,
-        rewardInfo: rolls[i].rewardInfo,
-        mintAddress,
-        metadata: metadataResult.metadata,
-        filePath
-      });
-    }
+    //   processedResults.push({
+    //     nft,
+    //     blueprint: rolls[i].blueprint,
+    //     rewardInfo: rolls[i].rewardInfo,
+    //     mintAddress,
+    //     metadata: metadataResult.metadata,
+    //     filePath
+    //   });
+    // }
 
-    // === STEP 3: Apply Referral Reward (hanya sekali per transaksi)
-    console.log("🎁 Checking referral reward eligibility...");
-    const ownerUser = await Auth.findOne({
-      $or: [
-        { 'wallets.address': custodian.address },
-        { 'custodialWallets.address': custodian.address },
-      ],
-    });
+    // // === STEP 3: Apply Referral Reward (hanya sekali per transaksi)
+    // console.log("🎁 Checking referral reward eligibility...");
+    // const ownerUser = await Auth.findOne({
+    //   $or: [
+    //     { 'wallets.address': custodian.address },
+    //     { 'custodialWallets.address': custodian.address },
+    //   ],
+    // });
 
-    if (ownerUser) {
-      const totalAmount = (pack.priceSOL || 0); // bisa diganti total semua NFT jika multi
-      await applyReferralReward(
-        ownerUser._id,
-        totalAmount,
-        "So11111111111111111111111111111111111111112",
-        `CUSTODIAN_${Date.now()}`
-      );
-      console.log("💰 Referral reward applied successfully.");
-    } else {
-      console.log("⚠️ [Referral] Owner not found, skip reward.");
-    }
+    // if (ownerUser) {
+    //   const totalAmount = (pack.priceSOL || 0); // bisa diganti total semua NFT jika multi
+    //   await applyReferralReward(
+    //     ownerUser._id,
+    //     totalAmount,
+    //     "So11111111111111111111111111111111111111112",
+    //     `CUSTODIAN_${Date.now()}`
+    //   );
+    //   console.log("💰 Referral reward applied successfully.");
+    // } else {
+    //   console.log("⚠️ [Referral] Owner not found, skip reward.");
+    // }
 
-    // // TX dummy
-    const resultsWithTx = processedResults.map(r => ({
-      ...r,
-      tx: {
-        mintAddress: r.mintAddress,
-        txSignature: `DUMMY_${Date.now()}_${r.mintAddress.slice(0, 6)}`
-      }
-    }));
+    // // // TX dummy
+    // const resultsWithTx = processedResults.map(r => ({
+    //   ...r,
+    //   tx: {
+    //     mintAddress: r.mintAddress,
+    //     txSignature: `DUMMY_${Date.now()}_${r.mintAddress.slice(0, 6)}`
+    //   }
+    // }));
 
     res.json({
-      message: "🎲 Custodian gatcha success! (dummy mode)",
-      count: resultsWithTx.length,
-      results: resultsWithTx,
-      costs: { packPriceSol: pack.priceSOL || 0 }
+      success: true,
+      message: "No Rewards"
     });
   } catch (err: any) {
     console.error("❌ Custodian gatcha error:", err);
@@ -394,14 +711,14 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
     if (!isValidWallet) return res.status(403).json({ error: "Invalid wallet address" });
 
     // === Cegah double pull (masih ada mint pending)
-    const existingPending = await Nft.findOne({ owner: activeWallet, status: "pending" });
-    if (existingPending) {
-      console.log("🚫 Pending mint exists, skip new pull:", existingPending.mintAddress);
-      return res.status(400).json({
-        error: "You already have a pending mint. Please confirm it first.",
-        mintAddress: existingPending.mintAddress,
-      });
-    }
+    // const existingPending = await Nft.findOne({ owner: activeWallet, status: "pending" });
+    // if (existingPending) {
+    //   console.log("🚫 Pending mint exists, skip new pull:", existingPending.mintAddress);
+    //   return res.status(400).json({
+    //     error: "You already have a pending mint. Please confirm it first.",
+    //     mintAddress: existingPending.mintAddress,
+    //   });
+    // }
 
     console.log("🎁 Selected Pack:", {
       name: pack.name,
@@ -450,10 +767,12 @@ router.post("/:id/pull", authenticateJWT, async (req: AuthRequest, res) => {
         base_name: rune.name,
         description: rune.description || `${rune.name} — magical rune of power.`,
         image: rune.image || "https://api.universeofgamers.io/assets/placeholder.png",
-        hp: rune.hp || 1,
-        atk: rune.atk || 0,
-        def: rune.def || 0,
-        spd: rune.spd || 0,
+        hp: rune.hpBonus || 1,
+        atk: rune.atkBonus || 0,
+        def: rune.defBonus || 0,
+        spd: rune.spdBonus || 0,
+        critRate: rune.critRateBonus || 0,
+        critDmg: rune.critDmgBonus || 0,
       });
     } else {
       throw new Error("NFT not have character or rune");
@@ -686,6 +1005,24 @@ router.post("/:id/confirm", async (req, res) => {
       price: nft.price,
       paymentMint: nft.paymentMint,
     });
+
+    // =====================================================
+    // 🟣 Step X: Withdraw Prizepool (10% from NFT Price)
+    // =====================================================
+    try {
+      if (nft.price) {
+        const feeSol = nft.price * 0.10;
+        console.log(`💰 [Prizepool] Auto-withdraw triggered: ${feeSol} SOL`);
+
+        await withdrawPrizepoolAndForward(nft.price);
+
+        console.log(`✅ Prizepool withdraw forwarded successfully: ${feeSol} SOL`);
+      } else {
+        console.warn("⚠️ NFT price empty, skip prizepool withdraw.");
+      }
+    } catch (err: any) {
+      console.error("❌ Prizepool withdraw error:", err.message);
+    }
 
     res.json({
       message: "🎲 Gatcha success!",
@@ -1066,5 +1403,8 @@ router.post("/:id/confirm", async (req, res) => {
 //     res.status(500).json({ error: err.message });
 //   }
 // });
+
+setInterval(runGatchaWatcher, WATCH_INTERVAL);
+console.log(`⏳ Gatcha Watcher started (interval ${WATCH_INTERVAL}ms)`);
 
 export default router;

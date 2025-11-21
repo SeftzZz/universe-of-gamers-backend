@@ -2,8 +2,10 @@ import fetch from "node-fetch";
 
 import { broadcast } from "../index";
 import WalletToken from "../models/WalletToken";
+import prizePoolRoutes from "../routes/prizepool";
 import Redis from "ioredis";
 import { Client } from "@solana-tracker/data-api";
+import { Connection, PublicKey } from "@solana/web3.js";
 
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 
@@ -11,6 +13,7 @@ const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 const POLL_INTERVAL = 1 * 60 * 1000; // 1 menit
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_KEY}`;
 const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
+const connection = new Connection(HELIUS_RPC, "confirmed");
 
 // 🔹 Struktur token hasil RPC
 interface TokenBalance {
@@ -359,6 +362,69 @@ async function refreshWalletCache(address: string) {
 import EventEmitter from "events";
 export const walletEvents = new EventEmitter();
 
+// ---------------------------------------------------------
+// 🏆 PRIZEPOOL FETCHER
+// ---------------------------------------------------------
+async function getPrizePoolStatus() {
+  const cacheKey = "prizepool:status";
+  const cached = await redis.get(cacheKey);
+
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  try {
+    const treasuryPubkey = new PublicKey(process.env.TREASURY_PDA!);
+
+    const SOL_MINT = "So11111111111111111111111111111111111111112";
+    const UOG_MINT = process.env.UOG_MINT;
+
+    // 1️⃣ Balance
+    const lamports = await connection.getBalance(treasuryPubkey);
+    const balanceSOL = lamports / 1e9;
+
+    // 2️⃣ Tx history
+    const sigs = await connection.getSignaturesForAddress(
+      treasuryPubkey,
+      { limit: 1000 }
+    );
+
+    // 3️⃣ Prices
+    const priceKeySol = `price:${SOL_MINT}`;
+    const priceKeyUog = `price:${UOG_MINT}`;
+
+    let solUsd = Number(await redis.get(priceKeySol));
+    let uogUsd = Number(await redis.get(priceKeyUog));
+
+    // if price unavailable, force refresh
+    if (!solUsd || solUsd === 0) solUsd = 0;
+    if (!uogUsd || uogUsd === 0) uogUsd = 0;
+
+    const uogPerSol = solUsd && uogUsd ? solUsd / uogUsd : 0;
+    const valueUsd = balanceSOL * solUsd;
+
+    const result = {
+      prizepool_address: treasuryPubkey,
+      balance_SOL: balanceSOL,
+      balance_lamports: lamports,
+      value_usd: valueUsd,
+      sol_usd: solUsd,
+      uog_usd: uogUsd,
+      uog_per_sol: uogPerSol,
+      total_transactions: sigs.length,
+      timestamp: new Date().toISOString(),
+    };
+
+    // cache 1 menit
+    await redis.set(cacheKey, JSON.stringify(result), "EX", 60);
+
+    return result;
+  } catch (err: any) {
+    console.error("❌ PrizePool Error:", err.message);
+    return null;
+  }
+}
+
 // === Service utama ===
 async function startWalletStream() {
   console.log("💰 Starting Wallet Stream Service (polling hybrid, from WalletToken)...");
@@ -378,11 +444,14 @@ async function startWalletStream() {
       const balancePromises = wallets.map((address) => getWalletBalance(address));
       const allBalances = await Promise.all(balancePromises);
 
+      const prizepool = await getPrizePoolStatus();
+
       // 3️⃣ Kirim broadcast ke semua client
       broadcast({
         type: "wallet_balance_update",
         timestamp: new Date().toISOString(),
         data: allBalances,
+        prizepool: prizepool,
       });
 
       // 4️⃣ Update data di WalletToken collection

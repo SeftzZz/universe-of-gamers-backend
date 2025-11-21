@@ -4,18 +4,16 @@ import { IRune } from "./Rune";
 
 export interface INft extends Document {
   _id: any;
-  owner: string; // wallet address user
-  character?: Types.ObjectId | ICharacter; // ref ke Character blueprint
-  rune?: Types.ObjectId | IRune;           // ref ke Rune blueprint
+  owner: string;
+  character?: Types.ObjectId | ICharacter;
+  rune?: Types.ObjectId | IRune;
 
-  // metadata tambahan
   name: string;
   description: string;
   image: string;
   royalty?: number;
   base_name?: string;
 
-  // 🔥 address mint di blockchain (unik & wajib)
   mintAddress: string;
 
   level: number;
@@ -28,21 +26,22 @@ export interface INft extends Document {
   critRate: number;
   critDmg: number;
 
-  // ✅ sekarang equipped jadi array of rune NFT IDs
-  equipped: Types.ObjectId[]; // daftar rune NFT yang terpasang
+  equipped: Types.ObjectId[];
 
-  // 🔥 Status rune (kalau NFT ini adalah Rune)
-  isEquipped: boolean;                     // apakah rune ini sedang dipakai
-  equippedTo?: Types.ObjectId | INft | null; // ref ke NFT Character yang memakai rune
+  isEquipped: boolean;
+  equippedTo?: Types.ObjectId | INft | null;
 
   isSell: boolean;
   price?: number;
-  paymentSymbol: string, // ex: SOL, USDC, BONK, UOG
-  paymentMint: string,      // optional: mint address SPL token
+  paymentSymbol: string;
+  paymentMint: string;
 
   txSignature?: string;
 
   status: "pending" | "minted" | "failed";
+
+  trial: Date | null | undefined;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -51,7 +50,6 @@ const NftSchema = new Schema<INft>(
   {
     owner: { type: String, required: true },
 
-    // opsional: bisa karakter atau rune
     character: { type: Schema.Types.ObjectId, ref: "Character" },
     rune: { type: Schema.Types.ObjectId, ref: "Rune" },
 
@@ -61,20 +59,18 @@ const NftSchema = new Schema<INft>(
     royalty: { type: Number, default: 0 },
     base_name: { type: String, required: false },
 
-    // 🔥 wajib ada mintAddress (unik di blockchain)
     mintAddress: { type: String, required: true, unique: true },
 
     level: { type: Number, min: 1, default: 1 },
     exp: { type: Number, min: 0, default: 0 },
 
-    hp: { type: Number, min: 1, required: true },
+    hp: { type: Number, min: 0, required: true },
     atk: { type: Number, min: 0, required: true },
     def: { type: Number, min: 0, required: true },
     spd: { type: Number, min: 0, required: true },
     critRate: { type: Number, min: 0, max: 100, default: 0 },
-    critDmg: { type: Number, min: 0, max: 500, default: 0 },
+    critDmg: { type: Number, min: 0, max: 1000, default: 0 },
 
-    // ✅ ganti jadi array of rune NFT IDs
     equipped: [{ type: Schema.Types.ObjectId, ref: "Nft" }],
 
     isEquipped: { type: Boolean, default: false },
@@ -82,19 +78,36 @@ const NftSchema = new Schema<INft>(
 
     isSell: { type: Boolean, default: false },
     price: { type: Number, default: 0 },
-    paymentSymbol: { type: String, default: "SOL" }, // ex: SOL, USDC, BONK, UOG
-    paymentMint: { type: String, default: "" },      // optional: mint address SPL token
+    paymentSymbol: { type: String, default: "SOL" },
+    paymentMint: { type: String, default: "" },
 
     txSignature: { type: String },
 
-    // 🟩 STATUS baru: pending / minted / failed
     status: {
       type: String,
       enum: ["pending", "minted", "failed"],
       default: "pending",
     },
+
+    // 🆕 TRIAL: hanya berlaku kalau status = pending
+    trial: {
+      type: Date,
+      default: function (this: any) {
+        return this.status === "pending"
+          ? new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
+          : undefined;
+      }
+    },
   },
   { collection: "nfts", timestamps: true }
 );
+
+// 🔥 Auto-remove trial ketika status berubah menjadi "minted"
+NftSchema.pre("save", function (next) {
+  if (!this.isNew && this.isModified("status") && this.status === "minted") {
+    this.trial = undefined; // hapus field trial
+  }
+  next();
+});
 
 export const Nft = mongoose.model<INft>("Nft", NftSchema);

@@ -11,6 +11,7 @@ export interface IGatchaPack extends Document {
   description: string;
   priceUOG?: number;
   priceSOL?: number;
+  priceUSD?: number;           // 🔥 baru ditambahkan
   rewards: IReward[];
   createdAt: Date;
   updatedAt: Date;
@@ -20,7 +21,7 @@ const RewardSchema = new Schema<IReward>(
   {
     type: { type: String, enum: ["character", "rune"], required: true },
     rarity: { type: String, required: true },
-    chance: { type: Number, required: true, min: 0, max: 100 }
+    chance: { type: Number, required: true, min: 0, max: 100 },
   },
   { _id: false }
 );
@@ -31,11 +32,15 @@ const GatchaPackSchema = new Schema<IGatchaPack>(
     description: { type: String, default: "" },
     priceUOG: { type: Number, default: 0 },
     priceSOL: { type: Number, default: 0 },
+    priceUSD: { type: Number, default: 0 },   // 🔥 baru ditambahkan
     rewards: { type: [RewardSchema], required: true },
     createdAt: { type: Date, default: Date.now },
-    updatedAt: { type: Date, default: Date.now }
+    updatedAt: { type: Date, default: Date.now },
   },
   { collection: "gatcha_packs" }
 );
 
-export const GatchaPack = mongoose.model<IGatchaPack>("GatchaPack", GatchaPackSchema);
+export const GatchaPack = mongoose.model<IGatchaPack>(
+  "GatchaPack",
+  GatchaPackSchema
+);

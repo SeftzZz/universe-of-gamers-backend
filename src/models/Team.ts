@@ -2,9 +2,9 @@ import mongoose, { Schema, Document, Types } from "mongoose";
 import { INft } from "./Nft";
 
 export interface ITeam extends Document {
-  name: string;                // nama tim (optional, bisa diisi user)
-  owner: string;               // wallet address user (biar jelas siapa pemilik tim)
-  members: Types.ObjectId[];   // array NFT yang jadi anggota tim (harus 3)
+  name: string;
+  owner: string;
+  members: Types.ObjectId[];
   isActive: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -13,10 +13,10 @@ export interface ITeam extends Document {
 const TeamSchema = new Schema<ITeam>(
   {
     name: { type: String, required: true },
-    owner: { type: String, required: true }, // wallet address
+    owner: { type: String, required: true },
     members: {
       type: [{ type: Schema.Types.ObjectId, ref: "Nft" }],
-      default: [] // biar aman kalau belum ada member
+      default: []
     },
     isActive: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now },
@@ -25,7 +25,7 @@ const TeamSchema = new Schema<ITeam>(
   { collection: "teams" }
 );
 
-// ✅ Validasi jumlah anggota tim = 0 atau 3
+// ✅ Validasi jumlah anggota (0–3)
 TeamSchema.pre("save", function (next) {
   if (Array.isArray(this.members)) {
     const len = this.members.length;
@@ -34,6 +34,28 @@ TeamSchema.pre("save", function (next) {
     }
   }
   next();
+});
+
+// ✅ Validasi unik name + owner tanpa menyebabkan MongoDB E11000
+TeamSchema.pre("save", async function (next) {
+  try {
+    const Team = mongoose.models.Team;
+
+    const exists = await Team.findOne({
+      name: this.name,
+      owner: this.owner,
+      _id: { $ne: this._id } // agar update tetap bisa
+    });
+
+    if (exists) {
+      return next(new Error("You already have a team with this name."));
+    }
+
+    next();
+  } catch (err) {
+    console.error("❌ Team validation error:", (err as any).message);
+    next(new Error("Failed validating team uniqueness."));
+  }
 });
 
 export const Team = mongoose.model<ITeam>("Team", TeamSchema);

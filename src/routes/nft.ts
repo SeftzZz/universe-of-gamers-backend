@@ -58,6 +58,25 @@ import Redis from "ioredis";
 import pLimit from "p-limit";
 import { broadcast } from "../index";
 
+import { createUmi } from "@metaplex-foundation/umi-bundle-defaults";
+import { mplTokenMetadata, fetchDigitalAsset } from "@metaplex-foundation/mpl-token-metadata";
+
+async function loadMetadataFromPDA(connection: Connection, mint: string) {
+  try {
+    // kita tidak ambil metadata on-chain.
+    // cukup kembalikan mint saja (metadata akan diambil dari Mongo)
+    return {
+      mint,
+      name: null,
+      symbol: null,
+      uri: null,
+      sellerFeeBasisPoints: null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 interface MulterRequest extends Request {
   file?: Express.Multer.File;
 }
@@ -124,7 +143,7 @@ const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 const limit = pLimit(5);
 
 // TTL cache (dalam detik)
-const CACHE_TTL = 300; // 5 menit
+const CACHE_TTL = 60 * 1000; // 1 menit
 
 // TTL (detik)
 const TTL_METADATA = 86400; // 24 jam
@@ -397,26 +416,35 @@ async function enrichMintAddresses(
 
         let detectedMint: string | null = null;
 
-        // === Case 1: MintAndList ===
+        // === Case 1: MintAndList (100% accurate mint detection) ===
         if (item.eventType === "MintAndList") {
-          const hasInitMintLog = tx.meta.logMessages.some((l) =>
-            l.includes("Instruction: InitializeMint")
-          );
-          console.log(`🪙 MintAndList InitializeMint found: ${hasInitMintLog}`);
+          console.log("🪙 MintAndList → scanning parsed accounts for REAL mint");
 
-          if (hasInitMintLog) {
-            const mintCandidate = keys.find(
-              (k) =>
-                !walletAddresses.includes(k) &&
-                !k.startsWith("So111") &&
-                k !== "11111111111111111111111111111111"
-            );
-            console.log(`💡 Mint candidate from keys: ${mintCandidate}`);
-            if (mintCandidate) detectedMint = mintCandidate;
+          for (const key of keys) {
+            try {
+              const pk = new PublicKey(key);
+              const acc = await connection.getParsedAccountInfo(pk);
+
+              if (!acc.value) continue;
+
+              // hanya SPL token program
+              if (acc.value.owner.toBase58() !== "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                continue;
+
+              const info = (acc.value.data as any)?.parsed?.info;
+              if (!info) continue;
+
+              // REAL mint account: decimals === 0 AND no "owner" (owner only appears on token accounts)
+              if (info.decimals === 0 && !info.owner) {
+                detectedMint = key;
+                console.log("🎯 REAL MINT FOUND:", detectedMint);
+                break;
+              }
+
+            } catch (_) {}
           }
         }
 
-        // === Case 2: BuyNft ===
         // === Case 2: BuyNft (improved, non-guessing search) ===
         if (item.eventType === "BuyNft") {
           console.log(`🛒 Inspecting BuyNft transaction ${item.signature} (strict search)`);
@@ -593,7 +621,6 @@ async function enrichMintAddresses(
   console.log(`\n✅ Finished enrichment: ${enriched}/${results.length} updated`);
 }
 
-
 // ================================
 // 🧠 Fungsi pencarian model NFT
 // ================================
@@ -644,6 +671,62 @@ async function attachNftModel(results: any[]) {
 
   console.log(`✅ Model attached for ${found}/${results.length} entries`);
 }
+
+async function getUsdPrice(mint: string): Promise<number> {
+  const url = `https://data.solanatracker.io/tokens/${mint}`;
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    "x-api-key": process.env.SOLANATRACKER_API_KEY || "",
+  };
+
+  const res = await fetch(url, { headers });
+  if (!res.ok) return 0;
+
+  const data = await res.json();
+  const pools = Array.isArray(data.pools) ? data.pools : [];
+  const best = pools.sort(
+    (a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+  )[0];
+
+  return best?.price?.usd ?? 0;
+}
+
+// Route harga token by mint
+router.get("/price/:mint", async (req: Request, res: Response) => {
+  try {
+    const mint = req.params.mint;
+    const price = await getUsdPrice(mint);
+    res.json({ mint, priceUsd: price });
+  } catch (err) {
+    console.error("❌ Failed to fetch token price", err);
+    res.status(500).json({ error: "Failed to fetch token price" });
+  }
+});
+
+// Route rates SOL ↔ USDC dari SolanaTracker
+router.get("/rates", async (_req: Request, res: Response) => {
+  try {
+    // Mint address SOL & USDC di Solana
+    const SOL_MINT = "So11111111111111111111111111111111111111112";
+    const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    const solToUsd = await getUsdPrice(SOL_MINT);
+    const usdcToUsd = await getUsdPrice(USDC_MINT);
+
+    const solToUsdcRate = solToUsd / usdcToUsd;
+    const usdcToSolRate = 1 / solToUsdcRate;
+
+    res.json({
+      solToUsd,
+      usdcToUsd,
+      solToUsdcRate,
+      usdcToSolRate,
+    });
+  } catch (err) {
+    console.error("❌ Failed to fetch SolanaTracker rates", err);
+    res.status(500).json({ error: "Failed to fetch SolanaTracker rates" });
+  }
+});
 
 router.post("/", async (req: Request, res: Response) => {
   try {
@@ -737,26 +820,33 @@ router.get("/my-nfts", authenticateJWT, async (req: AuthRequest, res) => {
   const userId = req.user.id;
   const cacheKey = `my-nfts:${userId}`;
 
+  // 🟣 Wallet special yang boleh melihat pending NFT
+  const SPECIAL_OWNERS = [
+    "2N1jWWZrhpQL1c2MkBJ5WsnE9UnsPEuud8fEspTRouHz",
+    "EMc9sS4NV9e7fHdP8RyQzvZiBgskcfXkt6HkLB3v8QqC",
+    "77wvMmB1vyDFsr77S4KWJkZDzoUN3c4XDxfL3f5NbDys",
+    "FfV1kmfGmf3dLxpEmZzMs14QNtcnyms2Rbvs9hPXjfW5"
+  ];
+
   try {
     console.time("⏱ my-nfts-total");
     console.log(`\n🚀 Fetching /my-nfts for user: ${userId}`);
 
     const forceRefresh = req.query.force === "true";
 
-    // 1️⃣ Cek Redis cache (jangan ubah struktur respon)
+    // 1️⃣ Redis cache
     if (!forceRefresh) {
       const cached = await redis.get(cacheKey);
       if (cached) {
-        const parsed = JSON.parse(cached);
         console.log(`⚡ [Redis] Returning cached NFTs for user ${userId}`);
         console.timeEnd("⏱ my-nfts-total");
-        return res.json(parsed); // <== struktur sama seperti hasil Nft.find()
+        return res.json(JSON.parse(cached));
       }
     } else {
       console.log("♻️ Force refresh cache for /my-nfts");
     }
 
-    // 2️⃣ Ambil data wallet user
+    // 2️⃣ Ambil wallet user
     const user = await Auth.findById(userId).select("wallets custodialWallets");
     if (!user) {
       return res.status(401).json({ error: "User not found" });
@@ -767,34 +857,43 @@ router.get("/my-nfts", authenticateJWT, async (req: AuthRequest, res) => {
       ...user.custodialWallets.map((c) => c.address),
     ];
 
-    if (walletAddresses.length === 0) {
-      return res.json([]);
-    }
+    if (walletAddresses.length === 0) return res.json([]);
+
+    // 🟣 Tentukan apakah user adalah special owner
+    const isSpecialOwner = walletAddresses.some((addr) =>
+      SPECIAL_OWNERS.includes(addr)
+    );
 
     // 3️⃣ Query NFT dari database
     console.time("⏱ DB-find");
-    const nfts = await Nft.find({
-      owner: { $in: walletAddresses },
-      // txSignature: { $exists: true, $ne: "" },
-    })
+
+    // 🔥 Query berbeda untuk special owner vs user biasa
+    let query: any = {
+      owner: { $in: walletAddresses }
+    };
+
+    if (!isSpecialOwner) {
+      // User biasa → hanya nft minted
+      query.status = "minted";
+    }
+
+    const nfts = await Nft.find(query)
       .populate("character", "name rarity element")
       .populate("rune", "name rarity")
       .sort({ updatedAt: -1 })
       .lean();
+
     console.timeEnd("⏱ DB-find");
 
-    console.log(`📦 Found ${nfts.length} NFTs owned by user ${userId}`);
-
-    // 4️⃣ Simpan hasil ke Redis (cache raw data, tanpa ubah struktur)
-    await redis.set(
-      cacheKey,
-      JSON.stringify(nfts),
-      "EX",
-      MYNFT_CACHE_TTL
+    console.log(
+      `📦 Found ${nfts.length} NFTs owned by user ${userId} (special=${isSpecialOwner})`
     );
+
+    // 4️⃣ Save Redis cache
+    await redis.set(cacheKey, JSON.stringify(nfts), "EX", MYNFT_CACHE_TTL);
     console.log(`💾 [Redis] Cached ${nfts.length} NFTs for user ${userId}`);
 
-    // 5️⃣ Return hasil asli (tanpa ubah struktur JSON)
+    // 5️⃣ Return tanpa modifikasi struktur
     res.json(nfts);
 
     console.timeEnd("⏱ my-nfts-total");
@@ -1665,26 +1764,13 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res: Respons
     }
     console.log(`👛 Wallets: ${walletAddresses.join(", ")}`);
 
-    // === 2️⃣ Cek Redis cache ===
-    const cacheKey = `my-history:${userId}:${walletQuery || "default"}`;
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      const ageSec = (Date.now() - new Date(parsed.timestamp).getTime()) / 1000;
-      if (ageSec < CACHE_TTL) {
-        console.log(`⚡ [Redis] Returning cached /my-history for user ${userId} (${ageSec.toFixed(1)}s old)`);
-        console.timeEnd("⏱ my-history-total");
-        return res.json({ ...parsed.data, cached: true, source: "redis-cache" });
-      }
-    }
-
-    // === 3️⃣ Setup connection ===
+    // === 2️⃣ Setup connection ===
     const connection = new Connection(process.env.SOLANA_CLUSTER as string, "confirmed");
     const programId = new PublicKey(process.env.PROGRAM_ID!);
     const results: any[] = [];
     const signatures: any[] = [];
 
-    // === 4️⃣ Ambil signatures ===
+    // === 3️⃣ Ambil signatures ===
     console.time("⏱ FetchSignatures");
     for (const address of walletAddresses) {
       const walletPk = new PublicKey(address);
@@ -1694,7 +1780,7 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res: Respons
     console.timeEnd("⏱ FetchSignatures");
     console.log(`🧮 Total signatures: ${signatures.length}`);
 
-    // === 5️⃣ Filter transaksi MintAndList / BuyNft ===
+    // === 4️⃣ Filter transaksi MintAndList / BuyNft ===
     console.time("⏱ FilterTransactions");
     await Promise.all(
       signatures.map((sig) =>
@@ -1715,6 +1801,7 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res: Respons
 
             const accountKeys = tx.transaction.message.getAccountKeys().staticAccountKeys;
             const walletIndex = accountKeys.findIndex((k) => k.toBase58() === sig.wallet);
+
             let amountFrom = null;
             let amountTo = null;
 
@@ -1745,35 +1832,27 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res: Respons
     console.timeEnd("⏱ FilterTransactions");
     console.log(`📊 Filtered ${results.length} MintAndList/BuyNft transactions`);
 
-    // === 6️⃣ Enrich mint addresses ===
+    // === 5️⃣ Enrich mint addresses ===
     console.time("⏱ EnrichMint");
     await enrichMintAddresses(results, connection, programId, walletAddresses);
     console.timeEnd("⏱ EnrichMint");
 
-    // === 7️⃣ Attach NFT model data ===
+    // === 6️⃣ Attach NFT model ===
     console.time("⏱ AttachModels");
     await attachNftModel(results);
     console.timeEnd("⏱ AttachModels");
 
-    // === 8️⃣ Final data
+    // === 7️⃣ Final response
     const responseData = {
       cached: false,
       totalWallets: walletAddresses.length,
       totalSignatures: signatures.length,
       totalFromProgram: results.length,
       history: results,
+      source: "onchain",
     };
 
-    // === 9️⃣ Simpan ke Redis ===
-    await redis.set(
-      cacheKey,
-      JSON.stringify({ timestamp: new Date().toISOString(), data: responseData }),
-      "EX",
-      CACHE_TTL
-    );
-    console.log(`💾 [Redis] Cached /my-history for user ${userId}`);
-
-    // === 🔔 Broadcast ke socket client
+    // 🔔 Broadcast real-time
     broadcast({
       type: "history-update",
       userId,
@@ -1783,7 +1862,9 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res: Respons
 
     console.timeEnd("⏱ my-history-total");
     console.log(`✅ Returning ${results.length} entries\n`);
-    return res.json({ ...responseData, source: "onchain" });
+
+    return res.json(responseData);
+
   } catch (err: any) {
     console.error("❌ my-history error:", err);
     console.timeEnd("⏱ my-history-total");
@@ -1794,8 +1875,8 @@ router.get("/my-history", authenticateJWT, async (req: AuthRequest, res: Respons
 // GET /nft/top-creators
 router.get("/top-creators", async (req, res) => {
   try {
-    // ambil semua NFT dari DB (tidak hanya isSell)
-    const nfts = await Nft.find({}).select("owner");
+    // ambil semua NFT minted dari DB
+    const nfts = await Nft.find({ status: "minted" }).select("owner");
 
     if (!nfts || nfts.length === 0) {
       return res.json([]);
@@ -1808,7 +1889,7 @@ router.get("/top-creators", async (req, res) => {
       ownerMap[nft.owner] = (ownerMap[nft.owner] || 0) + 1;
     });
 
-    // ambil semua user (hanya name + avatar + addresses)
+    // ambil semua user (name + avatar + wallets)
     const users = await Auth.find({})
       .select("name avatar wallets.address custodialWallets.address")
       .lean();
@@ -1817,8 +1898,8 @@ router.get("/top-creators", async (req, res) => {
     const creators = Object.entries(ownerMap).map(([owner, count]) => {
       const user = users.find(
         (u: any) =>
-          (u.wallets?.some((w: any) => w.address === owner) ||
-            u.custodialWallets?.some((c: any) => c.address === owner))
+          u.wallets?.some((w: any) => w.address === owner) ||
+          u.custodialWallets?.some((c: any) => c.address === owner)
       );
 
       return {
@@ -1833,8 +1914,10 @@ router.get("/top-creators", async (req, res) => {
       };
     });
 
-    // urutkan dari terbanyak & ambil top 5
-    const topCreators = creators.sort((a, b) => b.count - a.count).slice(0, 5);
+    // urutkan dari terbanyak → ambil top 5
+    const topCreators = creators
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
 
     return res.json(topCreators);
   } catch (err: any) {

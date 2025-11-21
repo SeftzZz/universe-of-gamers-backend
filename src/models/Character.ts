@@ -36,7 +36,7 @@ const CharacterSchema = new Schema<ICharacter>(
       default: "Common" 
     }, // 🔥 NEW FIELD
 
-    baseHp: { type: Number, min: 1, required: true },
+    baseHp: { type: Number, min: 0, required: true },
     baseAtk: { type: Number, min: 0, required: true },
     baseDef: { type: Number, min: 0, required: true },
     baseSpd: { type: Number, min: 0, required: true },
