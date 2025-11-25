@@ -36,7 +36,8 @@ import {
   MINT_SIZE,
   createInitializeMintInstruction,
   createInitializeAccountInstruction,
-  getAssociatedTokenAddressSync
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction
 } from "@solana/spl-token";
 import { TokenListProvider, ENV as ChainId } from "@solana/spl-token-registry";
 import * as anchor from "@project-serum/anchor";
@@ -56,7 +57,11 @@ import { Rune } from "../models/Rune";
 import { Team } from "../models/Team";
 import { Player } from "../models/Player";
 import { Referral } from "../models/Referral";
+import { Tournament } from "../models/Tournament";
+import { TournamentParticipant } from "../models/TournamentParticipant";
 import { authenticateJWT, requireAdmin, AuthRequest, optionalAuth } from "../middleware/auth";
+import mongoose from "mongoose";
+
 import { encrypt, decrypt } from '../utils/cryptoHelper';
 import {
   createMetadataAccountV3,
@@ -481,7 +486,7 @@ router.post('/google', async (req, res) => {
     // =======================================================
     if (!auth) {
       console.log('🆕 Creating new Google user...');
-      const avatarUrl = picture || `/uploads/avatars/default.png`;
+      const avatarUrl = `/uploads/avatars/default.png`;
 
       auth = new Auth({
         name,
@@ -703,9 +708,37 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    // =====================================================
-    // 🚫 Validasi wallet duplikat (tidak boleh dipakai user lain)
-    // =====================================================
+    /* =====================================================
+       🚫 HARD BLOCK: If user has email login (JWT) and 
+          already has a wallet → reject linking new wallet
+       ===================================================== */
+    if (req.user?.id) {
+      const userRecord = await Auth.findById(req.user.id);
+
+      if (userRecord) {
+        const allWallets = [
+          ...(userRecord.wallets || []),
+          ...(userRecord.custodialWallets || [])
+        ];
+
+        if (allWallets.length > 0) {
+          // user has existing wallets
+          const alreadyHasThisWallet = allWallets.some(w => w.address === address);
+
+          if (!alreadyHasThisWallet) {
+            console.warn(`🚫 Email ${userRecord.email} already linked to wallet(s), cannot add wallet ${address}`);
+            return res.status(400).json({
+              success: false,
+              error: "This email already has a wallet linked. You cannot login with a different wallet.",
+            });
+          }
+        }
+      }
+    }
+
+    /* =====================================================
+       🚫 Validasi wallet duplikat (wallet dipakai user lain)
+       ===================================================== */
     const existingWalletUser = await Auth.findOne({
       $or: [
         { 'wallets.address': address },
@@ -722,9 +755,9 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
       });
     }
 
-    // =====================================================
-    // 🧩 Step 1. Cek JWT user (kalau ada)
-    // =====================================================
+    /* =====================================================
+       🧩 Step 1. Cek JWT user (kalau ada)
+       ===================================================== */
     let auth = null;
     console.log('👤 [JWT User Check] req.user =', req.user);
 
@@ -747,9 +780,9 @@ router.post('/wallet', optionalAuth, async (req: AuthRequest, res) => {
       console.log('⚠️ No JWT found in request — will try to match by wallet');
     }
 
-    // =====================================================
-    // 🧩 Step 2. Kalau belum login, cari berdasarkan wallet
-    // =====================================================
+    /* =====================================================
+       🧩 Step 2. Kalau belum login, cari berdasarkan wallet
+       ===================================================== */
     if (!auth) {
       console.log('🔍 [Wallet Check] Finding existing user with wallet:', address);
       auth = await Auth.findOne({
@@ -2283,6 +2316,388 @@ router.get("/program-info", async (req, res) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* ============================================================
+   🪙 PAY TOURNAMENT (GENERATE UNSIGNED TX FOR PHANTOM)
+============================================================ */
+router.post("/tournament/:id/pay", authenticateJWT, async (req: AuthRequest, res) => {
+  try {
+    const { id: tournamentId } = req.params;
+    const { id: userId } = req.user;
+
+    let { paymentMint, price } = req.body;
+
+    console.log("🎮 Tournament payment request:", { tournamentId, paymentMint, price });
+
+    /* -------------------------------------------------------------
+       1️⃣ VALIDASI USER
+    ------------------------------------------------------------- */
+    const authUser = await Auth.findById(userId);
+    if (!authUser) return res.status(404).json({ error: "User not found" });
+
+    const solWallet =
+      authUser.custodialWallets?.find((w) => w.provider === "solana") ||
+      authUser.wallets?.find((w) => w.provider === "phantom");
+
+    if (!solWallet)
+      return res.status(400).json({ error: "No Solana/Phantom wallet found" });
+
+    const senderPk = new PublicKey(solWallet.address);
+
+    /* -------------------------------------------------------------
+       2️⃣ LOAD TOURNAMENT + PACK
+    ------------------------------------------------------------- */
+    const tournament = await Tournament.findById(tournamentId).populate("pack");
+    if (!tournament) return res.status(404).json({ error: "Tournament not found" });
+
+    const pack: any = tournament.pack;
+
+    /* -------------------------------------------------------------
+       3️⃣ SETUP ANCHOR
+    ------------------------------------------------------------- */
+    const rpcUrl = process.env.SOLANA_CLUSTER!;
+    const connection = new anchor.web3.Connection(rpcUrl, "confirmed");
+    const provider = new anchor.AnchorProvider(connection, {} as any, {
+      commitment: "confirmed",
+    });
+    anchor.setProvider(provider);
+
+    const idl = require("../../public/idl/universe_of_gamers.json");
+    const programId = new PublicKey(process.env.PROGRAM_ID!);
+    const program = new anchor.Program(idl, programId, provider);
+
+    const [marketConfigPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("market_config")],
+      program.programId
+    );
+    /* -------------------------------------------------------------
+       4️⃣ PDA TREASURY
+    ------------------------------------------------------------- */
+    const [treasuryPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("treasury")],
+      program.programId
+    );
+
+    // -------------------------------------------------------------
+    // 🛑 FIX: Jika mint SOL salah, perbaiki otomatis
+    // -------------------------------------------------------------
+    if (paymentMint === "So11111111111111111111111111111111111111111") {
+      console.warn("⚠️ Invalid SOL mint received, auto-correcting.");
+      paymentMint = "So11111111111111111111111111111111111111112";
+    }
+
+    /* -------------------------------------------------------------
+       5️⃣ ATA (Sender, Treasury)
+    ------------------------------------------------------------- */
+    const mintPk = new PublicKey(paymentMint);
+
+    const senderTokenAta = getAssociatedTokenAddressSync(mintPk, senderPk);
+
+    const treasuryTokenAta = getAssociatedTokenAddressSync(
+      mintPk,
+      treasuryPda,
+      true
+    );
+
+    /* -------------------------------------------------------------
+       6️⃣ CONVERT HUMAN PRICE → BASE UNITS
+    ------------------------------------------------------------- */
+    const NATIVE_SOL = "So11111111111111111111111111111111111111112";
+    const isSol = paymentMint === NATIVE_SOL;
+    const decimals = isSol ? 9 : 6;
+
+    const baseUnits = Math.floor(price * 10 ** decimals);
+    const amountBN = new anchor.BN(baseUnits);
+
+    console.log("💰 Payment:", {
+      price,
+      baseUnits,
+      bn: amountBN.toString(),
+      symbol: isSol ? "SOL" : "SPL",
+    });
+
+    /* -------------------------------------------------------------
+       7️⃣ BUILD TRANSACTION
+    ------------------------------------------------------------- */
+    const blockhash = (await connection.getLatestBlockhash()).blockhash;
+
+    const tx = new Transaction({
+      recentBlockhash: blockhash,
+      feePayer: senderPk,
+    });
+
+    /* -------------------------------------------------------------
+       🟦 IF SOL — USE PROGRAM SEND_TOKEN (NO ATA)
+    ------------------------------------------------------------- */
+    if (isSol) {
+      console.log("💎 Building native SOL send_token() TX...");
+
+      // === W SOL ATA ===
+      const W_SOL = new PublicKey("So11111111111111111111111111111111111111112");
+      const senderWSolAta = getAssociatedTokenAddressSync(W_SOL, senderPk);
+
+      // Create wSOL ATA if does not exist
+      if (!(await connection.getAccountInfo(senderWSolAta))) {
+        tx.add(
+          createAssociatedTokenAccountIdempotentInstruction(
+            senderPk,
+            senderWSolAta,
+            senderPk,
+            W_SOL
+          )
+        );
+      }
+
+      // Treasury wSOL ATA
+      const treasuryWSolAta = getAssociatedTokenAddressSync(W_SOL, treasuryPda, true);
+
+      if (!(await connection.getAccountInfo(treasuryWSolAta))) {
+        tx.add(
+          createAssociatedTokenAccountIdempotentInstruction(
+            senderPk,
+            treasuryWSolAta,
+            treasuryPda,
+            W_SOL
+          )
+        );
+      }
+
+      // === CALL send_token() with VALID mutable accounts ===
+      const ix = await program.methods
+        .sendToken(amountBN)
+        .accounts({
+          sender: senderPk,
+          recipient: treasuryPda,
+          treasuryPda,
+          mint: W_SOL,
+          senderTokenAccount: senderWSolAta,
+          recipientTokenAccount: treasuryWSolAta,
+          treasuryTokenAccount: treasuryWSolAta,
+          marketConfig: marketConfigPda,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .instruction();
+
+      tx.add(ix);
+
+      const serialized = tx.serialize({ requireAllSignatures: false });
+      return res.json({
+        success: true,
+        transaction: serialized.toString("base64"),
+        amount: price,
+        paymentMint,
+        type: "SOL",
+      });
+    }
+
+    /* -------------------------------------------------------------
+       🟩 SPL TOKEN — ATA + send_token()
+    ------------------------------------------------------------- */
+
+    // Create sender ATA if missing
+    if (!(await connection.getAccountInfo(senderTokenAta))) {
+      tx.add(
+        createAssociatedTokenAccountIdempotentInstruction(
+          senderPk,
+          senderTokenAta,
+          senderPk,
+          mintPk
+        )
+      );
+    }
+
+    // Create treasury ATA if missing
+    if (!(await connection.getAccountInfo(treasuryTokenAta))) {
+      tx.add(
+        createAssociatedTokenAccountIdempotentInstruction(
+          senderPk,
+          treasuryTokenAta,
+          treasuryPda,
+          mintPk
+        )
+      );
+    }
+
+    /* -------------------------------------------------------------
+       8️⃣ SPL: BUILD INSTRUCTION send_token()
+    ------------------------------------------------------------- */
+    const ix = await program.methods
+      .sendToken(amountBN)
+      .accounts({
+        sender: senderPk,
+        recipient: treasuryPda,
+        treasuryPda,
+        mint: mintPk,
+        senderTokenAccount: senderTokenAta,
+        recipientTokenAccount: treasuryTokenAta,
+        treasuryTokenAccount: treasuryTokenAta,
+        marketConfig: marketConfigPda,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+
+    tx.add(ix);
+
+    /* -------------------------------------------------------------
+       9️⃣ SERIALIZE → FRONTEND SIGN
+    ------------------------------------------------------------- */
+    const serialized = tx.serialize({ requireAllSignatures: false });
+    const base64Tx = serialized.toString("base64");
+
+    console.log("✅ Tournament payment TX ready");
+
+    return res.json({
+      success: true,
+      transaction: base64Tx,
+      amount: price,
+      paymentMint,
+    });
+  } catch (err: any) {
+    console.error("❌ Payment Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ============================================================
+   🪙 CONFIRM PAYMENT
+============================================================ */
+router.post("/tournament/:id/confirm", async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { 
+      signedTx, 
+      walletAddress, 
+      teamId, 
+      characters,  
+      runes       
+    } = req.body;
+
+    const tournamentId = req.params.id;
+
+    console.log("\n==============================");
+    console.log("🎯 TOURNAMENT FULL CONFIRM FLOW (ACID MODE)");
+    console.log("==============================");
+
+    // -----------------------------------
+    // 0️⃣ VALIDATION
+    // -----------------------------------
+    if (!signedTx) throw new Error("Missing signedTx");
+    if (!walletAddress) throw new Error("Missing walletAddress");
+    if (!teamId) throw new Error("Missing teamId");
+    if (!characters?.length) throw new Error("Missing characters");
+
+    // -----------------------------------
+    // 1️⃣ CONFIRM PAYMENT ON SOLANA
+    // -----------------------------------
+    console.log("\n🔧 Decoding tx...");
+    const tx = Transaction.from(bs58.decode(signedTx));
+
+    const connection = new Connection(process.env.SOLANA_CLUSTER!, "confirmed");
+    console.log("📡 Broadcasting transaction...");
+
+    const signature = await connection.sendRawTransaction(tx.serialize());
+    console.log("🔗 Payment TX Signature:", signature);
+
+    console.log("⏳ Waiting confirmation...");
+    await connection.confirmTransaction(signature, "confirmed");
+
+    console.log("💰 PAYMENT SUCCESSFUL\n");
+
+    // =====================================================
+    // START DATABASE ATOMIC TRANSACTION (SESSION)
+    // =====================================================
+
+    console.log("🪄 Updating NFT rune loadout...");
+
+    // -----------------------------------
+    // 2️⃣ EQUIP RUNES ON EACH NFT
+    // -----------------------------------
+    for (const nftId of characters) {
+      const runeList = runes[nftId] || [];
+
+      console.log(`➡ NFT ${nftId} → equip ${runeList.length} runes`);
+
+      await Nft.updateOne(
+        { _id: nftId },
+        { $set: { equipped: runeList } },
+        { session }
+      );
+    }
+
+    console.log("🎉 NFT rune loadout updated\n");
+
+    // -----------------------------------
+    // 3️⃣ UPDATE TEAM MEMBERS
+    // -----------------------------------
+    console.log("👥 Updating team...");
+
+    const team = await Team.findById(teamId).session(session);
+
+    if (!team) throw new Error("Team not found");
+
+    team.members = characters;
+    await team.save({ session });
+
+    console.log("✅ Team updated:", team._id);
+
+    // -----------------------------------
+    // 4️⃣ INSERT TOURNAMENT PARTICIPANT
+    // -----------------------------------
+    console.log("\n🎯 Checking existing participant...");
+
+    const existing = await TournamentParticipant.findOne({
+      tournamentId,
+      walletAddress,
+    }).session(session);
+
+    if (!existing) {
+      console.log("🆕 Creating participant...");
+
+      await TournamentParticipant.create(
+        [{
+          tournamentId,
+          walletAddress,
+          team: teamId
+        }],
+        { session }
+      );
+    } else {
+      console.log("⚠️ Already exists:", existing._id);
+    }
+
+    console.log("🏆 TOURNAMENT JOIN SUCCESS\n");
+
+    // =====================================================
+    // COMMIT ALL CHANGES — ATOMIC SUCCESS
+    // =====================================================
+    await session.commitTransaction();
+    session.endSession();
+
+    return res.json({
+      success: true,
+      txSignature: signature,
+      joined: true
+    });
+
+  } catch (err: any) {
+    // =====================================================
+    // ROLLBACK ON ERROR
+    // =====================================================
+    await session.abortTransaction();
+    session.endSession();
+
+    console.log("\n==============================");
+    console.log("❌ FULL TOURNAMENT CONFIRM ERROR (ROLLBACK)");
+    console.log("==============================");
+    console.error(err);
+
+    return res.status(500).json({ error: err.message });
   }
 });
 

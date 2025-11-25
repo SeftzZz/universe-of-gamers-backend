@@ -278,6 +278,104 @@ async function verifyNftIntegrity(nft: any): Promise<void> {
   console.log("──────────────────────────────────────────────");
 }
 
+// ============================================================
+// ⭐ TEAM POWER CALCULATOR (Based on Final Stats)
+// ============================================================
+// ============================================================
+// ⚔️ NFT POWER CALCULATOR (Full: Base + NFT + Rune + Rarity)
+// ============================================================
+async function calculateNftPower(nft: any): Promise<number> {
+  if (!nft) return 0;
+
+  // 1️⃣ Load NFT + Character + Runes
+  const original = await Nft.findOne({ mintAddress: nft.mintAddress })
+    .populate({
+      path: "character",
+      model: "Character",
+      select: "rarity baseHp baseAtk baseDef baseSpd baseCritRate baseCritDmg"
+    })
+    .populate({
+      path: "equipped",
+      populate: { path: "rune", model: "Rune" }
+    });
+
+  if (!original) return 0;
+
+  const char = original.character;
+
+  // FIX TypeScript type
+  if (!char || typeof char !== "object" || !("baseHp" in char)) {
+    console.error("❌ Invalid character blueprint");
+    return 0;
+  }
+
+  const character = char as any;
+
+  // 2️⃣ Final stats: base + upgrade
+  let finalHp = character.baseHp + (nft.hp ?? 0);
+  let finalAtk = character.baseAtk + (nft.atk ?? 0);
+  let finalDef = character.baseDef + (nft.def ?? 0);
+  let finalSpd = character.baseSpd + (nft.spd ?? 0);
+  let finalCritRate = character.baseCritRate + (nft.critRate ?? 0);
+  let finalCritDmg = character.baseCritDmg + (nft.critDmg ?? 0);
+
+  // 3️⃣ Bonus dari rune
+  for (const equip of original.equipped || []) {
+    const rune = (equip as any)?.rune;
+    if (!rune) continue;
+
+    finalHp += rune.hpBonus ?? 0;
+    finalAtk += rune.atkBonus ?? 0;
+    finalDef += rune.defBonus ?? 0;
+    finalSpd += rune.spdBonus ?? 0;
+    finalCritRate += rune.critRateBonus ?? 0;
+    finalCritDmg += rune.critDmgBonus ?? 0;
+  }
+
+  // 4️⃣ Ambil teamValue berdasarkan rarity + level
+  const rarityCfg = await HeroConfig.findOne({
+    rarity: character.rarity.toLowerCase(),
+  });
+
+  // Level NFT -> pastikan TS menganggap hanya 1|2|3
+  const level = (nft.level ?? 1) as 1 | 2 | 3;
+
+  // Fix TS7053
+  const rarityValue = rarityCfg?.teamValue?.[level] ?? 0;
+
+
+  // 5️⃣ Rumus Power resmi: 
+  // totalStats + rarityValue
+  const totalStats =
+    finalHp +
+    finalAtk +
+    finalDef +
+    finalSpd +
+    finalCritRate +
+    finalCritDmg;
+
+  const finalPower = Math.round(totalStats + rarityValue);
+
+  console.log("───────────────────────────────");
+  console.log(`⚔️ NEW NFT Power (with teamValue): ${nft.name}`);
+  console.log({
+    finalHp,
+    finalAtk,
+    finalDef,
+    finalSpd,
+    finalCritRate,
+    finalCritDmg,
+    rarity: character.rarity,
+    level,
+    rarityValue,
+    totalStats,
+    finalPower
+  });
+  console.log("───────────────────────────────");
+
+  return finalPower;
+}
+
 // =====================================================
 // 🎮 API ROUTES
 // =====================================================
@@ -727,7 +825,8 @@ export {
   getRankModifier,
   saveDailyEarning,
   verifyNftIntegrity,
-  calculateEconomicFragment
+  calculateEconomicFragment,
+  calculateNftPower
 };
 
 export default router;

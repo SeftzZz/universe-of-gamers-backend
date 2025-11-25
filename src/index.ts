@@ -43,6 +43,11 @@ import battleRoutes, {
   verifyNftIntegrity
 } from "./routes/battle";
 
+import { TournamentPack } from "./models/TournamentPack";
+import { Tournament } from "./models/Tournament";
+import { TournamentParticipant } from "./models/TournamentParticipant";
+import { TournamentMatch } from "./models/TournamentMatch";
+
 import battleSimulateRouter from "./routes/battleSimulate";
 
 import mongoose from "mongoose";
@@ -186,6 +191,60 @@ const upload = multer({
     cb(null, true);
   },
 });
+
+async function autoGenerateNextPhase(tournament: any, nextPhase: any) {
+  console.log("⚙️ Auto-generating next phase:", nextPhase);
+
+  const winners = await TournamentParticipant.find({
+    tournamentId: tournament._id,
+    eliminated: false
+  });
+
+  if (winners.length < 2) return;
+
+  if (nextPhase === "semi") {
+    // generate 2 matches
+    await TournamentMatch.create({
+      tournamentId: tournament._id,
+      phase: "semi",
+      player1: winners[0].walletAddress,
+      player2: winners[1].walletAddress,
+      team1: winners[0].team,
+      team2: winners[1].team
+    });
+
+    await TournamentMatch.create({
+      tournamentId: tournament._id,
+      phase: "semi",
+      player1: winners[2].walletAddress,
+      player2: winners[3].walletAddress,
+      team1: winners[2].team,
+      team2: winners[3].team
+    });
+  }
+
+  if (nextPhase === "final") {
+    await TournamentMatch.create({
+      tournamentId: tournament._id,
+      phase: "final",
+      player1: winners[0].walletAddress,
+      player2: winners[1].walletAddress,
+      team1: winners[0].team,
+      team2: winners[1].team
+    });
+  }
+
+  tournament.currentPhase = nextPhase;
+  await tournament.save();
+
+  broadcast({
+    type: "tournament_phase_update",
+    tournamentId: tournament._id,
+    phase: nextPhase
+  });
+
+  console.log(`🎉 New phase generated: ${nextPhase}`);
+}
 
 // 📥 POST /api/join
 app.post("/api/join", upload.array("attachments", 5), async (req, res) => {
@@ -435,6 +494,93 @@ wss.on("connection", (ws: WebSocket) => {
 
             console.log(`📢 Broadcasted battle_reward to all clients for ${walletAddress}`);
             console.log("-----------------------------------");
+
+            // ===================================================
+            // 🏆 TOURNAMENT INTEGRATION — Update Tournament Match
+            // ===================================================
+            const tournamentMatch = await TournamentMatch.findOne({ battleId });
+
+            if (tournamentMatch) {
+              console.log("🎯 Tournament match detected → updating result...");
+
+              // winner wallet
+              const winnerPlayer = battle.players.find(p => p.isWinner);
+              const winnerWallet = winnerPlayer?.user;
+
+              if (winnerWallet) {
+                tournamentMatch.winner = winnerWallet;
+                tournamentMatch.completed = true;
+                await tournamentMatch.save();
+
+                console.log("🔥 TournamentMatch updated:", tournamentMatch._id);
+
+                // tandai yang kalah
+                const loserWallet =
+                  battle.players.find(p => !p.isWinner)?.user;
+
+                if (loserWallet) {
+                  await TournamentParticipant.findOneAndUpdate(
+                    { walletAddress: loserWallet, tournamentId: tournamentMatch.tournamentId },
+                    { eliminated: true }
+                  );
+                  console.log("💀 Eliminated participant:", loserWallet);
+                }
+
+                // BROADCAST update match ke client frontend
+                broadcast({
+                  type: "tournament_match_update",
+                  matchId: tournamentMatch._id,
+                  tournamentId: tournamentMatch.tournamentId,
+                  winner: winnerWallet,
+                  loser: loserWallet,
+                  battleId
+                });
+
+                // ===================================================
+                // AUTO NEXT PHASE HANDLING
+                // ===================================================
+                const t = await Tournament.findById(tournamentMatch.tournamentId);
+                if (t) {
+                  const remaining = await TournamentParticipant.countDocuments({
+                    tournamentId: t._id,
+                    eliminated: false
+                  });
+
+                  console.log(`🎯 Tournament phase check: phase=${t.currentPhase} | remaining=${remaining}`);
+
+                  // quarter → semi (4 left)
+                  if (t.currentPhase === "quarter" && remaining === 4) {
+                    await autoGenerateNextPhase(t, "semi");
+                  }
+
+                  // semi → final (2 left)
+                  if (t.currentPhase === "semi" && remaining === 2) {
+                    await autoGenerateNextPhase(t, "final");
+                  }
+
+                  // final → completed (1 left)
+                  if (t.currentPhase === "final" && remaining === 1) {
+                    const champion = await TournamentParticipant.findOne({
+                      tournamentId: t._id,
+                      eliminated: false
+                    });
+
+                    t.winner = champion?.walletAddress;
+                    t.currentPhase = "completed";
+                    await t.save();
+
+                    broadcast({
+                      type: "tournament_finished",
+                      tournamentId: t._id,
+                      winner: champion?.walletAddress
+                    });
+
+                    console.log("🏆 Tournament completed → Winner =", champion?.walletAddress);
+                  }
+                }
+              }
+            }
+
           }
         }
 
@@ -627,7 +773,7 @@ export const broadcast = (data: any) => {
 
   server.listen(PORT, () => {
     console.log(`📡 Program ID:${process.env.PROGRAM_ID}`);
-    console.log(`   Backend version 14.11.2025.2100`);
+    console.log(`   Backend version 23.11.2025`);
     console.log(`🚀 NFT Backend running on http://localhost:${PORT}`);
     console.log(`📡 WebSocket active on ws://localhost:${PORT}`);
     console.log("🌍 Allowed Origins:", allowedOrigins.join(", "));

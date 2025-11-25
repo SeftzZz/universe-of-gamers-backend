@@ -10,7 +10,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 
 // === Konfigurasi ===
-const POLL_INTERVAL = 1 * 60 * 1000; // 1 menit
+const POLL_INTERVAL = 60 * 60 * 1000; // 60 menit
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_KEY}`;
 const solanaTracker = new Client({ apiKey: process.env.SOLANATRACKER_API_KEY as string });
 const connection = new Connection(HELIUS_RPC, "confirmed");
@@ -75,7 +75,7 @@ async function invalidateWalletCache(address: string) {
       `wallet:${address}`,
     ];
     await Promise.all(keys.map((k) => redis.del(k)));
-    console.log(`🧹 [Cache] Invalidated for wallet ${address}`);
+    // console.log(`🧹 [Cache] Invalidated for wallet ${address}`);
   } catch (err: any) {
     console.error(`❌ [Cache] Failed to invalidate ${address}:`, err.message);
   }
@@ -194,7 +194,7 @@ async function getWalletBalance(address: string): Promise<{
       }
 
       if (!existing) {
-        console.log(`🆕 [${address}] New token: ${t.symbol || t.mint} (${t.amount})`);
+        // console.log(`🆕 [${address}] New token: ${t.symbol || t.mint} (${t.amount})`);
         addedCount++;
         await WalletToken.updateOne(
           { address, mint: t.mint },
@@ -215,9 +215,9 @@ async function getWalletBalance(address: string): Promise<{
       const diff = Math.abs(existing.amount - t.amount);
       if (diff > tolerance) {
         const direction = t.amount > existing.amount ? "⬆️ increased" : "⬇️ decreased";
-        console.log(
-          `🔄 [${address}] ${t.symbol || t.mint}: ${existing.amount} → ${t.amount} (${direction} ${diff.toFixed(6)})`
-        );
+        // console.log(
+        //   `🔄 [${address}] ${t.symbol || t.mint}: ${existing.amount} → ${t.amount} (${direction} ${diff.toFixed(6)})`
+        // );
         updatedCount++;
         await WalletToken.updateOne(
           { address, mint: t.mint },
@@ -239,7 +239,7 @@ async function getWalletBalance(address: string): Promise<{
 
       const stillExists = tokens.find((t) => t.mint === old.mint);
       if (!stillExists) {
-        console.log(`❌ [${address}] Token removed: ${old.symbol || old.mint}`);
+        // console.log(`❌ [${address}] Token removed: ${old.symbol || old.mint}`);
         removedCount++;
         await WalletToken.updateOne(
           { address, mint: old.mint },
@@ -250,9 +250,9 @@ async function getWalletBalance(address: string): Promise<{
 
     // 📊 Summary per wallet
     if (addedCount > 0 || updatedCount > 0 || removedCount > 0) {
-      console.log(
-        `📊 [${address}] ${updatedCount} updated, ${addedCount} added, ${removedCount} removed`
-      );
+      // console.log(
+      //   `📊 [${address}] ${updatedCount} updated, ${addedCount} added, ${removedCount} removed`
+      // );
     }
 
     return { address, sol, tokens };
@@ -266,7 +266,7 @@ async function getWalletBalance(address: string): Promise<{
 async function refreshWalletCache(address: string) {
   if (!address) return;
   try {
-    console.log(`🔁 [Cache] Refreshing wallet cache for ${address}...`);
+    // console.log(`🔁 [Cache] Refreshing wallet cache for ${address}...`);
     await invalidateWalletCache(address);
 
     // 🕒 Tunggu 3 detik dulu supaya indexer SolanaTracker sempat sync
@@ -281,7 +281,7 @@ async function refreshWalletCache(address: string) {
         wallet = await solanaTracker.getWallet(address);
         if (wallet?.tokens?.length > 1) break;
       } catch (err: any) {
-        console.warn(`⚠️ getWallet attempt ${attempt + 1} failed: ${err.message}`);
+        // console.warn(`⚠️ getWallet attempt ${attempt + 1} failed: ${err.message}`);
       }
       attempt++;
       if (attempt < maxRetries) {
@@ -322,7 +322,7 @@ async function refreshWalletCache(address: string) {
     });
 
     if (!apiTokens.length) {
-      console.warn(`⚠️ [Cache] No tokens found after retries for ${address}, skipping cache rebuild.`);
+      // console.warn(`⚠️ [Cache] No tokens found after retries for ${address}, skipping cache rebuild.`);
       return;
     }
 
@@ -353,7 +353,7 @@ async function refreshWalletCache(address: string) {
       60 * 5
     );
 
-    console.log(`✅ [Cache] Rebuilt Redis for ${address} (${apiTokens.length} tokens)`);
+    // console.log(`✅ [Cache] Rebuilt Redis for ${address} (${apiTokens.length} tokens)`);
   } catch (err: any) {
     console.error(`❌ [Cache] Failed to refresh cache for ${address}:`, err.message);
   }
@@ -434,11 +434,11 @@ async function startWalletStream() {
       // 1️⃣ Ambil semua wallet unik dari WalletToken
       const wallets = await WalletToken.distinct("address");
       if (!wallets.length) {
-        console.log("⚠️ No wallets found in WalletToken collection.");
+        // console.log("⚠️ No wallets found in WalletToken collection.");
         return;
       }
 
-      console.log(`🔍 Checking balances for ${wallets.length} wallets...`);
+      // console.log(`🔍 Checking balances for ${wallets.length} wallets...`);
 
       // 2️⃣ Parallel fetch semua saldo
       const balancePromises = wallets.map((address) => getWalletBalance(address));
@@ -476,7 +476,7 @@ async function startWalletStream() {
         }
       }
 
-      console.log("✅ WalletToken balances updated & broadcasted.");
+      // console.log("✅ WalletToken balances updated & broadcasted.");
     } catch (err: any) {
       console.error("❌ Error in wallet stream loop:", err.message);
     }

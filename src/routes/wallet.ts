@@ -784,52 +784,52 @@ router.post("/tokens/add", async (req: Request, res: Response) => {
 //
 router.get("/trending", async (req: Request, res: Response) => {
   try {
-    // ✅ langsung ambil trending tokens (interval 1h)
-    const trendingTokens = await solanaTracker.getTrendingTokens("1h");
+    // // ✅ langsung ambil trending tokens (interval 1h)
+    // const trendingTokens = await solanaTracker.getTrendingTokens("1h");
 
-    // mapping hasil biar konsisten dengan schema lama
-    const tokens = trendingTokens.map((t: any) => {
-      const pool = t.pools?.[0] || {};
-      const priceUsd = pool.price?.usd ?? 0;
-      const liquidity = pool.liquidity?.usd ?? 0;
-      const marketCap = pool.marketCap?.usd ?? 0;
-      const percentChange = t.events?.["1h"]?.priceChangePercentage ?? 0;
-      const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
+    // // mapping hasil biar konsisten dengan schema lama
+    // const tokens = trendingTokens.map((t: any) => {
+    //   const pool = t.pools?.[0] || {};
+    //   const priceUsd = pool.price?.usd ?? 0;
+    //   const liquidity = pool.liquidity?.usd ?? 0;
+    //   const marketCap = pool.marketCap?.usd ?? 0;
+    //   const percentChange = t.events?.["1h"]?.priceChangePercentage ?? 0;
+    //   const trend = percentChange > 0 ? 1 : percentChange < 0 ? -1 : 0;
 
-      return {
-        mint: t.token.mint,
-        name: t.token.name,
-        symbol: t.token.symbol,
-        logoURI: t.token.image,
-        decimals: t.token.decimals,
-        amount: 0, // trending token tidak punya balance wallet
-        priceUsd: parseFloat(priceUsd.toFixed(6)),
-        usdValue: 0,
-        liquidity: parseFloat(liquidity.toFixed(2)),
-        marketCap: parseFloat(marketCap.toFixed(2)),
-        percentChange: parseFloat(percentChange.toFixed(2)),
-        trend,
-        holders: t.holders ?? 0,
-      };
-    });
+    //   return {
+    //     mint: t.token.mint,
+    //     name: t.token.name,
+    //     symbol: t.token.symbol,
+    //     logoURI: t.token.image,
+    //     decimals: t.token.decimals,
+    //     amount: 0, // trending token tidak punya balance wallet
+    //     priceUsd: parseFloat(priceUsd.toFixed(6)),
+    //     usdValue: 0,
+    //     liquidity: parseFloat(liquidity.toFixed(2)),
+    //     marketCap: parseFloat(marketCap.toFixed(2)),
+    //     percentChange: parseFloat(percentChange.toFixed(2)),
+    //     trend,
+    //     holders: t.holders ?? 0,
+    //   };
+    // });
 
-    // opsional: simpan ke DB
-    await Promise.all(
-      tokens.map(async (t) => {
-        await TrendingToken.findOneAndUpdate(
-          { mint: t.mint },
-          { ...t, lastUpdated: new Date() },
-          { upsert: true, new: true }
-        );
-      })
-    );
+    // // opsional: simpan ke DB
+    // await Promise.all(
+    //   tokens.map(async (t) => {
+    //     await TrendingToken.findOneAndUpdate(
+    //       { mint: t.mint },
+    //       { ...t, lastUpdated: new Date() },
+    //       { upsert: true, new: true }
+    //     );
+    //   })
+    // );
 
-    // ✅ tampilkan hanya 10 token teratas
-    const limitedTokens = tokens.slice(0, 10);
+    // // ✅ tampilkan hanya 10 token teratas
+    // const limitedTokens = tokens.slice(0, 10);
 
     res.json({
-      tokens: limitedTokens,
-      total: limitedTokens.length,
+      tokens: [''],
+      total: 0,
       totalSol: 0,
     });
   } catch (err: any) {

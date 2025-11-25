@@ -17,7 +17,7 @@ export interface IBattle extends Document {
     team: Types.ObjectId;
     isWinner?: boolean;
   }[];
-  mode: "pvp" | "adventure";
+  mode: "pvp" | "adventure" | "tournament";
   result: "init_battle" | "end_battle";
   log: IBattleLog[];
   createdAt: Date;
@@ -46,7 +46,7 @@ const BattleSchema = new Schema<IBattle>(
         isWinner: { type: Boolean, default: false },
       },
     ],
-    mode: { type: String, enum: ["pvp", "adventure"], required: true },
+    mode: { type: String, enum: ["pvp", "adventure", "tournament"], required: true },
     result: { type: String, enum: ["init_battle", "end_battle"], default: "init_battle" },
     log: { type: [BattleLogSchema], default: [] },
     createdAt: { type: Date, default: Date.now },

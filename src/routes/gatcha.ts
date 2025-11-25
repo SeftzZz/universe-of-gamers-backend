@@ -340,7 +340,7 @@ async function runGatchaWatcher() {
     const packs = await GatchaPack.find({ priceSOL: { $gt: 0 } }).lean();
 
     if (!lastGatchaPackSnapshot) {
-      // console.log("🆕 [WATCHER] Initial snapshot created");
+      console.log("🆕 [WATCHER] Initial snapshot created");
       lastGatchaPackSnapshot = packs;
 
       console.log("📡 [WATCHER] First broadcast");
@@ -395,7 +395,7 @@ async function runGatchaWatcher() {
         packs,
       });
     } else {
-      // console.log("⏸ [WATCHER] No changes → No broadcast");
+      console.log("⏸ [WATCHER] No changes → No broadcast");
     }
   } catch (err: any) {
     console.error("❌ [WATCHER] Error:", err.message);
@@ -677,8 +677,10 @@ router.post("/:id/pull/custodian", authenticateJWT, async (req: AuthRequest, res
     // }));
 
     res.json({
-      success: true,
-      message: "No Rewards"
+      message: "No Rewards",
+      count: 0,
+      results: [],
+      costs: { packPriceSol: 0 }
     });
   } catch (err: any) {
     console.error("❌ Custodian gatcha error:", err);

@@ -8,6 +8,13 @@ import { Team } from "../models/Team";
 import { generateNftMetadata } from "../services/metadataGenerator";
 import { authenticateJWT, requireAdmin, AuthRequest } from "../middleware/auth";
 import Auth from "../models/Auth";
+import battleRoutes, {
+  calculateEconomicFragment,
+  getRankModifier,
+  saveDailyEarning,
+  verifyNftIntegrity,
+  calculateNftPower
+} from "./battle";
 
 import { 
   Connection, 
@@ -1255,29 +1262,52 @@ router.post("/team", async (req, res) => {
  */
 router.get("/team", authenticateJWT, async (req: AuthRequest, res) => {
   try {
-    // 🔐 Ambil user dari DB
     const user = await Auth.findById(req.user.id).select(
       "wallets custodialWallets"
     );
+
     if (!user) {
       return res.status(401).json({ error: "User not found" });
     }
 
-    // 🔗 Gabungkan semua wallet address user
     const walletAddresses = [
       ...user.wallets.map((w) => w.address),
       ...user.custodialWallets.map((c) => c.address),
     ];
 
-    if (walletAddresses.length === 0) {
-      return res.json([]); // user belum punya wallet
-    }
+    if (walletAddresses.length === 0) return res.json([]);
 
-    // 📦 Filter teams berdasarkan owner
     const teams = await Team.find({ owner: { $in: walletAddresses } })
-      .populate("members");
+      .populate({
+        path: "members",
+        populate: [
+          { path: "character", model: "Character" },
+          { 
+            path: "equipped",
+            populate: { path: "rune", model: "Rune" }
+          }
+        ]
+      })
+      .lean(); // ← recommended, hasil lebih bersih
 
-    res.json(teams);
+    // FIX UTAMA ⬇️
+    const result = await Promise.all(
+      teams.map(async (team: any) => {
+        let teamPower = 0;
+
+        for (const nft of team.members) {
+          teamPower += await calculateNftPower(nft);
+        }
+
+        return {
+          ...team,
+          power: teamPower
+        };
+      })
+    );
+
+    return res.json(result);
+
   } catch (err: any) {
     console.error("❌ Failed to fetch teams:", err);
     res.status(500).json({ error: "Failed to fetch teams" });
@@ -1905,12 +1935,12 @@ router.get("/top-creators", async (req, res) => {
       return {
         owner,
         count,
-        name: user?.name || null,
+        name: user?.name,
         avatar: user?.avatar
           ? `${process.env.BASE_URL}/${
               user.avatar.startsWith("/") ? user.avatar.slice(1) : user.avatar
             }`
-          : "assets/images/avatar/avatar-small-01.png",
+          : "/uploads/avatars/default.png",
       };
     });
 

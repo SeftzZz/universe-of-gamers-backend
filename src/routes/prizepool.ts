@@ -57,7 +57,7 @@ async function getUsdPrice(mint: string): Promise<number> {
 let lastPrizepoolSnapshot: any = null;
 
 // interval (ms)
-const PRIZEPOOL_POLL_INTERVAL = 5000;
+const PRIZEPOOL_POLL_INTERVAL = 3600000;
 
 async function fetchPrizepoolData() {
   const lamports = await connection.getBalance(treasuryPubkey);
